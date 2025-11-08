@@ -1,0 +1,100 @@
+"""Rate limiting for Slack API calls."""
+import asyncio
+import time
+from collections import defaultdict
+from typing import Dict, Optional
+from threading import Lock
+
+from config import get_rate_limit_for_method
+from .logger import get_logger
+
+logger = get_logger(__name__)
+
+
+class RateLimiter:
+    """Rate limiter for Slack API methods."""
+    
+    def __init__(self):
+        """Initialize rate limiter."""
+        self._locks: Dict[str, Lock] = defaultdict(Lock)
+        self._requests: Dict[str, list] = defaultdict(list)
+        self._window_seconds = 60  # 1 minute window
+    
+    def _clean_old_requests(self, method: str):
+        """Remove requests older than the time window."""
+        now = time.time()
+        cutoff = now - self._window_seconds
+        self._requests[method] = [
+            req_time for req_time in self._requests[method]
+            if req_time > cutoff
+        ]
+    
+    def _get_wait_time(self, method: str, limit: int) -> float:
+        """Calculate wait time needed."""
+        self._clean_old_requests(method)
+        
+        if len(self._requests[method]) < limit:
+            return 0
+        
+        # Need to wait until oldest request expires
+        oldest = self._requests[method][0]
+        wait_time = (oldest + self._window_seconds) - time.time()
+        return max(0, wait_time)
+    
+    def wait_if_needed(self, method: str) -> float:
+        """Wait if rate limit would be exceeded. Returns wait time."""
+        limit = get_rate_limit_for_method(method)
+        
+        with self._locks[method]:
+            wait_time = self._get_wait_time(method, limit)
+            
+            if wait_time > 0:
+                logger.debug(
+                    f"Rate limit approaching for {method}. "
+                    f"Waiting {wait_time:.2f}s (limit: {limit}/min)"
+                )
+                time.sleep(wait_time)
+            
+            # Record this request
+            self._requests[method].append(time.time())
+            return wait_time
+    
+    async def async_wait_if_needed(self, method: str) -> float:
+        """Async version of wait_if_needed."""
+        limit = get_rate_limit_for_method(method)
+        
+        # Use asyncio-compatible approach
+        wait_time = self._get_wait_time(method, limit)
+        
+        if wait_time > 0:
+            logger.debug(
+                f"Rate limit approaching for {method}. "
+                f"Waiting {wait_time:.2f}s (limit: {limit}/min)"
+            )
+            await asyncio.sleep(wait_time)
+        
+        # Record this request
+        self._requests[method].append(time.time())
+        return wait_time
+    
+    def get_current_usage(self, method: str) -> tuple[int, int]:
+        """Get current usage (requests made, limit)."""
+        self._clean_old_requests(method)
+        limit = get_rate_limit_for_method(method)
+        return len(self._requests[method]), limit
+    
+    def reset(self, method: Optional[str] = None):
+        """Reset rate limiter for method or all methods."""
+        if method:
+            self._requests[method] = []
+        else:
+            self._requests.clear()
+
+
+# Global rate limiter instance
+_rate_limiter = RateLimiter()
+
+
+def get_rate_limiter() -> RateLimiter:
+    """Get global rate limiter instance."""
+    return _rate_limiter
