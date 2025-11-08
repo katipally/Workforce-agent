@@ -343,3 +343,30 @@ class DatabaseManager:
                 "files": session.query(func.count(File.file_id)).scalar(),
                 "reactions": session.query(func.count(Reaction.id)).scalar(),
             }
+    
+    def get_all_users(self) -> List[User]:
+        """Get all users."""
+        with self.get_session() as session:
+            return session.query(User).all()
+    
+    def get_all_files(self) -> List[File]:
+        """Get all files."""
+        with self.get_session() as session:
+            return session.query(File).all()
+    
+    def get_messages_by_channel(self, channel_id: str, limit: Optional[int] = None) -> List[Message]:
+        """Get messages for a specific channel.
+        
+        Args:
+            channel_id: Channel ID
+            limit: Optional limit on number of messages
+            
+        Returns:
+            List of messages
+        """
+        with self.get_session() as session:
+            query = session.query(Message).filter(Message.channel_id == channel_id)
+            query = query.order_by(Message.timestamp.desc())
+            if limit:
+                query = query.limit(limit)
+            return query.all()

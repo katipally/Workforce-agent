@@ -1,5 +1,6 @@
 """Socket Mode client for real-time events."""
 import asyncio
+import os
 from typing import Optional, Callable
 from slack_bolt.app.async_app import AsyncApp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -21,7 +22,26 @@ class SocketModeClient:
     ):
         """Initialize Socket Mode client."""
         self.db_manager = db_manager or DatabaseManager()
-        self.app = AsyncApp(token=Config.SLACK_BOT_TOKEN)
+        
+        # CRITICAL FIX: Temporarily hide OAuth env vars to force simple token auth
+        # Bolt SDK auto-detects SLACK_CLIENT_ID/SECRET and enables OAuth mode
+        # We need single-workspace token-based auth instead
+        client_id = os.environ.pop('SLACK_CLIENT_ID', None)
+        client_secret = os.environ.pop('SLACK_CLIENT_SECRET', None)
+        
+        try:
+            # Initialize app with ONLY token - no OAuth
+            self.app = AsyncApp(
+                token=Config.SLACK_BOT_TOKEN,
+                signing_secret=Config.SLACK_SIGNING_SECRET,
+            )
+        finally:
+            # Restore env vars for other parts of the application
+            if client_id:
+                os.environ['SLACK_CLIENT_ID'] = client_id
+            if client_secret:
+                os.environ['SLACK_CLIENT_SECRET'] = client_secret
+        
         self.handler = None
         self.is_running = False
         

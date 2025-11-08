@@ -439,5 +439,41 @@ def list_channels():
         raise
 
 
+@cli.command()
+@click.option('--parent-page-id', help='Notion parent page ID (or set NOTION_PARENT_PAGE_ID in .env)')
+def export_to_notion(parent_page_id):
+    """Export all Slack data to a Notion page."""
+    from notion_export import NotionExporter
+    
+    # Get parent page ID from option or env
+    parent_id = parent_page_id or Config.NOTION_PARENT_PAGE_ID
+    
+    if not parent_id:
+        console.print("[red]Error: Parent page ID required![/red]")
+        console.print("\nProvide via:")
+        console.print("  1. --parent-page-id option")
+        console.print("  2. NOTION_PARENT_PAGE_ID in .env")
+        return
+    
+    console.print("[bold cyan]Slack → Notion Export[/bold cyan]")
+    console.print(f"Parent Page ID: {parent_id}\n")
+    
+    try:
+        exporter = NotionExporter()
+        result = exporter.export_all(parent_page_id=parent_id)
+        
+        if result:
+            console.print("\n[bold green]✓ Export successful![/bold green]")
+        else:
+            console.print("\n[bold red]✗ Export failed![/bold red]")
+    
+    except ValueError as e:
+        console.print(f"[red]Configuration Error: {e}[/red]")
+        console.print("\nMake sure NOTION_TOKEN is set in your .env file")
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise
+
+
 if __name__ == "__main__":
     cli()

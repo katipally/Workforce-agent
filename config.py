@@ -21,6 +21,10 @@ class Config:
     SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "")
     SLACK_VERIFICATION_TOKEN = os.getenv("SLACK_VERIFICATION_TOKEN", "")
     
+    # Notion API (for exporting data to Notion)
+    NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
+    NOTION_PARENT_PAGE_ID = os.getenv("NOTION_PARENT_PAGE_ID", "")
+    
     # Database
     DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///data/slack_data.db")
     
