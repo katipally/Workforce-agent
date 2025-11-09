@@ -233,3 +233,148 @@ class SyncStatus(Base):
     
     # Relationships
     channel = relationship("Channel", back_populates="sync_status")
+
+
+# ============================================================================
+# Gmail Models
+# ============================================================================
+
+class GmailAccount(Base):
+    """Gmail account information."""
+    __tablename__ = "gmail_accounts"
+    
+    email_address = Column(String(255), primary_key=True)
+    messages_total = Column(Integer)
+    threads_total = Column(Integer)
+    history_id = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    emails = relationship("GmailMessage", back_populates="account", cascade="all, delete-orphan")
+    threads = relationship("GmailThread", back_populates="account", cascade="all, delete-orphan")
+    labels = relationship("GmailLabel", back_populates="account", cascade="all, delete-orphan")
+
+
+class GmailLabel(Base):
+    """Gmail labels (folders)."""
+    __tablename__ = "gmail_labels"
+    
+    label_id = Column(String(100), primary_key=True)
+    account_email = Column(String(255), ForeignKey("gmail_accounts.email_address"))
+    name = Column(String(255))
+    type = Column(String(50))  # system, user
+    message_list_visibility = Column(String(50))
+    label_list_visibility = Column(String(50))
+    messages_total = Column(Integer)
+    messages_unread = Column(Integer)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    account = relationship("GmailAccount", back_populates="labels")
+
+
+class GmailThread(Base):
+    """Gmail conversation thread."""
+    __tablename__ = "gmail_threads"
+    
+    thread_id = Column(String(100), primary_key=True)
+    account_email = Column(String(255), ForeignKey("gmail_accounts.email_address"))
+    snippet = Column(Text)
+    history_id = Column(String(50))
+    message_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    account = relationship("GmailAccount", back_populates="threads")
+    messages = relationship("GmailMessage", back_populates="thread", cascade="all, delete-orphan")
+
+
+class GmailMessage(Base):
+    """Gmail email message."""
+    __tablename__ = "gmail_messages"
+    
+    message_id = Column(String(100), primary_key=True)
+    account_email = Column(String(255), ForeignKey("gmail_accounts.email_address"))
+    thread_id = Column(String(100), ForeignKey("gmail_threads.thread_id"))
+    
+    # Message metadata
+    history_id = Column(String(50))
+    internal_date = Column(DateTime)
+    size_estimate = Column(Integer)
+    
+    # Headers
+    subject = Column(Text)
+    from_email = Column(String(500))
+    to_email = Column(Text)
+    cc_email = Column(Text)
+    bcc_email = Column(Text)
+    reply_to = Column(String(500))
+    date = Column(DateTime)
+    
+    # Content
+    snippet = Column(Text)
+    body_plain = Column(Text)
+    body_html = Column(Text)
+    
+    # Labels
+    label_ids = Column(JSON)  # List of label IDs
+    
+    # Flags
+    is_read = Column(Boolean, default=False)
+    is_starred = Column(Boolean, default=False)
+    is_important = Column(Boolean, default=False)
+    is_sent = Column(Boolean, default=False)
+    is_draft = Column(Boolean, default=False)
+    is_trash = Column(Boolean, default=False)
+    is_spam = Column(Boolean, default=False)
+    
+    # Attachments
+    has_attachments = Column(Boolean, default=False)
+    attachment_count = Column(Integer, default=0)
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    account = relationship("GmailAccount", back_populates="emails")
+    thread = relationship("GmailThread", back_populates="messages")
+    attachments = relationship("GmailAttachment", back_populates="message", cascade="all, delete-orphan")
+    
+    # Indexes
+    __table_args__ = (
+        Index('idx_gmail_message_thread', 'thread_id'),
+        Index('idx_gmail_message_date', 'date'),
+        Index('idx_gmail_message_from', 'from_email'),
+    )
+
+
+class GmailAttachment(Base):
+    """Gmail message attachment."""
+    __tablename__ = "gmail_attachments"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    message_id = Column(String(100), ForeignKey("gmail_messages.message_id"))
+    attachment_id = Column(String(255))  # Gmail attachment ID
+    
+    # Attachment info
+    filename = Column(String(500))
+    mime_type = Column(String(255))
+    size = Column(Integer)
+    
+    # Local storage
+    local_path = Column(String(1000))
+    is_downloaded = Column(Boolean, default=False)
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    message = relationship("GmailMessage", back_populates="attachments")
+    
+    # Indexes
+    __table_args__ = (
+        Index('idx_gmail_attachment_message', 'message_id'),
+    )

@@ -1,35 +1,48 @@
-# Slack Workforce Agent
+# Workspace Agent
 
-A comprehensive Python tool for extracting, monitoring, and exporting Slack workspace data. Supports real-time event streaming, data extraction, message operations, and Notion integration.
+A comprehensive Python tool for extracting, monitoring, and exporting data from Slack and Gmail. Supports real-time event streaming, data extraction, message operations, and Notion integration.
 
 ## ✨ Features
 
-### Data Extraction
-- **Users**: Extract all user profiles, roles, and metadata
-- **Channels**: Public channels, private channels, and DMs
-- **Messages**: Complete history with threads and replies
-- **Files**: File metadata and optional downloads
-- **Reactions**: Emoji reactions on messages
+### Slack Integration
+- **Data Extraction**: Users, channels, messages, files, reactions
+- **Real-time Streaming**: Socket Mode for live event monitoring
+- **Message Operations**: Send, receive, format, delete
+- **File Management**: Upload and download files
+- **Notion Export**: Export Slack data to formatted Notion pages
 
-### Real-time Operations
-- **Socket Mode Streaming**: Live event monitoring
-- **Message Sending**: Text and rich-formatted messages
-- **File Uploads**: Upload files to channels
-- **Reactions**: Add/remove emoji reactions
-- **Auto-save**: Events automatically saved to database
+### Gmail Integration ✨ NEW
+- **Email Extraction**: Emails, threads, labels, attachments
+- **Thread Support**: Complete conversation history
+- **Attachment Download**: Save email attachments locally
+- **Smart Queries**: Search and filter emails efficiently
+- **Notion Export**: Export Gmail data to formatted Notion pages
+- **Free Tier Optimized**: Quota-aware extraction
 
-### Export & Integration
-- **Notion Export**: Export all Slack data to formatted Notion pages
+### Data Management
 - **SQLite Database**: Local storage for all extracted data
 - **Statistics**: View counts and analytics
+- **Structured Storage**: Relational database with full indexing
 
 ---
 
 ## 📋 Requirements
 
 - Python 3.8+
-- Slack workspace with admin access
-- Slack App with required scopes (see Setup)
+- Slack workspace with admin access (for Slack integration)
+- Google account with Gmail (for Gmail integration)
+- Notion account (for Notion export)
+
+---
+
+## 📚 Documentation
+
+**Complete API setup guides available in:** `documentation/api_guide.md`
+
+This includes step-by-step instructions for:
+- ✅ Slack API setup (app creation, tokens, scopes)
+- ✅ Notion API setup (integration creation, page sharing)
+- ✅ Gmail API setup (OAuth credentials, consent screen)
 
 ---
 
@@ -175,7 +188,7 @@ Events are automatically saved to database. Press Ctrl+C to stop.
 2. Click ••• menu → Add connections
 3. Select your integration
 
-**Export:**
+**Export Slack Data:**
 ```bash
 python main.py export-to-notion
 ```
@@ -186,6 +199,219 @@ Creates a formatted page with:
 - Channel list
 - Message samples
 - File metadata
+
+**Export ENTIRE Database (All Tables):**
+```bash
+python main.py export-all-to-notion
+```
+
+Creates a comprehensive page with ALL data from ALL tables:
+- **Slack**: Workspaces, Users, Channels, Messages, Files, Reactions
+- **Gmail**: Accounts, Labels, Threads, Messages, Attachments
+- Shows counts, recent items, and complete statistics
+- Perfect for browsing all data in one organized page
+
+---
+
+## 📧 Gmail Integration Setup
+
+### Prerequisites
+- Google account with Gmail
+- Google Cloud project
+- Gmail API enabled
+
+### Step-by-Step Setup
+
+#### 1. Create Google Cloud Project
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com/)
+2. Click "Select a project" → "New Project"
+3. Name it (e.g., "Gmail Extractor")
+4. Click "Create"
+
+#### 2. Enable Gmail API
+
+1. In your project, go to "APIs & Services" → "Library"
+2. Search for "Gmail API"
+3. Click "Gmail API"
+4. Click "Enable"
+
+#### 3. Create OAuth 2.0 Credentials
+
+1. Go to "APIs & Services" → "Credentials"
+2. Click "+ CREATE CREDENTIALS" → "OAuth client ID"
+3. If prompted, configure consent screen:
+   - Choose "External" (unless you have Google Workspace)
+   - App name: "Gmail Extractor"
+   - User support email: your email
+   - Developer contact: your email
+   - Click "Save and Continue"
+   - Scopes: Skip (click "Save and Continue")
+   - Test users: Add your Gmail address
+   - Click "Save and Continue"
+4. Back to credentials, click "+ CREATE CREDENTIALS" → "OAuth client ID"
+5. Application type: "Desktop app"
+6. Name: "Gmail Desktop Client"
+7. Click "Create"
+8. **Download the JSON file**
+9. Rename it to `credentials.json`
+10. Place it in your project root directory
+
+#### 4. Configure Environment
+
+Add to `.env`:
+```bash
+GMAIL_CREDENTIALS_FILE=credentials.json
+GMAIL_TOKEN_FILE=data/gmail_token.pickle
+```
+
+#### 5. First-Time Authentication
+
+Run the test to trigger OAuth flow:
+```bash
+python test_gmail.py
+```
+
+This will:
+1. Open your browser
+2. Ask you to sign in to Google
+3. Show a warning (click "Advanced" → "Go to [App Name] (unsafe)")
+4. Grant permissions
+5. Save token to `data/gmail_token.pickle`
+
+**Note**: You only need to do this once. The token is saved for future use.
+
+### Gmail API Quota Limits (Free Tier)
+
+Understanding quotas is important for optimization:
+
+- **Daily limit**: 1 billion quota units
+- **Per-user limit**: 250 units/second
+
+**Quota costs per operation**:
+- List messages: 5 units
+- Get message: 5 units
+- Get attachment: 5 units
+- List threads: 5 units
+- Get thread: 5 units
+- List labels: 1 unit
+
+**Example**: Extracting 100 emails = 100 × 5 = 500 units (well within limits)
+
+### Extract Gmail Data
+
+**Using CLI Commands (Recommended):**
+
+```bash
+# Test connection
+python test_gmail.py
+
+# Extract recent emails (default: 100 messages)
+python main.py gmail-extract
+
+# Extract with custom limit
+python main.py gmail-extract --max-messages 50
+
+# Extract from specific sender
+python main.py gmail-extract --query "from:ivanlee@example.com" --max-messages 100
+
+# Extract with date filter
+python main.py gmail-extract --query "after:2024/11/01" --max-messages 200
+
+# Extract threads (conversations)
+python main.py gmail-extract --extract-threads --max-threads 50
+
+# Extract with attachments
+python main.py gmail-extract --max-messages 50 --download-attachments
+
+# View statistics
+python main.py gmail-stats
+```
+
+**Using Python (Advanced):**
+
+```python
+from gmail import GmailExtractor
+
+ext = GmailExtractor()
+ext.extract_messages(query='from:ivanlee@example.com', max_messages=100)
+ext.download_attachments()
+```
+
+### Gmail Search Queries
+
+Use Gmail search syntax for filtering:
+
+```python
+# Recent emails
+query = 'after:2024/11/01'
+
+# From specific sender
+query = 'from:example@gmail.com'
+
+# Has attachments
+query = 'has:attachment'
+
+# Important emails
+query = 'is:important'
+
+# Unread emails
+query = 'is:unread'
+
+# Combine filters
+query = 'from:boss@company.com has:attachment after:2024/10/01'
+
+# Exclude spam/trash (default)
+# Spam and trash are excluded automatically to save quota
+```
+
+### Export Gmail to Notion
+
+**Setup** (same as Slack Notion export):
+1. Create Notion integration
+2. Get parent page ID
+3. Share page with integration
+
+**Export using CLI:**
+```bash
+# Using NOTION_PARENT_PAGE_ID from .env
+python main.py gmail-notion
+
+# Or specify page ID directly
+python main.py gmail-notion --parent-page-id YOUR_PAGE_ID
+
+# Custom email limit
+python main.py gmail-notion --max-emails 100
+```
+
+**Using Python (Advanced):**
+```python
+from gmail import GmailNotionExporter
+
+exp = GmailNotionExporter()
+exp.export_all('YOUR_PAGE_ID', max_emails=50)
+```
+
+Creates a formatted page with:
+- Account statistics
+- Labels/folders
+- Recent messages (with snippets)
+- Thread information
+- Attachment list
+
+### Gmail Quota Optimization Tips
+
+To stay within free tier limits:
+
+1. **Start small**: Extract 50-100 emails first
+2. **Use queries**: Filter by date/sender to reduce API calls
+3. **Exclude spam/trash**: Automatically excluded (saves quota)
+4. **Batch operations**: The extractor batches requests automatically
+5. **Monitor usage**: Check [Google Cloud Console](https://console.cloud.google.com/) → APIs & Services → Dashboard
+
+**Daily capacity examples**:
+- Extract 200,000 emails: 1,000,000 units (within daily limit)
+- Extract 50 emails/day: 250 units (0.000025% of daily limit)
 
 ---
 
@@ -224,6 +450,26 @@ Tests:
 
 **Expected:** 10/10 tests pass
 
+### Test Gmail Integration
+
+```bash
+python test_gmail.py
+```
+
+Tests:
+- ✅ Configuration (credentials.json)
+- ✅ Gmail authentication
+- ✅ API connection
+- ✅ Profile extraction
+- ✅ Labels extraction
+- ✅ Message extraction
+- ✅ Database operations
+- ✅ Notion export (if configured)
+
+**Expected:** 10/10 tests pass
+
+**Note**: First run will open browser for OAuth. Subsequent runs use saved token.
+
 ---
 
 ## 📁 Project Structure
@@ -253,13 +499,21 @@ Workforce-agent/
 ├── notion_export/         # Notion integration
 │   ├── client.py
 │   └── exporter.py
+├── gmail/                 # Gmail integration
+│   ├── client.py
+│   ├── extractor.py
+│   └── exporter.py
 ├── utils/                 # Utilities
 │   ├── logger.py
 │   ├── rate_limiter.py
 │   └── backoff.py
+├── documentation/         # API setup guides
+│   └── api_guide.md       # Complete setup instructions
 ├── main.py                # Entry point
 ├── test_slack.py          # Slack tests
 ├── test_notion.py         # Notion tests
+├── test_gmail.py          # Gmail tests
+├── credentials.json       # Gmail OAuth credentials
 ├── .env.example           # Environment template
 └── requirements.txt       # Dependencies
 ```
@@ -270,7 +524,7 @@ Workforce-agent/
 
 **SQLite database at:** `data/slack_data.db`
 
-### Tables
+### Slack Tables
 
 **workspaces**
 - Workspace metadata (team name, ID)
@@ -299,6 +553,28 @@ Workforce-agent/
 - Track extraction progress
 - Fields: channel_id, last_synced_ts, is_complete, etc.
 
+### Gmail Tables
+
+**gmail_accounts**
+- Gmail account information
+- Fields: email_address, messages_total, threads_total, history_id
+
+**gmail_labels**
+- Gmail labels/folders (Inbox, Sent, custom labels)
+- Fields: label_id, account_email, name, type, messages_total, messages_unread
+
+**gmail_threads**
+- Email conversation threads
+- Fields: thread_id, account_email, snippet, message_count
+
+**gmail_messages**
+- Individual email messages
+- Fields: message_id, thread_id, subject, from_email, to_email, date, body_plain, body_html, snippet, label_ids, is_read, is_starred, has_attachments, etc.
+
+**gmail_attachments**
+- Email attachments
+- Fields: id, message_id, attachment_id, filename, mime_type, size, local_path, is_downloaded
+
 ---
 
 ## 🔧 Configuration
@@ -315,6 +591,8 @@ Workforce-agent/
 | `SLACK_SIGNING_SECRET` | ⚪ | Request verification secret |
 | `NOTION_TOKEN` | ⚪ | Notion Integration Token (for export) |
 | `NOTION_PARENT_PAGE_ID` | ⚪ | Notion page ID for exports |
+| `GMAIL_CREDENTIALS_FILE` | ⚪ | Gmail OAuth credentials JSON file (default: credentials.json) |
+| `GMAIL_TOKEN_FILE` | ⚪ | Gmail token pickle file (default: data/gmail_token.pickle) |
 | `DATABASE_URL` | ⚪ | SQLite database path (default: sqlite:///data/slack_data.db) |
 | `LOG_LEVEL` | ⚪ | Logging level (default: INFO) |
 
@@ -526,7 +804,9 @@ def your_command():
 
 | Command | Description |
 |---------|-------------|
-| `export-to-notion` | Export all data to Notion page |
+| `export-to-notion` | Export Slack data to Notion page |
+| `gmail-notion` | Export Gmail data to Notion page |
+| `export-all-to-notion` | Export ENTIRE database (all tables) to Notion |
 
 ---
 
@@ -566,25 +846,50 @@ MIT License - See LICENSE file for details
 
 ## 🎉 Quick Start Summary
 
+### For Slack
 ```bash
 # 1. Install
 pip install -r requirements.txt
 
 # 2. Configure
 cp .env.example .env
-# Edit .env with your tokens
+# Edit .env with Slack tokens
 
 # 3. Initialize
 python main.py init
 
 # 4. Test
 python test_slack.py
-python test_notion.py
 
 # 5. Use
 python main.py extract-all
 python main.py export-to-notion
 python main.py stream
+```
+
+### For Gmail
+```bash
+# 1. Install (same as above)
+pip install -r requirements.txt
+
+# 2. Download credentials.json from Google Cloud Console
+# Place in project root
+# See documentation/api_guide.md for detailed setup
+
+# 3. Test (triggers OAuth)
+python test_gmail.py
+
+# 4. Extract emails
+python main.py gmail-extract --max-messages 50
+
+# 5. Extract from specific sender (e.g., Ivan Lee)
+python main.py gmail-extract --query "from:ivanlee@example.com" --max-messages 100
+
+# 6. View statistics
+python main.py gmail-stats
+
+# 7. Export to Notion
+python main.py gmail-notion --max-emails 50
 ```
 
 **That's it! You're ready to go.** 🚀

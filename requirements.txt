@@ -5,6 +5,11 @@ slack-bolt>=1.26.0
 # Notion API
 notion-client>=2.2.1
 
+# Gmail API
+google-api-python-client>=2.108.0
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.2.0
+
 # Configuration
 python-dotenv>=1.0.0
 

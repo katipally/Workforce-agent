@@ -475,5 +475,202 @@ def export_to_notion(parent_page_id):
         raise
 
 
+@cli.command()
+@click.option('--query', default='', help='Gmail search query (e.g., "from:user@example.com")')
+@click.option('--max-messages', default=100, help='Maximum messages to extract')
+@click.option('--extract-threads', is_flag=True, help='Extract as threads instead of individual messages')
+@click.option('--max-threads', default=50, help='Maximum threads to extract (if --extract-threads)')
+@click.option('--download-attachments', is_flag=True, help='Download email attachments')
+def gmail_extract(query, max_messages, extract_threads, max_threads, download_attachments):
+    """Extract emails from Gmail and store in database."""
+    console.print("[bold blue]Extracting Gmail data...[/bold blue]\n")
+    
+    try:
+        from gmail import GmailExtractor
+        
+        # Initialize extractor
+        extractor = GmailExtractor()
+        
+        # Extract profile and labels first
+        console.print("[cyan]1. Extracting profile...[/cyan]")
+        extractor.extract_profile()
+        
+        console.print("[cyan]2. Extracting labels...[/cyan]")
+        extractor.extract_labels()
+        
+        # Extract messages or threads
+        if extract_threads:
+            console.print(f"[cyan]3. Extracting threads (max: {max_threads})...[/cyan]")
+            if query:
+                console.print(f"   Query: '{query}'")
+            count = extractor.extract_threads(
+                query=query,
+                max_threads=max_threads
+            )
+            console.print(f"[green]✓ Extracted {count} threads[/green]")
+        else:
+            console.print(f"[cyan]3. Extracting messages (max: {max_messages})...[/cyan]")
+            if query:
+                console.print(f"   Query: '{query}'")
+            count = extractor.extract_messages(
+                query=query,
+                max_messages=max_messages
+            )
+            console.print(f"[green]✓ Extracted {count} messages[/green]")
+        
+        # Download attachments if requested
+        if download_attachments:
+            console.print("[cyan]4. Downloading attachments...[/cyan]")
+            att_count = extractor.download_attachments()
+            console.print(f"[green]✓ Downloaded {att_count} attachments[/green]")
+        
+        console.print("\n[bold green]Gmail extraction complete![/bold green]")
+        console.print("\n[dim]View data: python main.py gmail-stats[/dim]")
+        console.print("[dim]Export to Notion: python main.py gmail-notion[/dim]")
+    
+    except ImportError as e:
+        console.print(f"[red]Error: Gmail module not found. {e}[/red]")
+        console.print("[yellow]Make sure you have installed Gmail dependencies:[/yellow]")
+        console.print("  pip install -r requirements.txt")
+    except ValueError as e:
+        console.print(f"[red]Configuration Error: {e}[/red]")
+        console.print("\n[yellow]Gmail API Setup Required:[/yellow]")
+        console.print("1. Download credentials.json from Google Cloud Console")
+        console.print("2. Place it in project root")
+        console.print("3. Run: python test_gmail.py (to authenticate)")
+        console.print("\nSee documentation/api_guide.md for detailed setup")
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise
+
+
+@cli.command()
+@click.option('--parent-page-id', help='Notion parent page ID (or set NOTION_PARENT_PAGE_ID in .env)')
+@click.option('--max-emails', default=50, help='Maximum emails to include in export')
+def gmail_notion(parent_page_id, max_emails):
+    """Export Gmail data to a Notion page."""
+    from gmail import GmailNotionExporter
+    
+    # Get parent page ID from option or env
+    parent_id = parent_page_id or Config.NOTION_PARENT_PAGE_ID
+    
+    if not parent_id:
+        console.print("[red]Error: Parent page ID required![/red]")
+        console.print("\nProvide via:")
+        console.print("  1. --parent-page-id option")
+        console.print("  2. NOTION_PARENT_PAGE_ID in .env")
+        return
+    
+    console.print("[bold cyan]Gmail → Notion Export[/bold cyan]")
+    console.print(f"Parent Page ID: {parent_id}")
+    console.print(f"Max emails: {max_emails}\n")
+    
+    try:
+        exporter = GmailNotionExporter()
+        result = exporter.export_all(
+            parent_page_id=parent_id,
+            max_emails=max_emails
+        )
+        
+        if result:
+            console.print("\n[bold green]✓ Export successful![/bold green]")
+            if 'url' in result:
+                console.print(f"[cyan]Page URL:[/cyan] {result['url']}")
+        else:
+            console.print("\n[bold red]✗ Export failed![/bold red]")
+    
+    except ValueError as e:
+        console.print(f"[red]Configuration Error: {e}[/red]")
+        console.print("\nMake sure NOTION_TOKEN is set in your .env file")
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise
+
+
+@cli.command()
+def gmail_stats():
+    """Show Gmail database statistics."""
+    console.print("[bold blue]Gmail Database Statistics[/bold blue]")
+    
+    try:
+        from database.models import GmailAccount, GmailLabel, GmailMessage, GmailThread, GmailAttachment
+        
+        db = DatabaseManager()
+        with db.get_session() as session:
+            accounts = session.query(GmailAccount).all()
+            labels = session.query(GmailLabel).all()
+            messages = session.query(GmailMessage).all()
+            threads = session.query(GmailThread).all()
+            attachments = session.query(GmailAttachment).all()
+        
+        table = Table(show_header=True)
+        table.add_column("Category", style="cyan")
+        table.add_column("Count", style="green", justify="right")
+        
+        table.add_row("Accounts", str(len(accounts)))
+        table.add_row("Labels", str(len(labels)))
+        table.add_row("Messages", str(len(messages)))
+        table.add_row("Threads", str(len(threads)))
+        table.add_row("Attachments", str(len(attachments)))
+        
+        console.print(table)
+        
+        # Show account details
+        if accounts:
+            console.print("\n[bold]Account Details:[/bold]")
+            for acc in accounts:
+                console.print(f"  Email: {acc.email_address}")
+                console.print(f"  Total Messages: {acc.messages_total or 0}")
+                console.print(f"  Total Threads: {acc.threads_total or 0}")
+        
+        # Show unread count
+        with db.get_session() as session:
+            unread = session.query(GmailMessage).filter_by(is_read=False).count()
+            starred = session.query(GmailMessage).filter_by(is_starred=True).count()
+        
+        console.print(f"\n[yellow]Unread:[/yellow] {unread}")
+        console.print(f"[yellow]Starred:[/yellow] {starred}")
+    
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise
+
+
+@cli.command()
+@click.option('--parent-page-id', help='Notion parent page ID (or set NOTION_PARENT_PAGE_ID in .env)')
+def export_all_to_notion(parent_page_id):
+    """Export ENTIRE database (all tables) to a single Notion page."""
+    from notion_export.full_database_exporter import FullDatabaseExporter
+    
+    # Get parent page ID from option or env
+    parent_id = parent_page_id or Config.NOTION_PARENT_PAGE_ID
+    
+    if not parent_id:
+        console.print("[red]Error: Parent page ID required![/red]")
+        console.print("\nProvide via:")
+        console.print("  1. --parent-page-id option")
+        console.print("  2. NOTION_PARENT_PAGE_ID in .env")
+        return
+    
+    try:
+        exporter = FullDatabaseExporter()
+        result = exporter.export_all(parent_page_id=parent_id)
+        
+        if result and result.get('success'):
+            console.print("\n[bold green]✓ Complete database exported![/bold green]")
+            if 'url' in result:
+                console.print(f"[cyan]Page URL:[/cyan] {result['url']}")
+            console.print(f"\n[dim]Total blocks created: {result.get('total_blocks', 0)}[/dim]")
+        else:
+            console.print("\n[bold red]✗ Export failed![/bold red]")
+    
+    except ValueError as e:
+        console.print(f"[red]Configuration Error: {e}[/red]")
+        console.print("\nMake sure NOTION_TOKEN is set in your .env file")
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise
+
+
 if __name__ == "__main__":
     cli()
