@@ -1,13 +1,20 @@
-"""Configuration management for Slack Agent."""
+"""Configuration management for Workforce Agent.
+
+Manages all application settings including:
+- API credentials (Slack, Gmail, Notion)
+- Database connection (PostgreSQL with pgvector)
+- Rate limiting and performance settings
+- File paths and logging configuration
+"""
 import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load environment variables
+# Load environment variables from .env file
 load_dotenv()
 
 class Config:
-    """Application configuration."""
+    """Application configuration loaded from environment variables and defaults."""
     
     # Slack API Tokens
     SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
@@ -22,7 +29,8 @@ class Config:
     SLACK_VERIFICATION_TOKEN = os.getenv("SLACK_VERIFICATION_TOKEN", "")
     
     # Database
-    DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///data/slack_data.db")
+    # PostgreSQL for production, SQLite for dev
+    DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://localhost/workforce_agent")
     
     # Data directories
     BASE_DIR = Path(__file__).parent

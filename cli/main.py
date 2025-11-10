@@ -1,4 +1,8 @@
-"""CLI interface for Slack Agent."""
+"""Command-line interface for Workforce Agent.
+
+Provides all CLI commands for interacting with Slack, Gmail, and Notion APIs.
+Uses Click for command structure and Rich for beautiful terminal output.
+"""
 import asyncio
 import click
 from rich.console import Console
@@ -7,12 +11,10 @@ from rich.progress import track
 
 from config import Config
 from database.db_manager import DatabaseManager
-from extractor.coordinator import ExtractionCoordinator
-from realtime.socket_client import SocketModeClient
-from realtime.event_handlers import EventHandlers
-from sender.message_sender import MessageSender
-from sender.file_sender import FileSender
-from sender.reaction_manager import ReactionManager
+from slack.extractor import ExtractionCoordinator
+from slack.sender import MessageSender, FileSender, ReactionManager
+from slack.realtime.event_handlers import EventHandlers
+from slack.realtime.socket_client import SocketModeClient
 from utils.logger import setup_logging, get_logger
 
 console = Console()
@@ -20,9 +22,9 @@ logger = get_logger(__name__)
 
 
 @click.group()
-@click.option('--log-level', default='INFO', help='Logging level')
+@click.option('--log-level', default='INFO', help='Logging level (DEBUG, INFO, WARNING, ERROR)')
 def cli(log_level):
-    """Slack Agent - Extract, Stream, and Send Slack Data."""
+    """Workforce Agent - Extract data from Slack, Gmail, and export to Notion."""
     setup_logging(log_level=log_level)
     Config.create_directories()
     

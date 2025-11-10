@@ -41,6 +41,12 @@ raw_exports/
 files/
 *.json.gz
 
+# Credentials and tokens
+google-credentials.json
+credentials.json
+*.pickle
+token.json
+
 # IDE
 .vscode/
 .idea/

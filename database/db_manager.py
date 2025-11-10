@@ -1,4 +1,12 @@
-"""Database manager for Slack data."""
+"""Database manager for Workforce Agent.
+
+Handles all database operations including:
+- Connection management (PostgreSQL)
+- Session handling
+- Schema initialization
+- CRUD operations for Slack and Gmail data
+- Statistics and reporting
+"""
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from sqlalchemy import create_engine, func
@@ -16,16 +24,28 @@ logger = get_logger(__name__)
 
 
 class DatabaseManager:
-    """Manages database operations."""
+    """Manages database connections and operations for PostgreSQL.
+    
+    Features:
+    - Automatic reconnection (pool_pre_ping)
+    - Connection pooling with recycling
+    - Transaction management
+    - Context manager support for sessions
+    """
     
     def __init__(self, database_url: Optional[str] = None):
-        """Initialize database manager."""
+        """Initialize database manager.
+        
+        Args:
+            database_url: Database connection string. If None, uses Config.DATABASE_URL
+                         Format: postgresql://user:pass@host:port/dbname
+        """
         self.database_url = database_url or Config.DATABASE_URL
         self.engine = create_engine(
             self.database_url,
-            echo=False,
-            pool_pre_ping=True,
-            pool_recycle=3600
+            echo=False,  # Set to True for SQL query debugging
+            pool_pre_ping=True,  # Verify connections before using
+            pool_recycle=3600  # Recycle connections after 1 hour
         )
         self.SessionLocal = sessionmaker(bind=self.engine)
         self.init_db()

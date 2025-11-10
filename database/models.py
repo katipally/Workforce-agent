@@ -1,4 +1,10 @@
-"""SQLAlchemy models for Slack data."""
+"""SQLAlchemy database models for Workforce Agent.
+
+Defines all database tables for:
+- Slack data (workspaces, users, channels, messages, files, reactions)
+- Gmail data (accounts, labels, threads, messages, attachments)
+- PostgreSQL with optional pgvector support for AI/RAG features
+"""
 from datetime import datetime
 from sqlalchemy import (
     Column, String, Boolean, Integer, Float, DateTime,
@@ -6,6 +12,15 @@ from sqlalchemy import (
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
+
+# Vector support for AI/RAG semantic search (requires PostgreSQL + pgvector extension)
+# Install: brew install pgvector, then CREATE EXTENSION vector in database
+try:
+    from pgvector.sqlalchemy import Vector
+    VECTOR_SUPPORT = True
+except ImportError:
+    VECTOR_SUPPORT = False
+    Vector = None
 
 Base = declarative_base()
 

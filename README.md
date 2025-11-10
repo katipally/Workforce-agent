@@ -1,3 +1,4 @@
+<<<<<<< Updated upstream
 # 🤖 Slack Workspace Agent
 
 Complete Slack workspace data extraction, real-time streaming, and two-way communication using the official Slack API with Nov 2025 methods.
@@ -16,6 +17,68 @@ Complete Slack workspace data extraction, real-time streaming, and two-way commu
 ---
 
 ## 🚀 Quick Setup
+=======
+# Workforce Agent
+
+A production-ready Python agent for extracting, monitoring, and exporting data from Slack, Gmail, and Notion. Built with PostgreSQL for scalability and AI/RAG readiness with pgvector support.
+
+**Key Highlights:**
+- 🚀 **Production Database**: PostgreSQL with connection pooling and pgvector
+- 🤖 **AI/RAG Ready**: Vector embeddings support for semantic search
+- 📊 **18 CLI Commands**: Complete data extraction and export pipeline
+- 🔄 **Real-Time Streaming**: Socket Mode for live Slack events
+- 📧 **Full Email Bodies**: Complete Gmail message extraction (not just snippets)
+- 📝 **Notion Export**: Beautiful formatted exports to Notion pages
+
+## ✨ Features
+
+### Slack Integration
+- **Data Extraction**: Users, channels, messages, files, reactions
+- **Real-time Streaming**: Socket Mode for live event monitoring
+- **Message Operations**: Send, receive, format, delete
+- **File Management**: Upload and download files
+- **Notion Export**: Export Slack data to formatted Notion pages
+
+### Gmail Integration ✨ NEW
+- **Email Extraction**: Emails, threads, labels, attachments
+- **Thread Support**: Complete conversation history
+- **Attachment Download**: Save email attachments locally
+- **Smart Queries**: Search and filter emails efficiently
+- **Notion Export**: Export Gmail data to formatted Notion pages
+- **Free Tier Optimized**: Quota-aware extraction
+
+### Data Management
+- **PostgreSQL Database**: Production-ready database with pgvector support
+- **AI/RAG Ready**: Vector embeddings support for semantic search
+- **Statistics**: View counts and analytics
+- **Structured Storage**: Relational database with full indexing
+- **Migration Tools**: Easy migration from SQLite to PostgreSQL
+
+---
+
+## 📋 Requirements
+
+- Python 3.8+
+- PostgreSQL 14+ (with pgvector for AI features)
+- Slack workspace with admin access (for Slack integration)
+- Google account with Gmail (for Gmail integration)
+- Notion account (for Notion export)
+
+---
+
+## 📚 Documentation
+
+**Complete API setup guides available in:** `documentation/api_guide.md`
+
+This includes step-by-step instructions for:
+- ✅ Slack API setup (app creation, tokens, scopes)
+- ✅ Notion API setup (integration creation, page sharing)
+- ✅ Gmail API setup (OAuth credentials, consent screen)
+
+---
+
+## 🚀 Quick Start
+>>>>>>> Stashed changes
 
 ### 1. Install Dependencies
 ```bash
@@ -146,6 +209,7 @@ python main.py list-channels
 
 ```
 Workforce-agent/
+<<<<<<< Updated upstream
 ├── main.py                 # CLI entry point
 ├── config.py              # Configuration management
 ├── test_slack_integration.py  # Comprehensive test suite
@@ -182,13 +246,73 @@ Workforce-agent/
     ├── slack_data.db         # SQLite database (auto-created)
     ├── files/                # Downloaded files
     └── raw_exports/          # JSON exports
+=======
+├── cli/                    # CLI commands
+│   ├── __init__.py
+│   └── main.py            # All CLI commands
+├── config.py              # Configuration
+├── database/              # PostgreSQL database
+│   ├── models.py          # Data models (with pgvector support)
+│   └── db_manager.py      # Database operations
+├── slack/                 # Slack integration (unified)
+│   ├── __init__.py
+│   ├── client.py          # Unified Slack API client
+│   ├── extractor/         # Data extraction
+│   │   ├── users.py
+│   │   ├── channels.py
+│   │   ├── messages.py
+│   │   ├── files.py
+│   │   └── coordinator.py
+│   ├── sender/            # Sending messages/files
+│   │   ├── message_sender.py
+│   │   ├── file_sender.py
+│   │   └── reaction_manager.py
+│   └── realtime/          # Real-time streaming
+│       ├── event_handlers.py
+│       └── socket_client.py
+├── notion_export/         # Notion integration
+│   ├── client.py
+│   ├── exporter.py
+│   └── full_database_exporter.py
+├── gmail/                 # Gmail integration
+│   ├── client.py
+│   ├── extractor.py
+│   └── exporter.py
+├── utils/                 # Utilities
+│   ├── logger.py
+│   ├── rate_limiter.py
+│   └── backoff.py
+├── documentation/         # API setup guides
+│   └── api_guide.md       # Complete setup instructions (2025 updates)
+├── test-files/            # All test files
+│   ├── test_slack.py
+│   ├── test_notion.py
+│   ├── test_gmail.py
+│   └── test_complete_export.py
+├── main.py                # Entry point
+├── migrate_to_postgres.py # Database migration tool
+├── google-credentials.json # Gmail OAuth credentials
+├── .env                   # Environment variables (not in repo)
+├── .env.example           # Environment template
+└── requirements.txt       # Dependencies
+>>>>>>> Stashed changes
 ```
 
 ---
 
 ## 🗄️ Database Schema
 
+<<<<<<< Updated upstream
 All data is stored in `data/slack_data.db`:
+=======
+**PostgreSQL database:** `workforce_agent` (default connection: `postgresql://localhost/workforce_agent`)
+
+**Features:**
+- Relational integrity with foreign keys
+- Full-text search ready
+- pgvector support for AI/RAG semantic search
+- Connection pooling and automatic reconnection
+>>>>>>> Stashed changes
 
 - **Workspaces** - Workspace metadata
 - **Users** - User profiles and info
@@ -204,10 +328,27 @@ All data is stored in `data/slack_data.db`:
 
 The agent automatically handles Slack's rate limits:
 
+<<<<<<< Updated upstream
 - **Tier 4** (100+ req/min): `users.info`, `team.info`
 - **Tier 3** (50 req/min): `chat.postMessage`, `conversations.info`
 - **Tier 2** (20 req/min): `conversations.list`, `users.list`
 - **Special** (1 req/min): `conversations.history` for free workspaces
+=======
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `SLACK_BOT_TOKEN` | ✅ | Bot User OAuth Token (xoxb-...) |
+| `SLACK_APP_TOKEN` | ✅ | App-Level Token for Socket Mode (xapp-...) |
+| `SLACK_APP_ID` | ⚪ | App ID |
+| `SLACK_CLIENT_ID` | ⚪ | OAuth Client ID |
+| `SLACK_CLIENT_SECRET` | ⚪ | OAuth Client Secret |
+| `SLACK_SIGNING_SECRET` | ⚪ | Request verification secret |
+| `NOTION_TOKEN` | ⚪ | Notion Integration Token (for export) |
+| `NOTION_PARENT_PAGE_ID` | ⚪ | Notion page ID for exports |
+| `GMAIL_CREDENTIALS_FILE` | ⚪ | Gmail OAuth credentials JSON file (default: credentials.json) |
+| `GMAIL_TOKEN_FILE` | ⚪ | Gmail token pickle file (default: data/gmail_token.pickle) |
+| `DATABASE_URL` | ⚪ | PostgreSQL connection string (default: postgresql://localhost/workforce_agent) |
+| `LOG_LEVEL` | ⚪ | Logging level (default: INFO) |
+>>>>>>> Stashed changes
 
 The 1 req/min limit means extracting 100 channels takes ~100 minutes. This is normal for non-Marketplace apps.
 
