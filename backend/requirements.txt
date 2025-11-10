@@ -1,0 +1,47 @@
+# Core Backend
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.7
+websockets==12.0
+
+# AI/RAG Framework
+lightrag-hku==0.1.0
+langchain==0.1.20
+langgraph==0.0.40
+langchain-openai==0.0.8
+
+# Qwen3 Models
+transformers==4.38.2
+torch==2.2.1
+accelerate==0.27.2
+sentencepiece==0.2.0
+
+# OpenAI
+openai==1.12.0
+tiktoken==0.6.0
+
+# Database
+sqlalchemy==2.0.25
+psycopg2-binary==2.9.9
+pgvector==0.2.5
+alembic==1.13.1
+
+# Existing APIs
+slack-sdk==3.27.0
+google-api-python-client==2.118.0
+google-auth-httplib2==0.2.0
+google-auth-oauthlib==1.2.0
+notion-client==2.2.1
+
+# Utilities
+python-dotenv==1.0.1
+click==8.1.7
+rich==13.7.0
+tqdm==4.66.1
+pydantic==2.6.1
+pydantic-settings==2.1.0
+
+# Testing (optional)
+pytest==8.0.0
+pytest-asyncio==0.23.4
+httpx==0.26.0

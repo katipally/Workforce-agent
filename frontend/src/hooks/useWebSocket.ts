@@ -1,0 +1,149 @@
+import { useEffect, useRef, useState, useCallback } from 'react'
+import { useChatStore } from '../store/chatStore'
+
+interface WebSocketHook {
+  sendMessage: (query: string) => void
+  isConnected: boolean
+  connectionStatus: 'connecting' | 'connected' | 'disconnected' | 'error'
+}
+
+const WS_URL = 'ws://localhost:8000/api/chat/ws'
+const RECONNECT_INTERVAL = 3000 // 3 seconds
+const MAX_RECONNECT_ATTEMPTS = 5
+
+export function useWebSocket(): WebSocketHook {
+  const wsRef = useRef<WebSocket | null>(null)
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const reconnectAttemptsRef = useRef(0)
+  const [isConnected, setIsConnected] = useState(false)
+  const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected' | 'error'>('connecting')
+  
+  const {
+    setStreamingMessage,
+    appendStreamingToken,
+    setSources,
+    setIsStreaming,
+    finishStreaming,
+  } = useChatStore()
+  
+  const connect = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      return // Already connected
+    }
+    
+    setConnectionStatus('connecting')
+    console.log('Connecting to WebSocket...')
+    
+    const ws = new WebSocket(WS_URL)
+    
+    ws.onopen = () => {
+      console.log('✓ WebSocket connected')
+      setIsConnected(true)
+      setConnectionStatus('connected')
+      reconnectAttemptsRef.current = 0 // Reset reconnect counter
+    }
+    
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data)
+        
+        if (data.type === 'token') {
+          // Append streaming token
+          appendStreamingToken(data.content)
+        } else if (data.type === 'sources') {
+          // Receive sources
+          setSources(data.content)
+        } else if (data.type === 'done') {
+          // Streaming complete
+          finishStreaming()
+        } else if (data.type === 'status') {
+          // Status message
+          console.log('Status:', data.content)
+        } else if (data.type === 'error') {
+          console.error('Server error:', data.content)
+          setIsStreaming(false)
+          // Show error to user
+          finishStreaming()
+          setStreamingMessage(`Error: ${data.content}`)
+        }
+      } catch (error) {
+        console.error('Error parsing WebSocket message:', error)
+      }
+    }
+    
+    ws.onerror = (error) => {
+      console.error('WebSocket error:', error)
+      setIsConnected(false)
+      setConnectionStatus('error')
+    }
+    
+    ws.onclose = (event) => {
+      console.log('WebSocket disconnected', event.code, event.reason)
+      setIsConnected(false)
+      setConnectionStatus('disconnected')
+      wsRef.current = null
+      
+      // Attempt reconnection if not exceeded max attempts
+      if (reconnectAttemptsRef.current < MAX_RECONNECT_ATTEMPTS) {
+        reconnectAttemptsRef.current++
+        console.log(`Reconnecting... (attempt ${reconnectAttemptsRef.current}/${MAX_RECONNECT_ATTEMPTS})`)
+        
+        reconnectTimeoutRef.current = setTimeout(() => {
+          connect()
+        }, RECONNECT_INTERVAL)
+      } else {
+        console.error('Max reconnection attempts reached')
+        setConnectionStatus('error')
+      }
+    }
+    
+    wsRef.current = ws
+  }, [appendStreamingToken, setSources, setIsStreaming, finishStreaming, setStreamingMessage])
+  
+  useEffect(() => {
+    connect()
+    
+    // Cleanup on unmount
+    return () => {
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current)
+      }
+      if (wsRef.current) {
+        wsRef.current.close()
+      }
+    }
+  }, [connect])
+  
+  const sendMessage = useCallback((query: string) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      // Reset streaming state
+      setStreamingMessage('')
+      setSources([])
+      setIsStreaming(true)
+      
+      // Send query
+      try {
+        wsRef.current.send(JSON.stringify({ query }))
+        console.log('Query sent:', query.substring(0, 50) + '...')
+      } catch (error) {
+        console.error('Error sending message:', error)
+        setIsStreaming(false)
+        setStreamingMessage('Error: Failed to send message')
+      }
+    } else {
+      console.error('WebSocket is not connected. Status:', connectionStatus)
+      setStreamingMessage('Error: Connection lost. Reconnecting...')
+      
+      // Try to reconnect
+      if (reconnectAttemptsRef.current < MAX_RECONNECT_ATTEMPTS) {
+        connect()
+      }
+    }
+  }, [setStreamingMessage, setSources, setIsStreaming, connectionStatus, connect])
+  
+  return {
+    sendMessage,
+    isConnected,
+    connectionStatus,
+  }
+}
