@@ -1,9 +1,5 @@
 # 🤖 Workforce AI Agent
 
-**Your AI assistant that talks to Slack, Gmail, and Notion in plain English.**
-
-Ask questions like "Get messages from #social" or "Find emails from John" and the AI figures out what to do.
-
 ---
 
 ## ✨ What Can It Do?
