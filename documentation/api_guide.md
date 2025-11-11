@@ -1,15 +1,53 @@
-# API Setup Guide
+# 🔧 API Setup Guide - Workforce AI Agent
 
-Complete guide for setting up Slack, Notion, and Gmail APIs for the Workspace Agent.
+**Complete step-by-step guide for setting up Slack, Gmail, and Notion APIs.**
+
+This agent calls APIs **directly in real-time** - no database setup required first. Just add your API keys and start using it!
 
 ---
 
-## Table of Contents
+## 📋 Table of Contents
 
-1. [Slack API Setup](#slack-api-setup)
-2. [Notion API Setup](#notion-api-setup)
-3. [Gmail API Setup](#gmail-api-setup)
-4. [Quick Reference](#quick-reference)
+1. [OpenAI API Setup](#openai-api-setup) ⚡ **Required**
+2. [Slack API Setup](#slack-api-setup) 🔵 **For Slack features**
+3. [Gmail API Setup](#gmail-api-setup) 📧 **For Gmail features**
+4. [Notion API Setup](#notion-api-setup) 📝 **For Notion features**
+5. [Quick Reference](#quick-reference)
+
+---
+
+## ⚡ OpenAI API Setup
+
+**Required for AI brain to work.**
+
+### Step 1: Get API Key
+
+1. **Create OpenAI Account**
+   - Go to https://platform.openai.com/
+   - Sign up or log in
+
+2. **Create API Key**
+   - Go to https://platform.openai.com/api-keys
+   - Click "Create new secret key"
+   - Name it "Workforce Agent"
+   - Click "Create"
+   - **Copy the key** (starts with `sk-`)
+   - ⚠️ **Save it now** - you won't see it again!
+
+3. **Add to .env**
+   ```bash
+   OPENAI_API_KEY=sk-your-key-here
+   ```
+
+### Pricing (Pay-as-you-go)
+
+- **GPT-4 Turbo**: ~$0.01 per 1000 tokens input, ~$0.03 per output
+- **Typical query cost**: $0.001 - $0.01 per query
+- **Free tier**: $5 credit for new accounts
+
+**Estimated monthly cost for normal use:** $5-20/month
+
+---
 
 ---
 
@@ -145,35 +183,41 @@ Socket Mode allows real-time event streaming.
 
 ### Step 7: Configure Environment Variables
 
-Add to `.env`:
+Add to `.env` file in project root:
 ```bash
-# Slack API Tokens (Required)
+# Slack API Tokens (Required for Slack features)
 SLACK_BOT_TOKEN=xoxb-your-bot-token-here
 SLACK_APP_TOKEN=xapp-your-app-token-here
-
-# Slack App Credentials (Optional but recommended)
-SLACK_APP_ID=A09R6CU0295
-SLACK_CLIENT_ID=9884788367585.9856436002311
-SLACK_CLIENT_SECRET=your-client-secret-here
-SLACK_SIGNING_SECRET=your-signing-secret-here
-SLACK_VERIFICATION_TOKEN=your-verification-token-here
 ```
+
+**That's it!** You don't need the other credentials unless building advanced features.
 
 ### Step 8: Test Connection
 
+**Start the agent** and try this query in the web interface:
+
+```
+"Get all slack channel names"
+```
+
+You should see your actual channels listed!
+
+**Or test via CLI:**
 ```bash
-python main.py init
+cd backend
+python3 << 'EOF'
+from agent.langchain_tools import WorkforceTools
+tools = WorkforceTools()
+print(tools.get_all_slack_channels())
+EOF
 ```
 
 Expected output:
 ```
-✓ Connected to Slack
-  Workspace: Your Workspace Name
-  User: your_bot_name
-  Team ID: T12345678
-  Bot User ID: U12345678
-✓ Database initialized
-Initialization complete!
+Found 4 Slack channels:
+  #general - 🌐 Public - 5 members (ID: C123...)
+  #random - 🌐 Public - 3 members (ID: C456...)
+  ...
 ```
 
 ### Slack API Rate Limits
@@ -259,18 +303,30 @@ This step is CRITICAL - without it, the integration cannot access the page.
 
 Add to `.env`:
 ```bash
-# Notion API
-NOTION_TOKEN=secret_your-notion-token-here
+# Notion API (Optional - for Notion features)
+NOTION_API_KEY=secret_your-notion-token-here
 NOTION_PARENT_PAGE_ID=your-parent-page-id-here
 ```
 
 ### Step 5: Test Connection
 
-```bash
-python test_notion.py
+**Start the agent** and try this query:
+
+```
+"Create a Notion page titled Test Page"
 ```
 
-Expected: 10/10 tests pass ✅
+You should see a new page in your Notion workspace!
+
+**Or test via CLI:**
+```bash
+cd backend
+python3 << 'EOF'
+from agent.langchain_tools import WorkforceTools
+tools = WorkforceTools()
+print(tools.create_notion_page("Test Page", "This is a test"))
+EOF
+```
 
 ### Notion API Rate Limits
 
@@ -385,10 +441,12 @@ Before creating credentials, you must configure the consent screen.
 
 Add to `.env`:
 ```bash
-# Gmail API
-GMAIL_CREDENTIALS_FILE=credentials.json
-GMAIL_TOKEN_FILE=data/gmail_token.pickle
+# Gmail API (Optional - for Gmail features)
+GMAIL_CREDENTIALS_PATH=backend/core/credentials/gmail/credentials.json
+GMAIL_TOKEN_PATH=backend/core/credentials/gmail/token.pickle
 ```
+
+**Note:** Place `credentials.json` in `backend/core/credentials/gmail/` folder (create folders if needed).
 
 ### Step 6: First-Time Authentication
 
@@ -415,11 +473,23 @@ python test_gmail.py
 
 ### Step 7: Test Connection
 
-```bash
-python test_gmail.py
+**Start the agent** and try this query:
+
+```
+"Get emails from your-email@gmail.com"
 ```
 
-Expected: 10/10 tests pass ✅
+You should see your recent emails!
+
+**Or test via CLI:**
+```bash
+cd backend
+python3 << 'EOF'
+from agent.langchain_tools import WorkforceTools
+tools = WorkforceTools()
+print(tools.get_emails_from_sender("your-email@gmail.com", limit=5))
+EOF
+```
 
 ### Gmail API Quota Limits (Free Tier)
 
@@ -460,53 +530,85 @@ Expected: 10/10 tests pass ✅
 
 ---
 
-## Quick Reference
+## 📋 Quick Reference
 
-### Required Tokens
+### Required Environment Variables
 
-| Service | Variable | Format | Where to Get |
-|---------|----------|--------|--------------|
-| Slack | `SLACK_BOT_TOKEN` | `xoxb-...` | Slack App → Install App |
-| Slack | `SLACK_APP_TOKEN` | `xapp-...` | Slack App → Socket Mode |
-| Notion | `NOTION_TOKEN` | `secret_...` or `ntn_...` | Notion → My Integrations |
-| Gmail | `credentials.json` | JSON file | Google Cloud Console → Credentials |
+| Variable | Required | Format | Where to Get |
+|----------|----------|--------|--------------|
+| `OPENAI_API_KEY` | ✅ **YES** | `sk-...` | https://platform.openai.com/api-keys |
+| `SLACK_BOT_TOKEN` | For Slack | `xoxb-...` | Slack App → Install App |
+| `SLACK_APP_TOKEN` | For Slack | `xapp-...` | Slack App → Socket Mode |
+| `GMAIL_CREDENTIALS_PATH` | For Gmail | Path to JSON | Google Cloud Console |
+| `GMAIL_TOKEN_PATH` | For Gmail | Path to pickle | Auto-generated after OAuth |
+| `NOTION_API_KEY` | For Notion | `secret_...` | Notion → My Integrations |
+| `NOTION_PARENT_PAGE_ID` | For Notion | Page ID | Notion page URL |
+| `DATABASE_URL` | Optional | postgres://... | PostgreSQL connection |
+
+### Complete .env Template
+
+```bash
+# Required
+OPENAI_API_KEY=sk-your-key-here
+
+# Slack (Optional - for Slack features)
+SLACK_BOT_TOKEN=xoxb-your-bot-token
+SLACK_APP_TOKEN=xapp-your-app-token
+
+# Gmail (Optional - for Gmail features)
+GMAIL_CREDENTIALS_PATH=backend/core/credentials/gmail/credentials.json
+GMAIL_TOKEN_PATH=backend/core/credentials/gmail/token.pickle
+
+# Notion (Optional - for Notion features)
+NOTION_API_KEY=secret_your-token
+NOTION_PARENT_PAGE_ID=your-page-id
+
+# Database (Optional - auto-caching)
+DATABASE_URL=postgresql://localhost:5432/workforce_agent
+```
 
 ### Setup Summary
 
-**Slack:**
+**OpenAI (Required):**
+1. Go to https://platform.openai.com/api-keys
+2. Create new secret key
+3. Copy key → Add to `.env`
+
+**Slack (Optional):**
 1. Create app at https://api.slack.com/apps
-2. Add OAuth scopes
-3. Enable Socket Mode → Get app token
-4. Install app → Get bot token
-5. Add tokens to `.env`
+2. Add OAuth scopes (`channels:read`, `channels:history`, `chat:write`, `users:read`)
+3. Enable Socket Mode → Get `xapp-` token
+4. Install app → Get `xoxb-` token
+5. Add both to `.env`
 
-**Notion:**
-1. Create integration at https://www.notion.so/my-integrations
-2. Copy integration token
-3. Get parent page ID from URL
-4. Share page with integration
-5. Add token and page ID to `.env`
-
-**Gmail:**
+**Gmail (Optional):**
 1. Create project at https://console.cloud.google.com/
 2. Enable Gmail API
-3. Configure OAuth consent screen
-4. Create OAuth credentials (Desktop app)
-5. Download `credentials.json`
-6. Run `python test_gmail.py` (OAuth flow)
+3. Create OAuth credentials (Desktop app)
+4. Download `credentials.json` → Place in `backend/core/credentials/gmail/`
+5. First query triggers OAuth flow
 
-### Test Commands
+**Notion (Optional):**
+1. Create integration at https://www.notion.so/my-integrations
+2. Copy token → Add to `.env`
+3. Get page ID from URL → Add to `.env`
+4. Share page with integration
 
+### Testing
+
+**Start the agent:**
 ```bash
-# Slack
-python main.py init
-python test_slack.py
+./START_SERVERS.sh        # Mac/Linux
+# Or manually start backend + frontend (see README.md)
+```
 
-# Notion
-python test_notion.py
+**Open browser:** http://localhost:5173
 
-# Gmail
-python test_gmail.py
+**Try queries:**
+```
+"Get all slack channel names"
+"Get emails from john@example.com"
+"Create a Notion page titled Test"
 ```
 
 ### Common Issues

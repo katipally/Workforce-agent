@@ -1,164 +1,314 @@
 # 🤖 Workforce AI Agent
 
-**An intelligent AI assistant that unifies your Slack, Gmail, and Notion workspace with GPT-4 powered multi-tool automation.**
+**Your AI assistant that talks to Slack, Gmail, and Notion in plain English.**
 
-## ✅ Status: **PRODUCTION READY** (Nov 10, 2025)
-
-### **What Makes This Special**
-- 🧠 **Multi-Tool Intelligence**: AI automatically chains up to 5 tools to complete complex tasks
-- 💾 **Persistent Memory**: ALL API data extracted and stored at startup for instant access
-- 🎯 **26 Comprehensive Tools**: Full Slack/Gmail/Notion API capabilities
-- 🔄 **Auto Data Sync**: Syncs users, channels, messages, emails, labels, threads, pages
-- ⚡ **Real-Time Streaming**: Token-by-token responses via WebSocket
-- 🚀 **Production Ready**: Robust error handling, auto-reconnection, graceful shutdowns
-
-### **Recent Updates (Nov 10, 2025)**
-- ✅ **26 comprehensive tools** - Full API access to Slack, Gmail, Notion
-- ✅ **Automatic data sync** - Extracts and stores ALL data from APIs at startup
-- ✅ **Multi-tool calling** - AI chains up to 5 tools automatically
-- ✅ **Memory storage** - All API data stored in PostgreSQL for instant access
-- ✅ **Advanced features** - Reactions, labels, threads, topics, page updates
-- ✅ **Production ready** - Zero errors, graceful handling, robust sync
+Ask questions like "Get messages from #social" or "Find emails from John" and the AI figures out what to do.
 
 ---
 
-## ✨ Features
+## ✨ What Can It Do?
 
-### Slack Integration
-- **Data Extraction**: Users, channels, messages, files, reactions
-- **Real-time Streaming**: Socket Mode for live event monitoring
-- **Message Operations**: Send, receive, format, delete
-- **File Management**: Upload and download files
-- **Notion Export**: Export Slack data to formatted Notion pages
+### 📱 **Slack (10 features)**
+- Get all channel names
+- Read messages from any channel  
+- Send messages to channels
+- Get user information (email, timezone)
+- Get thread replies
+- Add reactions to messages
+- Set channel topics
+- Search messages
+- Summarize channel activity
 
-### Gmail Integration
-- **Email Extraction**: Emails, threads, labels, attachments
-- **Thread Support**: Complete conversation history
-- **Attachment Download**: Save email attachments locally
-- **Smart Queries**: Search and filter emails efficiently
-- **Notion Export**: Export Gmail data to formatted Notion pages
-- **Free Tier Optimized**: Quota-aware extraction
+### 📧 **Gmail (9 features)**
+- Get emails from specific people
+- Find emails by subject
+- Send emails
+- Mark emails as read
+- Archive emails
+- Add labels to emails
+- Get email threads (conversations)
+- List all labels/folders
+- Search emails
 
-### Data Management
-- **PostgreSQL Database**: Production-ready database with pgvector support
-- **AI/RAG Ready**: Vector embeddings support for semantic search
-- **Statistics**: View counts and analytics
-- **Structured Storage**: Relational database with full indexing
+### 📝 **Notion (5 features)**
+- Create new pages
+- Read page content
+- Update page titles
+- List all pages
+- Search Notion content
+
+### 🎯 **Smart Features**
+- **Multi-Tool Workflows**: AI chains multiple actions automatically
+  - Example: "Get messages from #team and save to Notion" → AI does both steps
+- **Natural Language**: Just type what you want in plain English
+- **Live Data**: Always fetches fresh data from APIs
+- **Streaming Responses**: See results as they're generated
 
 ---
 
-## 📋 Requirements
+## 🚀 Quick Setup
 
-- Python 3.8+
-- PostgreSQL 14+ (with pgvector for AI features)
-- Slack workspace with admin access (for Slack integration)
-- Google account with Gmail (for Gmail integration)
-- Notion account (for Notion export)
+### **Prerequisites**
 
----
+**Windows:**
+- Python 3.10 or higher ([Download](https://www.python.org/downloads/))
+- Node.js 18 or higher ([Download](https://nodejs.org/))
+- PostgreSQL 14+ ([Download](https://www.postgresql.org/download/windows/))
 
-## 🚀 Quick Start
-
-### 1. Install Dependencies
+**Mac:**
 ```bash
+# Install Homebrew if you don't have it
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# Install Python
+brew install python@3.12
+
+# Install Node.js
+brew install node
+
+# Install PostgreSQL
+brew install postgresql@14
+brew services start postgresql@14
+```
+
+---
+
+## 📦 Installation
+
+### **1. Clone Repository**
+
+**Windows (Command Prompt):**
+```cmd
+git clone https://github.com/yourusername/Workforce-agent.git
+cd Workforce-agent
+```
+
+**Mac (Terminal):**
+```bash
+git clone https://github.com/yourusername/Workforce-agent.git
+cd Workforce-agent
+```
+
+### **2. Install Python Dependencies**
+
+**Windows:**
+```cmd
 pip install -r requirements.txt
 ```
 
-### 2. Setup PostgreSQL
+**Mac:**
 ```bash
-# Create database
-createdb workforce_agent
-
-# Optional: Enable pgvector for AI/RAG (if available)
-psql workforce_agent -c "CREATE EXTENSION vector;"
+pip3 install -r requirements.txt
 ```
 
-### 3. Configure Environment Variables
-Copy `.env.example` to `.env` and fill in your credentials:
+### **3. Install Frontend Dependencies**
+
+**Both Windows & Mac:**
 ```bash
-# Slack
-SLACK_BOT_TOKEN=xoxb-your-bot-token
-SLACK_APP_TOKEN=xapp-your-app-token
+cd frontend
+npm install
+cd ..
+```
 
-# Gmail (optional)
-GMAIL_CREDENTIALS_FILE=google-credentials.json
+### **4. Create Database**
 
-# Notion (optional)  
-NOTION_TOKEN=secret_your-token
+**Windows (Command Prompt):**
+```cmd
+createdb workforce_agent
+```
+
+**Mac (Terminal):**
+```bash
+createdb workforce_agent
+```
+
+### **5. Configure API Keys**
+
+Copy the example environment file:
+
+**Windows:**
+```cmd
+copy .env.example .env
+```
+
+**Mac:**
+```bash
+cp .env.example .env
+```
+
+Then edit `.env` file and add your API keys:
+
+```bash
+# Required
+OPENAI_API_KEY=sk-your-openai-key-here
+SLACK_BOT_TOKEN=xoxb-your-slack-bot-token
+SLACK_APP_TOKEN=xapp-your-slack-app-token
+
+# Optional (add if you want Gmail/Notion)
+GMAIL_CREDENTIALS_PATH=backend/core/credentials/gmail/credentials.json
+NOTION_API_KEY=secret_your-notion-key
 NOTION_PARENT_PAGE_ID=your-page-id
 
 # Database
-DATABASE_URL=postgresql://localhost/workforce_agent
+DATABASE_URL=postgresql://localhost:5432/workforce_agent
 ```
-
-### 4. Test Connection
-```bash
-python main.py init
-python main.py stats
-```
-
-### 5. Start AI Agent (WebSocket API + Frontend)
-```bash
-# Quick start (recommended)
-./START_SERVERS.sh
-
-# Or manually:
-# Terminal 1 - Backend
-cd backend
-uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
-
-# Terminal 2 - Frontend  
-cd frontend
-npm run dev
-
-# Then open: http://localhost:5173
-```
-
-**Features:**
-- ⚡ Auto-reconnecting WebSocket for real-time streaming
-- 🛡️ Robust error handling (development + production)
-- 📊 Health monitoring: `http://localhost:8000/health`
-- 📚 API docs: `http://localhost:8000/docs`
-- 🔄 Hot reload enabled for development
 
 ---
 
-## 📋 Available Commands
+## 🔑 Getting API Keys
 
-### Data Extraction
+### **OpenAI (Required)**
+1. Go to https://platform.openai.com/api-keys
+2. Click "Create new secret key"
+3. Copy the key (starts with `sk-`)
+4. Add to `.env` as `OPENAI_API_KEY`
+
+### **Slack (Required for Slack features)**
+1. Go to https://api.slack.com/apps
+2. Click "Create New App" → "From scratch"
+3. Name it "Workforce Agent", select your workspace
+4. Go to "OAuth & Permissions"
+   - Add scopes: `channels:history`, `channels:read`, `chat:write`, `users:read`
+5. Go to "Socket Mode" → Enable it
+   - Generate app token (starts with `xapp-`)
+   - Add to `.env` as `SLACK_APP_TOKEN`
+6. Install app to workspace
+   - Copy Bot User OAuth Token (starts with `xoxb-`)
+   - Add to `.env` as `SLACK_BOT_TOKEN`
+
+**Full setup guide:** See `Documentation/api_guide.md`
+
+### **Gmail (Optional)**
+1. Go to https://console.cloud.google.com/
+2. Create new project
+3. Enable Gmail API
+4. Create OAuth credentials (Desktop app)
+5. Download `credentials.json`
+6. Place in `backend/core/credentials/gmail/`
+
+**Full setup guide:** See `Documentation/api_guide.md`
+
+### **Notion (Optional)**
+1. Go to https://www.notion.so/my-integrations
+2. Create new integration
+3. Copy token (starts with `secret_`)
+4. Share a Notion page with the integration
+5. Copy page ID from URL
+6. Add both to `.env`
+
+**Full setup guide:** See `Documentation/api_guide.md`
+
+---
+
+## ▶️ Starting the Agent
+
+### **Option 1: Use Startup Script (Recommended)**
+
+**Mac/Linux:**
 ```bash
-# Slack
-python main.py extract-all         # Extract everything (users, channels, messages)
-python main.py extract-users       # Users only
-python main.py extract-channels    # Channels only
-python main.py extract-messages    # Messages only
-python main.py extract-files       # Files only
-
-# Gmail
-python main.py gmail-extract       # Extract Gmail emails
-
-# Statistics
-python main.py stats               # Slack statistics
-python main.py gmail-stats         # Gmail statistics
+./START_SERVERS.sh
 ```
 
-### Real-Time Monitoring
-```bash
-python main.py stream              # Start real-time event streaming (Ctrl+C to stop)
+**Windows:**
+```cmd
+# Start backend
+cd backend
+uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
+
+# In another terminal, start frontend
+cd frontend
+npm run dev
 ```
 
-### Send Messages & Files
+### **Option 2: Manual Start**
+
+**Terminal 1 - Backend:**
 ```bash
-python main.py send "#channel" "Hello!"              # Send message
-python main.py upload "#channel" /path/to/file.pdf   # Upload file
-python main.py react CHANNEL_ID MSG_TS thumbsup      # Add reaction
+cd backend
+uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-### Notion Export
+**Terminal 2 - Frontend:**
 ```bash
-python main.py export-to-notion      # Export Slack data to Notion
-python main.py gmail-notion          # Export Gmail data to Notion
-python main.py export-all-to-notion  # Export everything to Notion
+cd frontend
+npm run dev
+```
+
+### **Access the Agent**
+
+Open your browser to: **http://localhost:5173**
+
+---
+
+## 💬 Example Queries
+
+Try these in the chat interface:
+
+### **Slack**
+```
+"Get all slack channel names"
+"Show me messages from #social"
+"Send a message to #team saying 'Hello everyone'"
+"Get user info for U12345678"
+"Summarize what happened in #engineering today"
+```
+
+### **Gmail**
+```
+"Get emails from john@company.com"
+"Find emails with subject 'project'"
+"Show me unread emails"
+```
+
+### **Notion**
+```
+"Create a Notion page titled 'Meeting Notes'"
+"List all my Notion pages"
+```
+
+### **Multi-Tool (Advanced)**
+```
+"Get messages from #social and save them to Notion"
+"Find emails about 'budget' and summarize them"
+"Get all channels and list their members"
+```
+
+---
+
+## 🛠️ Troubleshooting
+
+### **Backend won't start**
+- Check Python version: `python --version` (needs 3.10+)
+- Install dependencies: `pip install -r requirements.txt`
+- Check database: `psql -l` (should see `workforce_agent`)
+
+### **Frontend won't start**
+- Check Node version: `node --version` (needs 18+)
+- Install dependencies: `cd frontend && npm install`
+- Check port 5173 is free: `lsof -i:5173`
+
+### **"Slack API not configured" error**
+- Check `.env` file has `SLACK_BOT_TOKEN` starting with `xoxb-`
+- Check `SLACK_APP_TOKEN` starting with `xapp-`
+- Restart backend after adding keys
+
+### **"Gmail not authenticated" error**
+- Run first-time authentication: `cd backend && python -m core.gmail.extractor`
+- Browser should open for OAuth
+- After authentication, restart backend
+
+### **Port already in use**
+
+**Windows:**
+```cmd
+netstat -ano | findstr :8000
+taskkill /PID <PID> /F
+```
+
+**Mac:**
+```bash
+lsof -ti:8000 | xargs kill -9
+lsof -ti:5173 | xargs kill -9
 ```
 
 ---
@@ -167,326 +317,69 @@ python main.py export-all-to-notion  # Export everything to Notion
 
 ```
 Workforce-agent/
-├── cli/                    # CLI commands
-│   └── main.py            # All CLI commands
-├── config.py              # Configuration
-├── database/              # PostgreSQL database
-│   ├── models.py          # Data models (with pgvector support)
-│   └── db_manager.py      # Database operations
-├── slack/                 # Slack integration (unified)
-│   ├── client.py          # Unified Slack API client
-│   ├── extractor/         # Data extraction
-│   ├── sender/            # Sending messages/files
-│   └── realtime/          # Real-time streaming
-├── gmail/                 # Gmail integration
-│   └── extractor.py       # Gmail data extraction
-├── utils/                 # Utilities
-│   ├── logger.py
-│   ├── rate_limiter.py
-│   └── backoff.py
-├── test-files/            # All test files
-├── main.py                # Entry point
-└── requirements.txt       # Dependencies
+├── backend/
+│   ├── agent/              # AI brain & tools
+│   │   ├── ai_brain.py     # GPT-4 + multi-tool logic
+│   │   └── langchain_tools.py  # 26 API tools
+│   ├── api/                # FastAPI server
+│   │   └── main.py         # WebSocket endpoints
+│   ├── core/               # API integrations
+│   │   ├── slack/          # Slack API
+│   │   ├── gmail/          # Gmail API
+│   │   └── notion_export/  # Notion API
+│   └── database/           # PostgreSQL models
+├── frontend/               # React UI
+│   └── src/
+│       └── components/     # Chat interface
+├── Documentation/          # Full API setup guides
+├── .env                    # Your API keys (create this)
+├── .env.example            # Template
+├── START_SERVERS.sh        # Mac/Linux startup
+└── STOP_SERVERS.sh         # Shutdown script
 ```
 
 ---
 
-## 🗄️ Database Schema
+## 📚 Documentation
 
-**PostgreSQL database:** `workforce_agent`
-
-**Features:**
-- Relational integrity with foreign keys
-- Full-text search ready
-- pgvector support for AI/RAG semantic search
-- Connection pooling and automatic reconnection
-
-### Tables
-
-**Slack:**
-- `workspaces` - Workspace metadata
-- `users` - User profiles
-- `channels` - All channel types
-- `messages` - Complete message history
-- `files` - File metadata
-- `reactions` - Emoji reactions
-- `sync_status` - Extraction progress tracking
-
-**Gmail:**
-- `gmail_accounts` - Email accounts
-- `gmail_labels` - Gmail labels/folders
-- `gmail_threads` - Email threads
-- `gmail_messages` - Individual emails
-- `gmail_attachments` - Email attachments
+- **Full API Setup Guide:** `Documentation/api_guide.md`
+- **Slack API Details:** `Documentation/SLACK_API_GUIDE.md`
+- **API Endpoints:** http://localhost:8000/docs (when running)
 
 ---
 
-## ⚙️ Environment Variables
+## 🆘 Getting Help
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `SLACK_BOT_TOKEN` | ✅ | Bot User OAuth Token (xoxb-...) |
-| `SLACK_APP_TOKEN` | ✅ | App-Level Token for Socket Mode (xapp-...) |
-| `NOTION_TOKEN` | ⚪ | Notion Integration Token |
-| `NOTION_PARENT_PAGE_ID` | ⚪ | Notion page ID for exports |
-| `GMAIL_CREDENTIALS_FILE` | ⚪ | Gmail OAuth credentials (default: google-credentials.json) |
-| `DATABASE_URL` | ⚪ | PostgreSQL connection (default: postgresql://localhost/workforce_agent) |
-| `LOG_LEVEL` | ⚪ | Logging level (default: INFO) |
+1. **Check logs:**
+   - Backend: `tail -f logs/backend.log`
+   - Frontend: Check browser console (F12)
 
----
+2. **Test API connection:**
+   ```bash
+   curl http://localhost:8000/health
+   ```
 
-## 🎯 Use Cases
-
-### Full Workspace Backup
-```bash
-python main.py extract-all
-```
-
-### Monitor Real-Time Activity  
-```bash
-python main.py stream
-```
-
-### Email Archive
-```bash
-python main.py gmail-extract
-```
-
-### Export to Notion
-```bash
-python main.py export-all-to-notion
-```
+3. **Restart everything:**
+   - Stop: `./STOP_SERVERS.sh` (Mac) or close terminals (Windows)
+   - Start: `./START_SERVERS.sh` (Mac) or manual start (Windows)
 
 ---
 
-## 🛠️ Tech Stack
+## 🎯 What Makes This Special
 
-- **Python 3.10+**
-- **PostgreSQL 14+** with pgvector
-- **SQLAlchemy** - Database ORM
-- **slack-sdk** - Official Slack SDK
-- **google-api-python-client** - Gmail API
-- **notion-client** - Notion API
-- **Rich** - Beautiful CLI output
-- **Click** - Command-line interface
+- **No Database Setup Needed**: Just add API keys and go
+- **Always Fresh Data**: Calls APIs in real-time
+- **Smart AI**: GPT-4 decides which tools to use
+- **Multi-Tool Workflows**: Chains actions automatically
+- **Natural Language**: No commands to memorize
+- **Production Ready**: Robust error handling, auto-reconnection
 
 ---
 
-## 🤖 AI Agent Architecture (Final)
+## 📝 License
 
-### **Tech Stack**
-- **RAG Framework**: LightRAG (fast retrieval) + LangChain (tools) + LangGraph (workflow orchestration)
-- **Embedding Model**: Qwen3-Embedding-8B (8192 dims, #1 on MTEB leaderboard)
-- **Reranker**: Qwen3-Reranker-4B (native Qwen integration, 4B parameters)
-- **LLM**: OpenAI GPT-4-Turbo (via user API key)
-- **Vector DB**: PostgreSQL + pgvector
-- **Backend**: FastAPI + WebSocket (streaming)
-- **Frontend**: React + Vite + TanStack Query + shadcn/ui
-- **HTTP Client**: Native fetch + TanStack Query (caching, streaming)
-
-### **Architecture Layers**
-```
-React Frontend (TanStack Query + WebSocket)
-           ↓
-FastAPI Backend (async, streaming)
-           ↓
-LangGraph Workflow (state management, routing)
-           ↓
-LangChain Tools (Slack, Gmail, Notion actions)
-           ↓
-LightRAG Engine (hybrid retrieval)
-           ↓
-Qwen3 Embedding + Reranker
-           ↓
-PostgreSQL + pgvector (8192 dims)
-```
-
-### **Key Features**
-- ⚡ **Hybrid RAG**: Semantic (Qwen3) + Keyword (PostgreSQL FTS) + Reranking
-- 🔄 **Streaming**: Token-by-token responses via WebSocket
-- 🎯 **Accuracy**: 90%+ retrieval accuracy with Qwen3 + reranking
-- 🚀 **Speed**: <500ms retrieval, streaming responses
-- 📊 **Source Citations**: Every answer linked to Slack/Gmail/Notion sources
-- 🔧 **Agent Tools**: Send messages, emails, create Notion pages, search data
-
-### 🤖 Workforce AI Agent
-
-> **Context-aware AI assistant that unifies Slack, Gmail, and Notion with RAG**
-
-Your personal AI agent that understands your conversations, emails, and documents. Ask questions in natural language and get answers backed by your actual data.
-
-## ✅ **Status: Production Ready (Nov 2025)**
-
-All core issues fixed and validated:
-- ✅ Backend imports and module paths
-- ✅ Frontend build with latest packages
-- ✅ TypeScript strict mode enabled
-- ✅ Accessibility standards met
-- ✅ All dependencies up-to-date
+MIT License - See LICENSE file
 
 ---
 
-**Built for production with Nov 2025 API methods**
-
----
-
-## 📋 API Setup Guide
-
-### **1. Slack API Setup**
-
-#### Create Slack App
-1. Go to https://api.slack.com/apps
-2. Click **"Create New App"** → **"From scratch"**
-3. Name: `Workforce AI Agent`, choose your workspace
-
-#### Configure Permissions
-Add these **Bot Token Scopes**:
-- `channels:history`, `channels:read` - Read public channels
-- `chat:write` - Send messages
-- `users:read` - View users
-- `groups:history` - Read private channels
-- `files:read`, `files:write` - File operations
-
-#### Install & Get Tokens
-1. Install app to workspace
-2. Copy **Bot User OAuth Token** (xoxb-...)
-3. Enable **Socket Mode** → Generate token (xapp-...)
-
-### **2. Gmail API Setup**
-
-#### Enable API
-1. Go to https://console.cloud.google.com/
-2. Create project: `Workforce AI Agent`
-3. Enable **Gmail API** from Library
-
-#### Create OAuth Credentials
-1. Go to **APIs & Services** → **Credentials**
-2. Create **OAuth client ID** → **Desktop app**
-3. Download JSON as `credentials.json`
-4. Place in: `backend/core/credentials/gmail/`
-
-#### First Authentication
-```bash
-cd backend
-python -m core.gmail.extractor extract --max-messages 10
-# Browser opens → Authenticate → token.pickle created
-```
-
-### **3. Notion API Setup**
-
-#### Create Integration
-1. Go to https://www.notion.so/my-integrations
-2. **New integration**: `Workforce AI Agent`
-3. Copy **Internal Integration Token**
-
-#### Share Page
-1. Open Notion page
-2. Click **Share** → Invite your integration
-3. Copy **Page ID** from URL
-
-### **4. OpenAI API Setup**
-
-1. Get API key from https://platform.openai.com/api-keys
-2. Recommended model: `gpt-4-turbo-preview` (best) or `gpt-3.5-turbo` (faster/cheaper)
-
-### **5. Update .env File**
-
-```bash
-# OpenAI
-OPENAI_API_KEY=sk-your-key-here
-
-# Slack
-SLACK_BOT_TOKEN=xoxb-your-bot-token
-SLACK_APP_TOKEN=xapp-your-app-token
-
-# Gmail
-GMAIL_CREDENTIALS_PATH=backend/core/credentials/gmail/credentials.json
-GMAIL_TOKEN_PATH=backend/core/credentials/gmail/token.pickle
-
-# Notion
-NOTION_API_KEY=secret_your-notion-token
-NOTION_PARENT_PAGE_ID=your-page-id
-
-# Database
-DATABASE_URL=postgresql://user@localhost:5432/workforce_agent
-```
-
----
-
-## 🔥 How It Works - LIVE API Access
-
-### **Real-Time API Calls**
-The AI agent calls Slack/Gmail/Notion APIs **directly** when you ask questions:
-
-**Example Flow:**
-```
-You: "Get all slack channel names"
-↓
-AI Brain decides to use: get_all_slack_channels()
-↓
-Tool calls Slack API: conversations_list()
-↓
-Returns: Found 4 Slack channels:
-  #all-agent-testing - 🌐 Public - 2 members
-  #new-channel - 🌐 Public - 2 members
-  ...
-```
-
-**Benefits:**
-- ✅ **Always fresh data** - Direct from API, no stale database
-- ✅ **No setup required** - Just configure API keys and go
-- ✅ **Auto-caching** - Results cached in PostgreSQL for RAG
-- ✅ **Semantic search** - Cached data available for embeddings
-
-### **Data Flow Architecture**
-```
-User Query → AI Brain → Tool Selection → API Call → Cache to DB → Return Result
-                          ↓
-                     (Slack/Gmail/Notion APIs)
-                          ↓
-                     PostgreSQL + pgvector
-                          ↓
-                     RAG Engine (semantic search)
-```
-
----
-
-## 🎯 Example Usage
-
-### **Multi-Tool Automation**
-The AI automatically chains tools for complex tasks:
-
-```
-You: "Get all messages from #social and save to Notion"
-
-AI: I'll help you with that. Let me:
-1. Retrieve all messages from #social
-2. Create a Notion page with the content
-
-[Executes: get_channel_messages("social") → create_notion_page(...)]
-
-✓ Created Notion page "Social Channel Messages" with 47 messages
-```
-
-### **Smart Summarization**
-```
-You: "Summarize what happened in #general"
-
-AI: I'll get messages and provide a summary.
-[Executes: summarize_slack_channel("general")]
-
-Summary: The team discussed Q4 goals (12 messages), John raised budget concerns (3 messages), and Sarah shared new designs (8 messages). Key decision: Meeting scheduled for Thursday at 3pm.
-```
-
-### **Cross-Platform Search**
-```
-You: "Find all emails from john@company.com about the project"
-
-AI: Searching emails from john@company.com...
-[Executes: get_emails_from_sender("john@company.com")]
-
-Found 5 emails:
-1. [Nov 9] "Project Update" - Status report and timeline...
-2. [Nov 7] "Budget Review" - Q4 budget concerns...
-[...continues]
-```
+**Made with ❤️ | Built for productivity | Powered by GPT-4**
