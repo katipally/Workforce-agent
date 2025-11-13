@@ -171,7 +171,7 @@ class WorkforceAIBrain:
         self,
         openai_api_key: str,
         rag_engine: HybridRAGEngine,
-        model: str = "gpt-4-turbo-preview",
+        model: str = "gpt-4o-mini",
         temperature: float = 0.7
     ):
         """Initialize the AI brain.
@@ -179,7 +179,8 @@ class WorkforceAIBrain:
         Args:
             openai_api_key: OpenAI API key
             rag_engine: RAG engine for context retrieval
-            model: OpenAI model to use (gpt-4-turbo-preview recommended)
+            model: OpenAI model to use (default: gpt-4o-mini - cost-efficient, Nov 2025)
+                   Options: gpt-4o-mini (cheapest), gpt-4o (best), gpt-4-turbo (legacy)
             temperature: Model temperature (0.7 for balanced creativity)
         """
         self.client = AsyncOpenAI(api_key=openai_api_key)
@@ -191,7 +192,7 @@ class WorkforceAIBrain:
         # Get available tools
         self.tools = self._define_tools()
         
-        logger.info(f"AI Brain initialized: {model}")
+        logger.info(f"✓ AI Brain initialized with model: {model}")
         logger.info(f"Available tools: {len(self.tools)}")
     
     def _define_tools(self) -> List[Dict[str, Any]]:
@@ -462,6 +463,444 @@ class WorkforceAIBrain:
                         "required": ["query"]
                     }
                 }
+            },
+            # NEW GMAIL TOOLS - Nov 2025
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_full_email_content",
+                    "description": "Get COMPLETE email content with full body (not just snippet). Use this when user wants to read entire email.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "message_id": {
+                                "type": "string",
+                                "description": "Gmail message ID from search results"
+                            }
+                        },
+                        "required": ["message_id"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_unread_email_count",
+                    "description": "Get exact count of unread emails. Use when user asks 'how many unread emails'.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "advanced_gmail_search",
+                    "description": "Advanced Gmail search with ALL operators: from:, to:, subject:, has:attachment, is:unread, is:starred, label:, after:, before:, filename:, larger:, smaller:. Use for complex email searches.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Gmail search query with operators (e.g., 'from:john has:attachment is:unread')"
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum results (default: 20)",
+                                "default": 20
+                            }
+                        },
+                        "required": ["query"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_complete_email_thread",
+                    "description": "Get COMPLETE email thread with ALL messages - CRITICAL for long company email threads. Retrieves entire conversation history no matter how many messages. Use this when user wants full thread/conversation.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "thread_id": {
+                                "type": "string",
+                                "description": "Gmail thread ID (from search results)"
+                            }
+                        },
+                        "required": ["thread_id"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_email_threads",
+                    "description": "Search for email threads (conversations) and get thread summaries with message counts. Use this to find threads, then get_complete_email_thread to read full content.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Gmail search query (supports all operators: from:, to:, subject:, etc.)"
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum threads to return (default: 10)",
+                                "default": 10
+                            }
+                        },
+                        "required": ["query"]
+                    }
+                }
+            },
+            # NEW SLACK TOOLS - Nov 2025
+            {
+                "type": "function",
+                "function": {
+                    "name": "upload_file_to_slack",
+                    "description": "Upload a file to Slack channel. Use when user wants to share/upload files.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "channel": {
+                                "type": "string",
+                                "description": "Channel ID"
+                            },
+                            "file_content": {
+                                "type": "string",
+                                "description": "File path or content to upload"
+                            },
+                            "filename": {
+                                "type": "string",
+                                "description": "Name for the file"
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "Optional file title"
+                            }
+                        },
+                        "required": ["channel", "file_content", "filename"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "pin_slack_message",
+                    "description": "Pin a message in Slack channel for visibility.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "channel": {
+                                "type": "string",
+                                "description": "Channel ID"
+                            },
+                            "timestamp": {
+                                "type": "string",
+                                "description": "Message timestamp"
+                            }
+                        },
+                        "required": ["channel", "timestamp"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "unpin_slack_message",
+                    "description": "Unpin a message from Slack channel.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "channel": {"type": "string", "description": "Channel ID"},
+                            "timestamp": {"type": "string", "description": "Message timestamp"}
+                        },
+                        "required": ["channel", "timestamp"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_pinned_messages",
+                    "description": "Get all pinned messages in a Slack channel.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "channel": {"type": "string", "description": "Channel ID"}
+                        },
+                        "required": ["channel"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "create_slack_channel",
+                    "description": "Create a new Slack channel (public or private).",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Channel name (lowercase, no spaces)"
+                            },
+                            "is_private": {
+                                "type": "boolean",
+                                "description": "Create as private channel (default: false)",
+                                "default": False
+                            }
+                        },
+                        "required": ["name"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "archive_slack_channel",
+                    "description": "Archive a Slack channel.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "channel": {"type": "string", "description": "Channel ID to archive"}
+                        },
+                        "required": ["channel"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "invite_to_slack_channel",
+                    "description": "Invite users to a Slack channel.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "channel": {"type": "string", "description": "Channel ID"},
+                            "users": {"type": "string", "description": "Comma-separated user IDs"}
+                        },
+                        "required": ["channel", "users"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "update_slack_message",
+                    "description": "Update/edit a previously sent Slack message.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "channel": {"type": "string", "description": "Channel ID"},
+                            "timestamp": {"type": "string", "description": "Message timestamp"},
+                            "text": {"type": "string", "description": "New message text"}
+                        },
+                        "required": ["channel", "timestamp", "text"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "delete_slack_message",
+                    "description": "Delete a Slack message.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "channel": {"type": "string", "description": "Channel ID"},
+                            "timestamp": {"type": "string", "description": "Message timestamp"}
+                        },
+                        "required": ["channel", "timestamp"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_all_slack_users",
+                    "description": "List all users in the Slack workspace with emails and IDs.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                }
+            },
+            # NEW NOTION TOOLS - Nov 2025
+            {
+                "type": "function",
+                "function": {
+                    "name": "append_to_notion_page",
+                    "description": "Append content to an existing Notion page. Use to add content to pages.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "page_id": {"type": "string", "description": "Page ID to append to"},
+                            "content": {"type": "string", "description": "Content to append"}
+                        },
+                        "required": ["page_id", "content"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_notion_workspace",
+                    "description": "Search across entire Notion workspace for pages and databases.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "Search query"}
+                        },
+                        "required": ["query"]
+                    }
+                }
+            },
+            # PROJECT TRACKING TOOLS - Nov 2025
+            {
+                "type": "function",
+                "function": {
+                    "name": "track_project",
+                    "description": "Track a project across Slack, Gmail, and Notion. POWERFUL cross-platform aggregation that gathers updates from all sources, analyzes them, identifies key points, action items, blockers, and calculates progress. Use when user asks about project status or wants to see all updates.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "project_name": {
+                                "type": "string",
+                                "description": "Name of the project to track (e.g., 'Q4 Dashboard', 'Agent Project', 'Mobile App')"
+                            },
+                            "days_back": {
+                                "type": "integer",
+                                "description": "Number of days of history to include (default: 7)",
+                                "default": 7
+                            },
+                            "notion_page_id": {
+                                "type": "string",
+                                "description": "Optional Notion page ID to associate with project",
+                                "default": None
+                            }
+                        },
+                        "required": ["project_name"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "generate_project_report",
+                    "description": "Generate a comprehensive formatted project report suitable for stakeholders. Creates detailed ASCII report with progress bars, statistics, and organized sections. Use when user wants a formal project report or summary to share.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "project_name": {
+                                "type": "string",
+                                "description": "Name of the project"
+                            },
+                            "days_back": {
+                                "type": "integer",
+                                "description": "Number of days to include in report (default: 7)",
+                                "default": 7
+                            }
+                        },
+                        "required": ["project_name"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "update_project_notion_page",
+                    "description": "Update existing Notion page with current project status. IMPORTANT: This UPDATES an existing page, does NOT create new one. Automatically tracks project across all platforms and appends formatted status update to the specified Notion page. Use when user wants to update project documentation.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "page_id": {
+                                "type": "string",
+                                "description": "ID of existing Notion page to update"
+                            },
+                            "project_name": {
+                                "type": "string",
+                                "description": "Name of the project"
+                            },
+                            "days_back": {
+                                "type": "integer",
+                                "description": "Days of history to include (default: 7)",
+                                "default": 7
+                            }
+                        },
+                        "required": ["page_id", "project_name"]
+                    }
+                }
+            },
+            # UTILITY TOOLS - Nov 2025
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_all_platforms",
+                    "description": "Search across ALL platforms (Slack, Gmail, Notion) simultaneously for a query. Returns unified results from all sources. Use when user wants comprehensive search across everything.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Search query to use across all platforms"
+                            },
+                            "limit_per_platform": {
+                                "type": "integer",
+                                "description": "Max results per platform (default: 10)",
+                                "default": 10
+                            }
+                        },
+                        "required": ["query"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_team_activity_summary",
+                    "description": "Get activity summary for a team member across all platforms. Shows their Slack messages, emails, and Notion updates. Use when user asks about what someone is working on or their recent activity.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "person_name": {
+                                "type": "string",
+                                "description": "Name or email of the person"
+                            },
+                            "days_back": {
+                                "type": "integer",
+                                "description": "Days of history (default: 7)",
+                                "default": 7
+                            }
+                        },
+                        "required": ["person_name"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "analyze_slack_channel",
+                    "description": "Analyze a Slack channel's activity, most active users, common topics, and engagement patterns. Use when user wants channel analytics or insights.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "channel": {
+                                "type": "string",
+                                "description": "Channel name or ID"
+                            },
+                            "days_back": {
+                                "type": "integer",
+                                "description": "Days to analyze (default: 7)",
+                                "default": 7
+                            }
+                        },
+                        "required": ["channel"]
+                    }
+                }
             }
         ]
     
@@ -557,6 +996,143 @@ class WorkforceAIBrain:
                 
                 rag_results = self.rag_engine._retrieve_context(query, top_k=5)
                 result = f"Found {len(rag_results)} relevant results:\n\n{rag_results}"
+            
+            # NEW GMAIL TOOLS - Nov 2025
+            elif tool_name == "get_full_email_content":
+                result = self.tools_handler.get_full_email_content(
+                    message_id=arguments.get("message_id", "")
+                )
+            
+            elif tool_name == "get_unread_email_count":
+                result = self.tools_handler.get_unread_email_count()
+            
+            elif tool_name == "advanced_gmail_search":
+                result = self.tools_handler.advanced_gmail_search(
+                    query=arguments.get("query", ""),
+                    limit=arguments.get("limit", 20)
+                )
+            
+            elif tool_name == "get_complete_email_thread":
+                result = self.tools_handler.get_complete_email_thread(
+                    thread_id=arguments.get("thread_id", "")
+                )
+            
+            elif tool_name == "search_email_threads":
+                result = self.tools_handler.search_email_threads(
+                    query=arguments.get("query", ""),
+                    limit=arguments.get("limit", 10)
+                )
+            
+            # NEW SLACK TOOLS - Nov 2025
+            elif tool_name == "upload_file_to_slack":
+                result = self.tools_handler.upload_file_to_slack(
+                    channel=arguments.get("channel", ""),
+                    file_content=arguments.get("file_content", ""),
+                    filename=arguments.get("filename", ""),
+                    title=arguments.get("title")
+                )
+            
+            elif tool_name == "pin_slack_message":
+                result = self.tools_handler.pin_slack_message(
+                    channel=arguments.get("channel", ""),
+                    timestamp=arguments.get("timestamp", "")
+                )
+            
+            elif tool_name == "unpin_slack_message":
+                result = self.tools_handler.unpin_slack_message(
+                    channel=arguments.get("channel", ""),
+                    timestamp=arguments.get("timestamp", "")
+                )
+            
+            elif tool_name == "get_pinned_messages":
+                result = self.tools_handler.get_pinned_messages(
+                    channel=arguments.get("channel", "")
+                )
+            
+            elif tool_name == "create_slack_channel":
+                result = self.tools_handler.create_slack_channel(
+                    name=arguments.get("name", ""),
+                    is_private=arguments.get("is_private", False)
+                )
+            
+            elif tool_name == "archive_slack_channel":
+                result = self.tools_handler.archive_slack_channel(
+                    channel=arguments.get("channel", "")
+                )
+            
+            elif tool_name == "invite_to_slack_channel":
+                result = self.tools_handler.invite_to_slack_channel(
+                    channel=arguments.get("channel", ""),
+                    users=arguments.get("users", "")
+                )
+            
+            elif tool_name == "update_slack_message":
+                result = self.tools_handler.update_slack_message(
+                    channel=arguments.get("channel", ""),
+                    timestamp=arguments.get("timestamp", ""),
+                    text=arguments.get("text", "")
+                )
+            
+            elif tool_name == "delete_slack_message":
+                result = self.tools_handler.delete_slack_message(
+                    channel=arguments.get("channel", ""),
+                    timestamp=arguments.get("timestamp", "")
+                )
+            
+            elif tool_name == "list_all_slack_users":
+                result = self.tools_handler.list_all_slack_users()
+            
+            # NEW NOTION TOOLS - Nov 2025
+            elif tool_name == "append_to_notion_page":
+                result = self.tools_handler.append_to_notion_page(
+                    page_id=arguments.get("page_id", ""),
+                    content=arguments.get("content", "")
+                )
+            
+            elif tool_name == "search_notion_workspace":
+                result = self.tools_handler.search_notion_workspace(
+                    query=arguments.get("query", "")
+                )
+            
+            # PROJECT TRACKING TOOLS
+            elif tool_name == "track_project":
+                result = await self.tools_handler.track_project(
+                    project_name=arguments.get("project_name", ""),
+                    days_back=arguments.get("days_back", 7),
+                    notion_page_id=arguments.get("notion_page_id")
+                )
+            
+            elif tool_name == "generate_project_report":
+                result = await self.tools_handler.generate_project_report(
+                    project_name=arguments.get("project_name", ""),
+                    days_back=arguments.get("days_back", 7)
+                )
+            
+            elif tool_name == "update_project_notion_page":
+                result = await self.tools_handler.update_project_notion_page(
+                    page_id=arguments.get("page_id", ""),
+                    project_name=arguments.get("project_name", ""),
+                    days_back=arguments.get("days_back", 7)
+                )
+            
+            # UTILITY TOOLS
+            elif tool_name == "search_all_platforms":
+                result = await self.tools_handler.search_all_platforms(
+                    query=arguments.get("query", ""),
+                    limit_per_platform=arguments.get("limit_per_platform", 10)
+                )
+            
+            elif tool_name == "get_team_activity_summary":
+                result = await self.tools_handler.get_team_activity_summary(
+                    person_name=arguments.get("person_name", ""),
+                    days_back=arguments.get("days_back", 7)
+                )
+            
+            elif tool_name == "analyze_slack_channel":
+                result = await self.tools_handler.analyze_slack_channel(
+                    channel=arguments.get("channel", ""),
+                    days_back=arguments.get("days_back", 7)
+                )
             
             else:
                 result = f"Unknown tool: {tool_name}"

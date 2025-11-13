@@ -388,3 +388,44 @@ class GmailAttachment(Base):
     __table_args__ = (
         Index("idx_gmail_attachment_message", "message_id"),
     )
+
+
+# ============================================================================
+# Chat Conversation Models
+# ============================================================================
+
+class ChatSession(Base):
+    """Chat conversation session."""
+    __tablename__ = "chat_sessions"
+    
+    session_id = Column(String(50), primary_key=True)
+    title = Column(String(255))  # Auto-generated from first message
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    messages = relationship("ChatMessage", back_populates="session", cascade="all, delete-orphan")
+    
+    __table_args__ = (
+        Index("idx_chat_session_updated", "updated_at"),
+    )
+
+
+class ChatMessage(Base):
+    """Individual chat message in a session."""
+    __tablename__ = "chat_messages"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String(50), ForeignKey("chat_sessions.session_id"), nullable=False)
+    role = Column(String(20), nullable=False)  # 'user' or 'assistant'
+    content = Column(Text, nullable=False)
+    sources = Column(JSON)  # Sources returned with assistant messages
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    session = relationship("ChatSession", back_populates="messages")
+    
+    __table_args__ = (
+        Index("idx_chat_message_session", "session_id"),
+        Index("idx_chat_message_created", "created_at"),
+    )
