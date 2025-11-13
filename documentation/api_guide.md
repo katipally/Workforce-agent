@@ -39,13 +39,15 @@ This agent calls APIs **directly in real-time** - no database setup required fir
    OPENAI_API_KEY=sk-your-key-here
    ```
 
-### Pricing (Pay-as-you-go)
+### Pricing (Pay-as-you-go) - November 2025
 
-- **GPT-4 Turbo**: ~$0.01 per 1000 tokens input, ~$0.03 per output
-- **Typical query cost**: $0.001 - $0.01 per query
+- **GPT-4o-mini** (Recommended): ~$0.15/$0.60 per 1M tokens (80% cheaper!)
+- **GPT-4o**: ~$2.50/$10 per 1M tokens (best performance)
+- **GPT-4 Turbo** (Legacy): ~$10/$30 per 1M tokens
+- **Typical query cost**: $0.0001 - $0.001 per query (with GPT-4o-mini)
 - **Free tier**: $5 credit for new accounts
 
-**Estimated monthly cost for normal use:** $5-20/month
+**Estimated monthly cost for normal use:** $1-5/month (with GPT-4o-mini)
 
 ---
 
@@ -101,6 +103,7 @@ OAuth scopes define what your app can do. We need comprehensive access.
    **Messages:**
    - `chat:write` - Send messages
    - `chat:write.public` - Send messages to public channels (without joining)
+   - `chat:write.customize` - Customize message appearance (optional)
    
    **Files:**
    - `files:read` - View files
@@ -109,6 +112,23 @@ OAuth scopes define what your app can do. We need comprehensive access.
    **Reactions:**
    - `reactions:read` - View reactions
    - `reactions:write` - Add/remove reactions
+   
+   **Pins (NEW - Nov 2025):**
+   - `pins:read` - View pinned messages
+   - `pins:write` - Pin/unpin messages
+   
+   **Channel Management (NEW - Nov 2025):**
+   - `channels:join` - Join public channels
+   - `channels:write` - Create and rename public channels
+   - `groups:write` - Manage private channels
+   
+   **Bookmarks (Optional - Nov 2025):**
+   - `bookmarks:read` - View channel bookmarks
+   - `bookmarks:write` - Create/edit bookmarks
+   
+   **Reminders (Optional - Nov 2025):**
+   - `reminders:read` - View reminders
+   - `reminders:write` - Create reminders
 
 3. **Save Changes**
 
@@ -471,9 +491,37 @@ python test_gmail.py
 
 **IMPORTANT**: You only do this OAuth flow ONCE. The token is saved and automatically refreshed.
 
+### Gmail API Capabilities (November 2025 Update)
+
+With the configured Gmail API, the agent can now:
+
+**✅ Full Email Access:**
+- Get complete email bodies (not just snippets)
+- Access all email metadata (from, to, subject, date)
+- Read attachments information
+
+**✅ Advanced Search:**
+- Use ALL Gmail search operators:
+  - `from:email@example.com` - Sender filter
+  - `to:email@example.com` - Recipient filter
+  - `subject:keyword` - Subject search
+  - `has:attachment` - Emails with attachments
+  - `is:unread` / `is:starred` / `is:important` - Status filters
+  - `label:labelname` - Label filter
+  - `after:2024/11/01` / `before:2024/11/30` - Date range
+  - `filename:pdf` - Attachment type
+  - `larger:5M` / `smaller:1M` - Size filters
+
+**✅ Email Management:**
+- Get exact unread count
+- Mark emails as read/unread
+- Archive emails
+- Add/remove labels
+- Access complete threads
+
 ### Step 7: Test Connection
 
-**Start the agent** and try this query:
+**Start the agent** and try these queries:
 
 ```
 "Get emails from your-email@gmail.com"

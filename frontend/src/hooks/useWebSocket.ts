@@ -121,10 +121,16 @@ export function useWebSocket(): WebSocketHook {
       setSources([])
       setIsStreaming(true)
       
-      // Send query
+      // Get current session ID from store
+      const { currentSessionId } = useChatStore.getState()
+      
+      // Send query with session ID
       try {
-        wsRef.current.send(JSON.stringify({ query }))
-        console.log('Query sent:', query.substring(0, 50) + '...')
+        wsRef.current.send(JSON.stringify({ 
+          query,
+          session_id: currentSessionId
+        }))
+        console.log('Query sent:', query.substring(0, 50) + '... (session:', currentSessionId + ')')
       } catch (error) {
         console.error('Error sending message:', error)
         setIsStreaming(false)

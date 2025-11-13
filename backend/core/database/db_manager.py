@@ -17,7 +17,8 @@ from config import Config
 from .models import (
     Base, Workspace, User, Channel, Message, File, 
     MessageFile, Reaction, SyncStatus,
-    GmailAccount, GmailLabel, GmailThread, GmailMessage, GmailAttachment
+    GmailAccount, GmailLabel, GmailThread, GmailMessage, GmailAttachment,
+    ChatSession, ChatMessage
 )
 from utils.logger import get_logger
 
@@ -375,3 +376,130 @@ class DatabaseManager:
                 "threads": session.query(func.count(func.distinct(GmailMessage.thread_id))).scalar(),
                 "attachments": session.query(func.count(GmailAttachment.id)).scalar(),
             }
+    
+    # ============================================================================
+    # Chat Session Operations
+    # ============================================================================
+    
+    def create_chat_session(self, session_id: str, title: str = "New Chat") -> ChatSession:
+        """Create a new chat session.
+        
+        Args:
+            session_id: Unique session identifier
+            title: Session title (defaults to "New Chat")
+            
+        Returns:
+            Created ChatSession
+        """
+        with self.get_session() as session:
+            chat_session = ChatSession(
+                session_id=session_id,
+                title=title
+            )
+            session.add(chat_session)
+            session.commit()
+            session.refresh(chat_session)
+            return chat_session
+    
+    def get_chat_session(self, session_id: str) -> Optional[ChatSession]:
+        """Get a chat session by ID.
+        
+        Args:
+            session_id: Session identifier
+            
+        Returns:
+            ChatSession if found, None otherwise
+        """
+        with self.get_session() as session:
+            return session.query(ChatSession).filter_by(session_id=session_id).first()
+    
+    def list_chat_sessions(self, limit: int = 50) -> List[ChatSession]:
+        """List chat sessions ordered by last update.
+        
+        Args:
+            limit: Maximum number of sessions to return
+            
+        Returns:
+            List of ChatSession objects
+        """
+        with self.get_session() as session:
+            return session.query(ChatSession).order_by(
+                ChatSession.updated_at.desc()
+            ).limit(limit).all()
+    
+    def add_chat_message(self, session_id: str, role: str, content: str, sources: Optional[List[Dict]] = None) -> ChatMessage:
+        """Add a message to a chat session.
+        
+        Args:
+            session_id: Session identifier
+            role: Message role ('user' or 'assistant')
+            content: Message content
+            sources: Optional list of sources for assistant messages
+            
+        Returns:
+            Created ChatMessage
+        """
+        with self.get_session() as session:
+            # Update session's updated_at timestamp
+            chat_session = session.query(ChatSession).filter_by(session_id=session_id).first()
+            if chat_session:
+                chat_session.updated_at = datetime.utcnow()
+            
+            message = ChatMessage(
+                session_id=session_id,
+                role=role,
+                content=content,
+                sources=sources
+            )
+            session.add(message)
+            session.commit()
+            session.refresh(message)
+            return message
+    
+    def get_chat_history(self, session_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+        """Get chat history for a session formatted for AI context.
+        
+        Args:
+            session_id: Session identifier
+            limit: Maximum number of messages to return
+            
+        Returns:
+            List of message dicts with 'role' and 'content' keys
+        """
+        with self.get_session() as session:
+            messages = session.query(ChatMessage).filter_by(
+                session_id=session_id
+            ).order_by(
+                ChatMessage.created_at.asc()
+            ).limit(limit).all()
+            
+            return [
+                {"role": msg.role, "content": msg.content}
+                for msg in messages
+            ]
+    
+    def update_session_title(self, session_id: str, title: str) -> None:
+        """Update a session's title.
+        
+        Args:
+            session_id: Session identifier
+            title: New title
+        """
+        with self.get_session() as session:
+            chat_session = session.query(ChatSession).filter_by(session_id=session_id).first()
+            if chat_session:
+                chat_session.title = title
+                chat_session.updated_at = datetime.utcnow()
+                session.commit()
+    
+    def delete_chat_session(self, session_id: str) -> None:
+        """Delete a chat session and all its messages.
+        
+        Args:
+            session_id: Session identifier
+        """
+        with self.get_session() as session:
+            chat_session = session.query(ChatSession).filter_by(session_id=session_id).first()
+            if chat_session:
+                session.delete(chat_session)
+                session.commit()

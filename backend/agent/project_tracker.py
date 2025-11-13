@@ -1,0 +1,577 @@
+"""Project Tracking System for Workforce AI Agent.
+
+This module aggregates information across Slack, Gmail, and Notion to:
+1. Track project updates from multiple sources
+2. Maintain a unified project status
+3. Automatically update Notion pages with project progress
+4. Identify blockers and action items
+5. Generate comprehensive project reports
+
+Key Features:
+- Cross-platform information aggregation
+- Automatic Notion page updates (not creation)
+- Project timeline tracking
+- Team member activity tracking
+- Smart summarization of updates
+"""
+
+from typing import List, Dict, Any, Optional
+from datetime import datetime, timedelta
+from dataclasses import dataclass
+import json
+import re
+from pathlib import Path
+import sys
+
+# Add core directory to path
+core_path = Path(__file__).parent.parent / 'core'
+if str(core_path) not in sys.path:
+    sys.path.insert(0, str(core_path))
+
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+@dataclass
+class ProjectUpdate:
+    """Represents a single project update from any source."""
+    source: str  # 'slack', 'gmail', or 'notion'
+    timestamp: datetime
+    author: str
+    content: str
+    channel_or_thread: str
+    metadata: Dict[str, Any]
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return {
+            'source': self.source,
+            'timestamp': self.timestamp.isoformat(),
+            'author': self.author,
+            'content': self.content,
+            'channel_or_thread': self.channel_or_thread,
+            'metadata': self.metadata
+        }
+
+
+@dataclass
+class ProjectStatus:
+    """Comprehensive project status aggregated from all sources."""
+    project_name: str
+    last_updated: datetime
+    slack_updates: List[ProjectUpdate]
+    gmail_updates: List[ProjectUpdate]
+    notion_updates: List[ProjectUpdate]
+    key_points: List[str]
+    action_items: List[str]
+    blockers: List[str]
+    team_members: List[str]
+    progress_percentage: float
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for reports."""
+        return {
+            'project_name': self.project_name,
+            'last_updated': self.last_updated.isoformat(),
+            'total_updates': len(self.slack_updates) + len(self.gmail_updates) + len(self.notion_updates),
+            'slack_updates_count': len(self.slack_updates),
+            'gmail_updates_count': len(self.gmail_updates),
+            'notion_updates_count': len(self.notion_updates),
+            'key_points': self.key_points,
+            'action_items': self.action_items,
+            'blockers': self.blockers,
+            'team_members': self.team_members,
+            'progress_percentage': self.progress_percentage
+        }
+
+
+class ProjectTracker:
+    """Main project tracking system that aggregates cross-platform data."""
+    
+    def __init__(self, tools_handler):
+        """Initialize with access to all API tools.
+        
+        Args:
+            tools_handler: WorkforceTools instance with Slack, Gmail, Notion access
+        """
+        self.tools = tools_handler
+        logger.info("Project Tracker initialized")
+    
+    def extract_keywords(self, project_name: str) -> List[str]:
+        """Extract search keywords from project name.
+        
+        Args:
+            project_name: Name of the project
+            
+        Returns:
+            List of keywords for searching
+        """
+        # Remove common words and split
+        stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for'}
+        words = re.findall(r'\w+', project_name.lower())
+        keywords = [w for w in words if w not in stop_words and len(w) > 2]
+        return keywords
+    
+    async def gather_slack_updates(
+        self,
+        project_name: str,
+        days_back: int = 7,
+        channels: Optional[List[str]] = None
+    ) -> List[ProjectUpdate]:
+        """Gather project updates from Slack.
+        
+        Args:
+            project_name: Name of the project to track
+            days_back: Number of days to look back
+            channels: Optional list of specific channels to search
+            
+        Returns:
+            List of Slack updates related to the project
+        """
+        logger.info(f"Gathering Slack updates for '{project_name}' (last {days_back} days)")
+        updates = []
+        keywords = self.extract_keywords(project_name)
+        
+        try:
+            # Search across all keywords
+            for keyword in keywords:
+                result = self.tools.search_slack_messages(
+                    query=keyword,
+                    limit=50
+                )
+                
+                # Parse results
+                if "Found" in result:
+                    # Extract message details from result string
+                    # This is a simplified parser - in production, would parse actual Slack API response
+                    lines = result.split('\n')
+                    for line in lines:
+                        if 'From:' in line and 'in #' in line:
+                            try:
+                                # Extract basic info
+                                parts = line.split('in #')
+                                author_part = parts[0].split('From:')[1].strip()
+                                channel = parts[1].split('at')[0].strip()
+                                
+                                updates.append(ProjectUpdate(
+                                    source='slack',
+                                    timestamp=datetime.now() - timedelta(days=1),  # Approximate
+                                    author=author_part,
+                                    content=line,
+                                    channel_or_thread=channel,
+                                    metadata={'keyword': keyword}
+                                ))
+                            except:
+                                pass
+            
+            logger.info(f"Found {len(updates)} Slack updates")
+            return updates
+        
+        except Exception as e:
+            logger.error(f"Error gathering Slack updates: {e}")
+            return []
+    
+    async def gather_gmail_updates(
+        self,
+        project_name: str,
+        days_back: int = 7
+    ) -> List[ProjectUpdate]:
+        """Gather project updates from Gmail.
+        
+        Args:
+            project_name: Name of the project to track
+            days_back: Number of days to look back
+            
+        Returns:
+            List of Gmail updates related to the project
+        """
+        logger.info(f"Gathering Gmail updates for '{project_name}' (last {days_back} days)")
+        updates = []
+        keywords = self.extract_keywords(project_name)
+        
+        try:
+            # Calculate date range
+            date_filter = (datetime.now() - timedelta(days=days_back)).strftime("%Y/%m/%d")
+            
+            # Search for email threads containing project keywords
+            for keyword in keywords:
+                query = f"subject:({keyword}) OR {keyword} after:{date_filter}"
+                result = self.tools.search_email_threads(query, limit=20)
+                
+                # Parse thread results
+                if "threads found" in result.lower():
+                    # Extract thread info
+                    lines = result.split('\n')
+                    for line in lines:
+                        if 'Thread ID:' in line:
+                            try:
+                                thread_id = line.split('Thread ID:')[1].split()[0].strip()
+                                
+                                # Get complete thread
+                                thread_content = self.tools.get_complete_email_thread(thread_id)
+                                
+                                updates.append(ProjectUpdate(
+                                    source='gmail',
+                                    timestamp=datetime.now(),
+                                    author='Email Participants',
+                                    content=thread_content[:500],  # Summary
+                                    channel_or_thread=f"Thread {thread_id}",
+                                    metadata={'thread_id': thread_id, 'keyword': keyword}
+                                ))
+                            except:
+                                pass
+            
+            logger.info(f"Found {len(updates)} Gmail updates")
+            return updates
+        
+        except Exception as e:
+            logger.error(f"Error gathering Gmail updates: {e}")
+            return []
+    
+    async def gather_notion_updates(
+        self,
+        project_name: str,
+        page_id: Optional[str] = None
+    ) -> List[ProjectUpdate]:
+        """Gather project updates from Notion.
+        
+        Args:
+            project_name: Name of the project to track
+            page_id: Optional specific Notion page ID
+            
+        Returns:
+            List of Notion updates related to the project
+        """
+        logger.info(f"Gathering Notion updates for '{project_name}'")
+        updates = []
+        
+        try:
+            # Search Notion workspace
+            keywords = self.extract_keywords(project_name)
+            for keyword in keywords:
+                result = self.tools.search_notion_workspace(query=keyword)
+                
+                # Parse Notion search results
+                if "pages found" in result.lower():
+                    # Extract page info and content
+                    updates.append(ProjectUpdate(
+                        source='notion',
+                        timestamp=datetime.now(),
+                        author='Notion',
+                        content=result[:300],
+                        channel_or_thread='Notion Workspace',
+                        metadata={'keyword': keyword}
+                    ))
+            
+            logger.info(f"Found {len(updates)} Notion updates")
+            return updates
+        
+        except Exception as e:
+            logger.error(f"Error gathering Notion updates: {e}")
+            return []
+    
+    async def analyze_updates(
+        self,
+        all_updates: List[ProjectUpdate]
+    ) -> Dict[str, Any]:
+        """Analyze updates to extract key information.
+        
+        Args:
+            all_updates: List of all project updates
+            
+        Returns:
+            Dictionary with analysis results
+        """
+        logger.info(f"Analyzing {len(all_updates)} project updates")
+        
+        # Extract key information
+        key_points = []
+        action_items = []
+        blockers = []
+        team_members = set()
+        
+        # Common action item patterns
+        action_patterns = [
+            r'TODO:',
+            r'Action item:',
+            r'Next step:',
+            r'Need to',
+            r'Should',
+            r'Will',
+            r'Plan to'
+        ]
+        
+        # Common blocker patterns
+        blocker_patterns = [
+            r'blocked by',
+            r'waiting for',
+            r'issue:',
+            r'problem:',
+            r'blocker:',
+            r'stuck on'
+        ]
+        
+        for update in all_updates:
+            content_lower = update.content.lower()
+            
+            # Extract team members
+            team_members.add(update.author)
+            
+            # Identify action items
+            for pattern in action_patterns:
+                if re.search(pattern, content_lower, re.IGNORECASE):
+                    action_items.append(update.content[:200])
+                    break
+            
+            # Identify blockers
+            for pattern in blocker_patterns:
+                if re.search(pattern, content_lower, re.IGNORECASE):
+                    blockers.append(update.content[:200])
+                    break
+            
+            # Extract key points (sentences with important keywords)
+            important_keywords = ['completed', 'finished', 'ready', 'launched', 'deployed', 
+                                'started', 'began', 'decided', 'approved', 'milestone']
+            for keyword in important_keywords:
+                if keyword in content_lower:
+                    key_points.append(update.content[:200])
+                    break
+        
+        return {
+            'key_points': list(set(key_points))[:10],  # Top 10 unique points
+            'action_items': list(set(action_items))[:10],
+            'blockers': list(set(blockers))[:5],
+            'team_members': list(team_members)
+        }
+    
+    async def calculate_progress(
+        self,
+        updates: List[ProjectUpdate],
+        project_name: str
+    ) -> float:
+        """Calculate estimated project progress percentage.
+        
+        Args:
+            updates: List of all project updates
+            project_name: Name of the project
+            
+        Returns:
+            Progress percentage (0-100)
+        """
+        # Simple heuristic based on update content
+        progress_keywords = {
+            'completed': 10,
+            'finished': 10,
+            'done': 8,
+            'ready': 7,
+            'launched': 15,
+            'deployed': 15,
+            'testing': 5,
+            'in progress': 3,
+            'started': 2
+        }
+        
+        total_score = 0
+        for update in updates:
+            content_lower = update.content.lower()
+            for keyword, score in progress_keywords.items():
+                if keyword in content_lower:
+                    total_score += score
+        
+        # Normalize to 0-100 scale
+        progress = min(100, (total_score / len(updates) * 10) if updates else 0)
+        return round(progress, 1)
+    
+    async def track_project(
+        self,
+        project_name: str,
+        days_back: int = 7,
+        notion_page_id: Optional[str] = None
+    ) -> ProjectStatus:
+        """Main method to track a project across all platforms.
+        
+        Args:
+            project_name: Name of the project to track
+            days_back: Number of days to look back
+            notion_page_id: Optional Notion page ID for the project
+            
+        Returns:
+            Comprehensive project status
+        """
+        logger.info(f"=== Tracking Project: {project_name} ===")
+        
+        # Gather updates from all sources
+        slack_updates = await self.gather_slack_updates(project_name, days_back)
+        gmail_updates = await self.gather_gmail_updates(project_name, days_back)
+        notion_updates = await self.gather_notion_updates(project_name, notion_page_id)
+        
+        # Combine all updates
+        all_updates = slack_updates + gmail_updates + notion_updates
+        
+        # Analyze updates
+        analysis = await self.analyze_updates(all_updates)
+        
+        # Calculate progress
+        progress = await self.calculate_progress(all_updates, project_name)
+        
+        # Create project status
+        status = ProjectStatus(
+            project_name=project_name,
+            last_updated=datetime.now(),
+            slack_updates=slack_updates,
+            gmail_updates=gmail_updates,
+            notion_updates=notion_updates,
+            key_points=analysis['key_points'],
+            action_items=analysis['action_items'],
+            blockers=analysis['blockers'],
+            team_members=analysis['team_members'],
+            progress_percentage=progress
+        )
+        
+        logger.info(f"Project tracking complete: {len(all_updates)} total updates")
+        return status
+    
+    async def update_notion_page(
+        self,
+        page_id: str,
+        project_status: ProjectStatus
+    ) -> str:
+        """Update existing Notion page with project status.
+        
+        IMPORTANT: This UPDATES an existing page, does NOT create a new one.
+        
+        Args:
+            page_id: ID of the existing Notion page to update
+            project_status: Current project status to write
+            
+        Returns:
+            Success message or error
+        """
+        logger.info(f"Updating Notion page {page_id} with project status")
+        
+        try:
+            # Format update content
+            update_content = self._format_notion_update(project_status)
+            
+            # Use append_to_notion_page tool to add update
+            result = self.tools.append_to_notion_page(
+                page_id=page_id,
+                content=update_content
+            )
+            
+            logger.info(f"Notion page updated successfully")
+            return result
+        
+        except Exception as e:
+            logger.error(f"Error updating Notion page: {e}")
+            return f"Error: {str(e)}"
+    
+    def _format_notion_update(self, status: ProjectStatus) -> str:
+        """Format project status for Notion page.
+        
+        Args:
+            status: Project status to format
+            
+        Returns:
+            Formatted markdown content
+        """
+        content = f"""
+## 📊 Project Update: {status.project_name}
+**Last Updated:** {status.last_updated.strftime("%Y-%m-%d %H:%M")}
+**Progress:** {status.progress_percentage}%
+
+### 📈 Summary
+- **Total Updates:** {len(status.slack_updates) + len(status.gmail_updates) + len(status.notion_updates)}
+  - Slack: {len(status.slack_updates)} messages
+  - Gmail: {len(status.gmail_updates)} threads
+  - Notion: {len(status.notion_updates)} pages
+
+### ✅ Key Points
+"""
+        for point in status.key_points[:5]:
+            content += f"- {point}\n"
+        
+        content += "\n### 📋 Action Items\n"
+        for item in status.action_items[:5]:
+            content += f"- [ ] {item}\n"
+        
+        if status.blockers:
+            content += "\n### ⚠️ Blockers\n"
+            for blocker in status.blockers:
+                content += f"- 🚫 {blocker}\n"
+        
+        content += f"\n### 👥 Team Members\n"
+        for member in status.team_members[:10]:
+            content += f"- {member}\n"
+        
+        content += f"\n---\n*Auto-generated by Workforce AI Agent*\n"
+        
+        return content
+    
+    async def generate_report(
+        self,
+        project_name: str,
+        days_back: int = 7
+    ) -> str:
+        """Generate a comprehensive project report.
+        
+        Args:
+            project_name: Name of the project
+            days_back: Number of days to include
+            
+        Returns:
+            Formatted project report as string
+        """
+        logger.info(f"Generating report for project: {project_name}")
+        
+        # Track the project
+        status = await self.track_project(project_name, days_back)
+        
+        # Format report
+        report = f"""
+╔══════════════════════════════════════════════════════════╗
+║          PROJECT STATUS REPORT                            ║
+║          {project_name.center(44)}          ║
+╚══════════════════════════════════════════════════════════╝
+
+📅 Report Period: Last {days_back} days
+🕐 Generated: {status.last_updated.strftime("%Y-%m-%d %H:%M:%S")}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📊 OVERVIEW
+  Progress: {'█' * int(status.progress_percentage/5)}{' ' * (20-int(status.progress_percentage/5))} {status.progress_percentage}%
+  
+  Updates Across Platforms:
+  • Slack Messages:  {len(status.slack_updates)}
+  • Email Threads:   {len(status.gmail_updates)}
+  • Notion Pages:    {len(status.notion_updates)}
+  • Total Updates:   {len(status.slack_updates) + len(status.gmail_updates) + len(status.notion_updates)}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ KEY HIGHLIGHTS
+"""
+        
+        for i, point in enumerate(status.key_points[:5], 1):
+            report += f"  {i}. {point[:80]}...\n"
+        
+        report += "\n📋 ACTION ITEMS\n"
+        for i, item in enumerate(status.action_items[:5], 1):
+            report += f"  {i}. {item[:80]}...\n"
+        
+        if status.blockers:
+            report += "\n⚠️  BLOCKERS & ISSUES\n"
+            for i, blocker in enumerate(status.blockers, 1):
+                report += f"  {i}. {blocker[:80]}...\n"
+        
+        report += f"\n👥 TEAM MEMBERS ({len(status.team_members)})\n"
+        report += f"  {', '.join(status.team_members[:10])}\n"
+        
+        report += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        report += "  📎 Sources: Slack + Gmail + Notion\n"
+        report += "  🤖 Generated by Workforce AI Agent\n"
+        report += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        
+        return report

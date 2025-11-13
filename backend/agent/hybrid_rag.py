@@ -65,8 +65,10 @@ class HybridRAGEngine:
         self.reranker_model = qwen_reranker
         
         # Initialize OpenAI (for LLM calls)
+        # Using gpt-4o-mini: Latest cost-efficient model (Nov 2025)
+        # 80% cheaper than GPT-4, full streaming and tool calling support
         self.llm = ChatOpenAI(
-            model="gpt-4-turbo-preview",
+            model="gpt-4o-mini",
             api_key=openai_api_key,
             temperature=0.1,
             streaming=True
@@ -145,9 +147,10 @@ class HybridRAGEngine:
             slack_messages = session.query(Message).join(Channel).join(User).limit(1000).all()
             
             for msg in slack_messages:
-                if msg.embedding is not None and len(msg.embedding) == 8192:
-                    # Calculate similarity
-                    doc_emb = np.array(msg.embedding)
+                # Use qwen_embedding (8192-dim) for Qwen3 model
+                if msg.qwen_embedding is not None and len(msg.qwen_embedding) == 8192:
+                    # Calculate cosine similarity
+                    doc_emb = np.array(msg.qwen_embedding)
                     score = np.dot(query_emb, doc_emb)
                     
                     results.append({
@@ -165,8 +168,9 @@ class HybridRAGEngine:
             gmail_messages = session.query(GmailMessage).limit(1000).all()
             
             for email in gmail_messages:
-                if email.embedding is not None and len(email.embedding) == 8192:
-                    doc_emb = np.array(email.embedding)
+                # Use qwen_embedding (8192-dim) for Qwen3 model
+                if email.qwen_embedding is not None and len(email.qwen_embedding) == 8192:
+                    doc_emb = np.array(email.qwen_embedding)
                     score = np.dot(query_emb, doc_emb)
                     
                     results.append({

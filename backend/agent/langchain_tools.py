@@ -8,6 +8,7 @@ from langchain.tools import Tool, StructuredTool
 from pydantic import BaseModel, Field
 import sys
 import os
+import base64
 from pathlib import Path
 
 # Add core directory to path
@@ -59,6 +60,62 @@ class CreateNotionPageInput(BaseModel):
     content: str = Field(description="Page content")
 
 
+class GetFullEmailInput(BaseModel):
+    """Input for getting full email content."""
+    message_id: str = Field(description="Gmail message ID")
+
+
+class GetUnreadCountInput(BaseModel):
+    """Input for getting unread email count."""
+    pass  # No parameters needed
+
+
+class AdvancedSearchInput(BaseModel):
+    """Input for advanced Gmail search."""
+    query: str = Field(description="Gmail search query (from:, to:, subject:, has:attachment, is:unread, after:, before:)")
+    limit: int = Field(default=20, description="Maximum results")
+
+
+class UploadSlackFileInput(BaseModel):
+    """Input for uploading files to Slack."""
+    channel: str = Field(description="Channel ID")
+    file_content: str = Field(description="File content or path")
+    filename: str = Field(description="Filename")
+    title: Optional[str] = Field(default=None, description="File title")
+
+
+class PinMessageInput(BaseModel):
+    """Input for pinning messages."""
+    channel: str = Field(description="Channel ID")
+    timestamp: str = Field(description="Message timestamp")
+
+
+class UpdateNotionPageInput(BaseModel):
+    """Input for updating Notion pages."""
+    page_id: str = Field(description="Page ID")
+    content: str = Field(description="New content to append or update")
+
+
+class TrackProjectInput(BaseModel):
+    """Input for tracking a project across platforms."""
+    project_name: str = Field(description="Name of the project to track")
+    days_back: int = Field(default=7, description="Number of days to look back")
+    notion_page_id: Optional[str] = Field(default=None, description="Optional Notion page ID for updates")
+
+
+class GenerateProjectReportInput(BaseModel):
+    """Input for generating project reports."""
+    project_name: str = Field(description="Name of the project")
+    days_back: int = Field(default=7, description="Number of days to include in report")
+
+
+class UpdateProjectNotionInput(BaseModel):
+    """Input for updating Notion page with project status."""
+    page_id: str = Field(description="Notion page ID to update")
+    project_name: str = Field(description="Project name")
+    days_back: int = Field(default=7, description="Days of history to include")
+
+
 class WorkforceTools:
     """Collection of tools for the AI agent - Comprehensive API access."""
     
@@ -88,6 +145,14 @@ class WorkforceTools:
         except:
             self.notion_client = None
             logger.warning("Notion client not initialized")
+        
+        # Initialize Project Tracker
+        try:
+            from agent.project_tracker import ProjectTracker
+            self.project_tracker = ProjectTracker(self)
+        except Exception as e:
+            self.project_tracker = None
+            logger.warning(f"Project Tracker not initialized: {e}")
         
         logger.info("Workforce tools initialized with all API clients")
     
@@ -359,11 +424,9 @@ class WorkforceTools:
                     if 'parts' in msg['payload']:
                         for part in msg['payload']['parts']:
                             if part['mimeType'] == 'text/plain' and 'data' in part['body']:
-                                import base64
                                 body = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8')
                                 break
                     elif 'body' in msg['payload'] and 'data' in msg['payload']['body']:
-                        import base64
                         body = base64.urlsafe_b64decode(msg['payload']['body']['data']).decode('utf-8')
                     
                     body_preview = (body[:300] if body else 'No content') + "..."
@@ -503,7 +566,6 @@ class WorkforceTools:
             
             # Create message
             from email.mime.text import MIMEText
-            import base64
             
             message = MIMEText(body)
             message['to'] = to
@@ -859,7 +921,7 @@ class WorkforceTools:
             response = requests.patch(
                 f"https://api.notion.com/v1/pages/{page_id}",
                 headers={
-                    "Authorization": f"Bearer {Config.NOTION_API_KEY}",
+                    "Authorization": f"Bearer {Config.NOTION_TOKEN}",
                     "Notion-Version": "2022-06-28",
                     "Content-Type": "application/json"
                 },
@@ -879,6 +941,1020 @@ class WorkforceTools:
         except Exception as e:
             logger.error(f"Error updating page: {e}")
             return f"Error: {str(e)}"
+    
+    # ========================================
+    # CRITICAL NEW TOOLS - Nov 2025 Features
+    # ========================================
+    
+    def get_full_email_content(self, message_id: str) -> str:
+        """Get FULL email content including complete body (not just snippet).
+        
+        This returns the entire email body, not just a preview.
+        
+        Args:
+            message_id: Gmail message ID
+            
+        Returns:
+            Complete email with full body content
+        """
+        try:
+            if not self.gmail_client or not self.gmail_client.authenticate():
+                return "❌ Gmail not authenticated"
+            
+            # Get FULL message
+            msg = self.gmail_client.service.users().messages().get(
+                userId='me',
+                id=message_id,
+                format='full'
+            ).execute()
+            
+            # Extract headers
+            headers = msg['payload']['headers']
+            subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
+            from_addr = next((h['value'] for h in headers if h['name'].lower() == 'from'), 'Unknown')
+            to_addr = next((h['value'] for h in headers if h['name'].lower() == 'to'), 'Unknown')
+            date = next((h['value'] for h in headers if h['name'].lower() == 'date'), 'Unknown')
+            
+            # Extract COMPLETE body (not snippet)
+            def extract_body(payload):
+                body = ""
+                if 'body' in payload and 'data' in payload['body']:
+                    body = base64.urlsafe_b64decode(payload['body']['data']).decode('utf-8', errors='ignore')
+                    return body
+                
+                if 'parts' in payload:
+                    for part in payload['parts']:
+                        mime_type = part.get('mimeType', '')
+                        if mime_type == 'text/plain' and 'data' in part.get('body', {}):
+                            body = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8', errors='ignore')
+                            break
+                        elif mime_type == 'text/html' and 'data' in part.get('body', {}) and not body:
+                            body = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8', errors='ignore')
+                        if 'parts' in part:
+                            nested = extract_body(part)
+                            if nested and not body:
+                                body = nested
+                return body
+            
+            body = extract_body(msg['payload'])
+            
+            result = f"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📧 FULL EMAIL CONTENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+From: {from_addr}
+To: {to_addr}
+Date: {date}
+Subject: {subject}
+
+COMPLETE MESSAGE BODY:
+{body if body else 'No body content'}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+            return result
+        except Exception as e:
+            logger.error(f"Error getting full email: {e}")
+            return f"❌ Error: {str(e)}"
+    
+    def get_unread_email_count(self) -> str:
+        """Get EXACT count of unread emails.
+        
+        Returns:
+            Exact number of unread emails in inbox
+        """
+        try:
+            if not self.gmail_client or not self.gmail_client.authenticate():
+                return "❌ Gmail not authenticated"
+            
+            # Get unread count
+            result = self.gmail_client.service.users().messages().list(
+                userId='me',
+                q='is:unread',
+                maxResults=1
+            ).execute()
+            
+            count = result.get('resultSizeEstimate', 0)
+            
+            return f"📬 You have {count} unread emails"
+        except Exception as e:
+            logger.error(f"Error getting unread count: {e}")
+            return f"❌ Error: {str(e)}"
+    
+    def get_complete_email_thread(self, thread_id: str) -> str:
+        """Get COMPLETE email thread with ALL messages (for long company threads).
+        
+        This retrieves the ENTIRE thread, no matter how many messages.
+        Critical for business use cases with long email chains.
+        
+        Args:
+            thread_id: Gmail thread ID
+            
+        Returns:
+            Complete thread with all messages, full bodies, and metadata
+        """
+        try:
+            if not self.gmail_client or not self.gmail_client.authenticate():
+                return "❌ Gmail not authenticated"
+            
+            # Get COMPLETE thread with ALL messages
+            thread = self.gmail_client.service.users().threads().get(
+                userId='me',
+                id=thread_id,
+                format='full'  # Get complete message content for ALL messages
+            ).execute()
+            
+            messages = thread.get('messages', [])
+            message_count = len(messages)
+            
+            if message_count == 0:
+                return "No messages found in thread"
+            
+            # Extract body helper
+            def extract_body(payload):
+                body = ""
+                if 'body' in payload and 'data' in payload['body']:
+                    body = base64.urlsafe_b64decode(payload['body']['data']).decode('utf-8', errors='ignore')
+                    return body
+                
+                if 'parts' in payload:
+                    for part in payload['parts']:
+                        mime_type = part.get('mimeType', '')
+                        if mime_type == 'text/plain' and 'data' in part.get('body', {}):
+                            body = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8', errors='ignore')
+                            break
+                        elif mime_type == 'text/html' and 'data' in part.get('body', {}) and not body:
+                            body = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8', errors='ignore')
+                        if 'parts' in part:
+                            nested = extract_body(part)
+                            if nested and not body:
+                                body = nested
+                return body
+            
+            # Format complete thread
+            result = [f"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📧 COMPLETE EMAIL THREAD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Thread ID: {thread_id}
+Total Messages: {message_count}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""]
+            
+            # Process ALL messages in thread
+            for idx, msg in enumerate(messages, 1):
+                headers = msg['payload']['headers']
+                subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
+                from_addr = next((h['value'] for h in headers if h['name'].lower() == 'from'), 'Unknown')
+                to_addr = next((h['value'] for h in headers if h['name'].lower() == 'to'), 'Unknown')
+                date = next((h['value'] for h in headers if h['name'].lower() == 'date'), 'Unknown')
+                
+                # Extract full body
+                body = extract_body(msg['payload'])
+                
+                result.append(f"""
+MESSAGE {idx} of {message_count}:
+──────────────────────────────────────────────
+From: {from_addr}
+To: {to_addr}
+Date: {date}
+Subject: {subject}
+
+{body if body else '[No body content]'}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+""")
+            
+            result.append(f"\n✅ Retrieved ALL {message_count} messages in thread")
+            
+            return "\n".join(result)
+            
+        except Exception as e:
+            logger.error(f"Error getting thread: {e}")
+            return f"❌ Error: {str(e)}"
+    
+    def search_email_threads(self, query: str, limit: int = 10) -> str:
+        """Search for email threads (not individual messages) and get thread info.
+        
+        Use this when you need to find threads, then use get_complete_email_thread 
+        to retrieve full thread content.
+        
+        Args:
+            query: Gmail search query (supports all operators)
+            limit: Maximum threads to return
+            
+        Returns:
+            List of threads with summary info and thread IDs
+        """
+        try:
+            if not self.gmail_client or not self.gmail_client.authenticate():
+                return "❌ Gmail not authenticated"
+            
+            # Search threads (not messages)
+            result = self.gmail_client.service.users().threads().list(
+                userId='me',
+                q=query,
+                maxResults=limit
+            ).execute()
+            
+            threads = result.get('threads', [])
+            
+            if not threads:
+                return f"No threads found matching: {query}"
+            
+            results = [f"📧 Found {len(threads)} email threads matching '{query}':\n"]
+            
+            # Get summary of each thread
+            for idx, thread_ref in enumerate(threads, 1):
+                try:
+                    # Get thread with metadata
+                    thread = self.gmail_client.service.users().threads().get(
+                        userId='me',
+                        id=thread_ref['id'],
+                        format='metadata',
+                        metadataHeaders=['Subject', 'From', 'Date']
+                    ).execute()
+                    
+                    message_count = len(thread.get('messages', []))
+                    
+                    # Get first message headers
+                    first_msg = thread['messages'][0]
+                    headers = first_msg['payload']['headers']
+                    subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
+                    from_addr = next((h['value'] for h in headers if h['name'].lower() == 'from'), 'Unknown')
+                    date = next((h['value'] for h in headers if h['name'].lower() == 'date'), 'Unknown')
+                    
+                    results.append(f"""
+{idx}. Thread: {subject[:60]}
+   Messages: {message_count}
+   From: {from_addr}
+   Latest: {date}
+   Thread ID: {thread_ref['id']}
+   Use get_complete_email_thread("{thread_ref['id']}") to read all {message_count} messages
+""")
+                    
+                except Exception as e:
+                    logger.error(f"Error getting thread summary: {e}")
+                    continue
+            
+            return "\n".join(results)
+            
+        except Exception as e:
+            logger.error(f"Error searching threads: {e}")
+            return f"❌ Error: {str(e)}"
+    
+    def advanced_gmail_search(self, query: str, limit: int = 20) -> str:
+        """Advanced Gmail search with ALL operators supported.
+        
+        Supports:
+        - from:user@example.com - Emails from specific sender
+        - to:user@example.com - Emails to specific recipient
+        - subject:keyword - Search in subject
+        - has:attachment - Emails with attachments
+        - is:unread - Unread emails only
+        - is:starred - Starred emails
+        - is:important - Important emails
+        - label:labelname - Emails with specific label
+        - after:2024/11/01 - Emails after date
+        - before:2024/11/30 - Emails before date
+        - filename:pdf - Specific attachment type
+        - larger:5M - Emails larger than size
+        - smaller:1M - Emails smaller than size
+        
+        Args:
+            query: Gmail search query with operators
+            limit: Maximum results
+            
+        Returns:
+            Formatted search results with full content
+        """
+        try:
+            if not self.gmail_client or not self.gmail_client.authenticate():
+                return "❌ Gmail not authenticated"
+            
+            # Execute advanced search
+            results_response = self.gmail_client.service.users().messages().list(
+                userId='me',
+                q=query,
+                maxResults=limit
+            ).execute()
+            
+            messages = results_response.get('messages', [])
+            
+            if not messages:
+                return f"No emails found matching query: {query}"
+            
+            # Get full details for each message
+            results = [f"📧 Found {len(messages)} emails matching '{query}':\n"]
+            
+            for msg_ref in messages[:limit]:
+                try:
+                    msg = self.gmail_client.service.users().messages().get(
+                        userId='me',
+                        id=msg_ref['id'],
+                        format='full'
+                    ).execute()
+                    
+                    headers = msg['payload']['headers']
+                    subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
+                    from_addr = next((h['value'] for h in headers if h['name'].lower() == 'from'), 'Unknown')
+                    date = next((h['value'] for h in headers if h['name'].lower() == 'date'), 'Unknown')
+                    
+                    # Get snippet or body preview
+                    snippet = msg.get('snippet', 'No preview')
+                    
+                    results.append(
+                        f"\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"ID: {msg_ref['id']}\n"
+                        f"From: {from_addr}\n"
+                        f"Date: {date}\n"
+                        f"Subject: {subject}\n"
+                        f"Preview: {snippet[:200]}...\n"
+                    )
+                except Exception as e:
+                    logger.error(f"Error getting message: {e}")
+                    continue
+            
+            return "\n".join(results)
+        except Exception as e:
+            logger.error(f"Error in advanced search: {e}")
+            return f"❌ Error: {str(e)}"
+    
+    def upload_file_to_slack(self, channel: str, file_content: str, filename: str, title: str = None) -> str:
+        """Upload a file to Slack channel.
+        
+        Args:
+            channel: Channel ID
+            file_content: File content or path to file
+            filename: Name for the file
+            title: Optional title
+            
+        Returns:
+            Success/error message
+        """
+        try:
+            if not self.slack_client:
+                return "❌ Slack not configured"
+            
+            # Check if file_content is a path
+            if os.path.exists(file_content):
+                # Upload from file path
+                result = self.slack_client.files_upload_v2(
+                    channel=channel,
+                    file=file_content,
+                    filename=filename,
+                    title=title or filename
+                )
+            else:
+                # Upload from content
+                import tempfile
+                with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=f"_{filename}") as tmp:
+                    tmp.write(file_content)
+                    tmp_path = tmp.name
+                
+                result = self.slack_client.files_upload_v2(
+                    channel=channel,
+                    file=tmp_path,
+                    filename=filename,
+                    title=title or filename
+                )
+                os.unlink(tmp_path)
+            
+            return f"✅ File '{filename}' uploaded to Slack"
+        except Exception as e:
+            logger.error(f"Error uploading file: {e}")
+            return f"❌ Error: {str(e)}"
+    
+    def pin_slack_message(self, channel: str, timestamp: str) -> str:
+        """Pin a message in Slack channel.
+        
+        Args:
+            channel: Channel ID
+            timestamp: Message timestamp
+            
+        Returns:
+            Success/error message
+        """
+        try:
+            if not self.slack_client:
+                return "❌ Slack not configured"
+            
+            self.slack_client.pins_add(channel=channel, timestamp=timestamp)
+            return "✅ Message pinned successfully"
+        except Exception as e:
+            logger.error(f"Error pinning message: {e}")
+            return f"❌ Error: {str(e)}"
+    
+    def unpin_slack_message(self, channel: str, timestamp: str) -> str:
+        """Unpin a message from Slack channel."""
+        try:
+            if not self.slack_client:
+                return "❌ Slack not configured"
+            
+            self.slack_client.pins_remove(channel=channel, timestamp=timestamp)
+            return "✅ Message unpinned successfully"
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+    
+    def get_pinned_messages(self, channel: str) -> str:
+        """Get all pinned messages in a channel."""
+        try:
+            if not self.slack_client:
+                return "❌ Slack not configured"
+            
+            result = self.slack_client.pins_list(channel=channel)
+            items = result.get('items', [])
+            
+            if not items:
+                return "No pinned messages in this channel"
+            
+            messages = []
+            for item in items:
+                if 'message' in item:
+                    msg = item['message']
+                    messages.append(f"📌 {msg.get('text', 'No text')[:150]}")
+            
+            return "\n\n".join(messages) if messages else "No pinned messages"
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+    
+    def create_slack_channel(self, name: str, is_private: bool = False) -> str:
+        """Create a new Slack channel.
+        
+        Args:
+            name: Channel name (lowercase, no spaces)
+            is_private: Create as private channel
+            
+        Returns:
+            Success message with channel ID
+        """
+        try:
+            if not self.slack_client:
+                return "❌ Slack not configured"
+            
+            result = self.slack_client.conversations_create(
+                name=name,
+                is_private=is_private
+            )
+            
+            channel = result['channel']
+            privacy = "private" if is_private else "public"
+            return f"✅ Created {privacy} channel #{channel['name']} (ID: {channel['id']})"
+        except Exception as e:
+            logger.error(f"Error creating channel: {e}")
+            return f"❌ Error: {str(e)}"
+    
+    def archive_slack_channel(self, channel: str) -> str:
+        """Archive a Slack channel."""
+        try:
+            if not self.slack_client:
+                return "❌ Slack not configured"
+            
+            self.slack_client.conversations_archive(channel=channel)
+            return f"✅ Channel archived successfully"
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+    
+    def invite_to_slack_channel(self, channel: str, users: str) -> str:
+        """Invite users to a Slack channel.
+        
+        Args:
+            channel: Channel ID
+            users: Comma-separated user IDs
+            
+        Returns:
+            Success/error message
+        """
+        try:
+            if not self.slack_client:
+                return "❌ Slack not configured"
+            
+            self.slack_client.conversations_invite(
+                channel=channel,
+                users=users
+            )
+            return f"✅ Users invited to channel"
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+    
+    def update_slack_message(self, channel: str, timestamp: str, text: str) -> str:
+        """Update/edit a Slack message.
+        
+        Args:
+            channel: Channel ID
+            timestamp: Message timestamp
+            text: New message text
+            
+        Returns:
+            Success/error message
+        """
+        try:
+            if not self.slack_client:
+                return "❌ Slack not configured"
+            
+            self.slack_client.chat_update(
+                channel=channel,
+                ts=timestamp,
+                text=text
+            )
+            return "✅ Message updated successfully"
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+    
+    def delete_slack_message(self, channel: str, timestamp: str) -> str:
+        """Delete a Slack message."""
+        try:
+            if not self.slack_client:
+                return "❌ Slack not configured"
+            
+            self.slack_client.chat_delete(channel=channel, ts=timestamp)
+            return "✅ Message deleted successfully"
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+    
+    def list_all_slack_users(self) -> str:
+        """List all users in the Slack workspace."""
+        try:
+            if not self.slack_client:
+                return "❌ Slack not configured"
+            
+            result = self.slack_client.users_list()
+            users = result.get('members', [])
+            
+            active_users = []
+            for user in users:
+                if not user.get('deleted') and not user.get('is_bot'):
+                    name = user.get('real_name', user.get('name'))
+                    email = user.get('profile', {}).get('email', 'No email')
+                    active_users.append(f"- {name} (@{user['name']}) - {email} - ID: {user['id']}")
+            
+            return f"👥 Workspace users ({len(active_users)}):\n" + "\n".join(active_users)
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+    
+    def append_to_notion_page(self, page_id: str, content: str) -> str:
+        """Append content to existing Notion page.
+        
+        Args:
+            page_id: Page ID to append to
+            content: Content to append
+            
+        Returns:
+            Success/error message
+        """
+        try:
+            import requests
+            
+            # Create paragraph blocks from content
+            paragraphs = content.split('\n\n')
+            blocks = []
+            for para in paragraphs:
+                if para.strip():
+                    blocks.append({
+                        "object": "block",
+                        "type": "paragraph",
+                        "paragraph": {
+                            "rich_text": [{
+                                "type": "text",
+                                "text": {"content": para.strip()}
+                            }]
+                        }
+                    })
+            
+            response = requests.patch(
+                f"https://api.notion.com/v1/blocks/{page_id}/children",
+                headers={
+                    "Authorization": f"Bearer {Config.NOTION_TOKEN}",
+                    "Notion-Version": "2022-06-28",
+                    "Content-Type": "application/json"
+                },
+                json={"children": blocks}
+            )
+            
+            if response.status_code == 200:
+                return f"✅ Content appended to Notion page"
+            else:
+                return f"❌ Error {response.status_code}: {response.text}"
+        except Exception as e:
+            logger.error(f"Error appending to page: {e}")
+            return f"❌ Error: {str(e)}"
+    
+    def search_notion_workspace(self, query: str) -> str:
+        """Search across entire Notion workspace.
+        
+        Args:
+            query: Search query
+            
+        Returns:
+            Matching pages and databases
+        """
+        try:
+            import requests
+            
+            response = requests.post(
+                "https://api.notion.com/v1/search",
+                headers={
+                    "Authorization": f"Bearer {Config.NOTION_TOKEN}",
+                    "Notion-Version": "2022-06-28",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "query": query,
+                    "filter": {"property": "object", "value": "page"},
+                    "sort": {"direction": "descending", "timestamp": "last_edited_time"}
+                }
+            )
+            
+            if response.status_code != 200:
+                return f"❌ Error {response.status_code}"
+            
+            results = response.json().get('results', [])
+            
+            if not results:
+                return f"No Notion pages found matching '{query}'"
+            
+            pages = []
+            for page in results[:10]:
+                title = "Untitled"
+                if 'properties' in page:
+                    title_prop = page['properties'].get('title', {}) or page['properties'].get('Name', {})
+                    if 'title' in title_prop and title_prop['title']:
+                        title = title_prop['title'][0]['plain_text']
+                
+                pages.append(f"📄 {title} (ID: {page['id']})")
+            
+            return f"🔍 Found {len(results)} pages:\n" + "\n".join(pages)
+        except Exception as e:
+            logger.error(f"Error searching Notion: {e}")
+            return f"❌ Error: {str(e)}"
+    
+    # ========================================
+    # PROJECT TRACKING - Cross-Platform Aggregation
+    # ========================================
+    
+    async def track_project(
+        self,
+        project_name: str,
+        days_back: int = 7,
+        notion_page_id: Optional[str] = None
+    ) -> str:
+        """Track a project across Slack, Gmail, and Notion.
+        
+        This is a powerful cross-platform aggregation tool that:
+        - Gathers updates from Slack conversations
+        - Collects relevant email threads from Gmail
+        - Pulls information from Notion pages
+        - Analyzes all sources to identify key points, action items, and blockers
+        - Calculates project progress
+        
+        Args:
+            project_name: Name of the project to track (e.g., "Q4 Dashboard", "Agent Project")
+            days_back: Number of days of history to include (default: 7)
+            notion_page_id: Optional Notion page ID to associate with project
+            
+        Returns:
+            Comprehensive project status summary
+        """
+        if not self.project_tracker:
+            return "❌ Project Tracker not available"
+        
+        try:
+            logger.info(f"Tracking project: {project_name}")
+            status = await self.project_tracker.track_project(
+                project_name=project_name,
+                days_back=days_back,
+                notion_page_id=notion_page_id
+            )
+            
+            # Format response
+            summary = f"""
+📊 **Project: {status.project_name}**
+🕐 Last Updated: {status.last_updated.strftime("%Y-%m-%d %H:%M")}
+📈 Progress: {status.progress_percentage}%
+
+**Updates Summary:**
+- Slack: {len(status.slack_updates)} messages
+- Gmail: {len(status.gmail_updates)} threads
+- Notion: {len(status.notion_updates)} pages
+- Total: {len(status.slack_updates) + len(status.gmail_updates) + len(status.notion_updates)} updates
+
+**✅ Key Highlights:**
+{chr(10).join(f"• {point}" for point in status.key_points[:5])}
+
+**📋 Action Items:**
+{chr(10).join(f"• {item}" for item in status.action_items[:5])}
+
+**⚠️ Blockers:**
+{chr(10).join(f"• {blocker}" for blocker in status.blockers[:3]) if status.blockers else "None identified"}
+
+**👥 Team Members:**
+{', '.join(status.team_members[:10])}
+"""
+            return summary
+        
+        except Exception as e:
+            logger.error(f"Error tracking project: {e}")
+            return f"❌ Error tracking project: {str(e)}"
+    
+    async def generate_project_report(
+        self,
+        project_name: str,
+        days_back: int = 7
+    ) -> str:
+        """Generate a comprehensive formatted project report.
+        
+        Creates a detailed, formatted report suitable for sharing with stakeholders.
+        Includes progress bars, statistics, and organized sections for all updates.
+        
+        Args:
+            project_name: Name of the project
+            days_back: Number of days to include (default: 7)
+            
+        Returns:
+            Formatted project report
+        """
+        if not self.project_tracker:
+            return "❌ Project Tracker not available"
+        
+        try:
+            logger.info(f"Generating report for: {project_name}")
+            report = await self.project_tracker.generate_report(
+                project_name=project_name,
+                days_back=days_back
+            )
+            return report
+        
+        except Exception as e:
+            logger.error(f"Error generating report: {e}")
+            return f"❌ Error generating report: {str(e)}"
+    
+    async def update_project_notion_page(
+        self,
+        page_id: str,
+        project_name: str,
+        days_back: int = 7
+    ) -> str:
+        """Update existing Notion page with current project status.
+        
+        IMPORTANT: This UPDATES an existing Notion page, it does NOT create a new one.
+        The page must already exist and be shared with your Notion integration.
+        
+        This method:
+        1. Tracks the project across all platforms
+        2. Formats the status update
+        3. Appends it to the specified Notion page
+        
+        Args:
+            page_id: ID of the existing Notion page to update
+            project_name: Name of the project
+            days_back: Days of history to include (default: 7)
+            
+        Returns:
+            Success message or error
+        """
+        if not self.project_tracker:
+            return "❌ Project Tracker not available"
+        
+        try:
+            logger.info(f"Updating Notion page {page_id} for project: {project_name}")
+            
+            # Track the project
+            status = await self.project_tracker.track_project(
+                project_name=project_name,
+                days_back=days_back
+            )
+            
+            # Update Notion page
+            result = await self.project_tracker.update_notion_page(
+                page_id=page_id,
+                project_status=status
+            )
+            
+            return f"✅ Notion page updated successfully!\n\n{result}"
+        
+        except Exception as e:
+            logger.error(f"Error updating Notion page: {e}")
+            return f"❌ Error: {str(e)}"
+    
+    # ========================================
+    # UTILITY TOOLS - Cross-Platform & Analytics
+    # ========================================
+    
+    async def search_all_platforms(
+        self,
+        query: str,
+        limit_per_platform: int = 10
+    ) -> str:
+        """Search across all platforms simultaneously.
+        
+        Args:
+            query: Search query
+            limit_per_platform: Max results per platform
+            
+        Returns:
+            Unified search results from all platforms
+        """
+        logger.info(f"Searching all platforms for: {query}")
+        
+        results = []
+        
+        # Search Slack
+        try:
+            slack_results = self.search_slack_messages(query, limit=limit_per_platform)
+            results.append(f"## 💬 SLACK RESULTS\n{slack_results}\n")
+        except Exception as e:
+            results.append(f"## 💬 SLACK RESULTS\n❌ Error: {e}\n")
+        
+        # Search Gmail
+        try:
+            gmail_results = self.search_gmail_messages(query, limit=limit_per_platform)
+            results.append(f"## 📧 GMAIL RESULTS\n{gmail_results}\n")
+        except Exception as e:
+            results.append(f"## 📧 GMAIL RESULTS\n❌ Error: {e}\n")
+        
+        # Search Notion
+        try:
+            notion_results = self.search_notion_workspace(query)
+            results.append(f"## 📄 NOTION RESULTS\n{notion_results}\n")
+        except Exception as e:
+            results.append(f"## 📄 NOTION RESULTS\n❌ Error: {e}\n")
+        
+        summary = f"""
+🔍 **CROSS-PLATFORM SEARCH: "{query}"**
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{chr(10).join(results)}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ Search complete across all platforms
+"""
+        return summary
+    
+    async def get_team_activity_summary(
+        self,
+        person_name: str,
+        days_back: int = 7
+    ) -> str:
+        """Get activity summary for a team member.
+        
+        Args:
+            person_name: Name or email of the person
+            days_back: Days of history to include
+            
+        Returns:
+            Activity summary across all platforms
+        """
+        logger.info(f"Getting activity summary for: {person_name}")
+        
+        activities = []
+        
+        # Search Slack for person's messages
+        try:
+            slack_query = f"from:@{person_name}"
+            slack_results = self.search_slack_messages(slack_query, limit=20)
+            if "Found" in slack_results:
+                message_count = slack_results.count('\n')
+                activities.append(f"💬 **Slack:** {message_count} messages found")
+                activities.append(slack_results[:500] + "...\n")
+            else:
+                activities.append(f"💬 **Slack:** No messages found\n")
+        except Exception as e:
+            activities.append(f"💬 **Slack:** Error - {e}\n")
+        
+        # Search Gmail for person's emails
+        try:
+            gmail_query = f"from:{person_name}"
+            gmail_results = self.search_gmail_messages(gmail_query, limit=20)
+            if "emails found" in gmail_results.lower():
+                email_count = gmail_results.count('Subject:')
+                activities.append(f"📧 **Gmail:** {email_count} emails found")
+                activities.append(gmail_results[:500] + "...\n")
+            else:
+                activities.append(f"📧 **Gmail:** No emails found\n")
+        except Exception as e:
+            activities.append(f"📧 **Gmail:** Error - {e}\n")
+        
+        # Search Notion for person's updates
+        try:
+            notion_results = self.search_notion_workspace(person_name)
+            if "Found" in notion_results:
+                page_count = notion_results.count('📄')
+                activities.append(f"📄 **Notion:** {page_count} pages found")
+                activities.append(notion_results[:300] + "...\n")
+            else:
+                activities.append(f"📄 **Notion:** No pages found\n")
+        except Exception as e:
+            activities.append(f"📄 **Notion:** Error - {e}\n")
+        
+        summary = f"""
+👤 **TEAM MEMBER ACTIVITY: {person_name}**
+📅 Period: Last {days_back} days
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{chr(10).join(activities)}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ Activity summary complete
+"""
+        return summary
+    
+    async def analyze_slack_channel(
+        self,
+        channel: str,
+        days_back: int = 7
+    ) -> str:
+        """Analyze Slack channel activity and engagement.
+        
+        Args:
+            channel: Channel name or ID
+            days_back: Days to analyze
+            
+        Returns:
+            Channel analytics and insights
+        """
+        logger.info(f"Analyzing Slack channel: {channel}")
+        
+        try:
+            # Get channel messages
+            messages_result = self.get_channel_messages(channel, limit=100)
+            
+            if "Error" in messages_result or "not found" in messages_result.lower():
+                return f"❌ Could not analyze channel '{channel}': {messages_result}"
+            
+            # Parse messages for analytics
+            lines = messages_result.split('\n')
+            message_count = len([l for l in lines if l.strip()])
+            
+            # Count unique users
+            users = set()
+            for line in lines:
+                if ']' in line and ':' in line:
+                    try:
+                        user = line.split(']')[1].split(':')[0].strip()
+                        users.add(user)
+                    except:
+                        pass
+            
+            # Basic sentiment analysis (simple keyword counting)
+            positive_keywords = ['great', 'good', 'excellent', 'thanks', 'awesome', 'perfect', 'done', 'completed']
+            negative_keywords = ['issue', 'problem', 'error', 'bug', 'blocked', 'stuck', 'failed']
+            question_keywords = ['?', 'how', 'what', 'when', 'why', 'where']
+            
+            positive_count = sum(1 for line in lines for kw in positive_keywords if kw in line.lower())
+            negative_count = sum(1 for line in lines for kw in negative_keywords if kw in line.lower())
+            question_count = sum(1 for line in lines for kw in question_keywords if kw in line.lower())
+            
+            # Calculate engagement metrics
+            avg_messages_per_user = message_count / len(users) if users else 0
+            
+            analysis = f"""
+📊 **SLACK CHANNEL ANALYSIS: #{channel}**
+📅 Period: Last {days_back} days
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+**📈 Activity Metrics:**
+• Total Messages: {message_count}
+• Active Users: {len(users)}
+• Avg Messages/User: {avg_messages_per_user:.1f}
+
+**👥 Most Active Users:**
+{chr(10).join(f'• {user}' for user in list(users)[:10])}
+
+**💬 Message Patterns:**
+• Positive Mentions: {positive_count} (great, good, thanks, done, etc.)
+• Issues/Blockers: {negative_count} (problem, error, blocked, etc.)
+• Questions Asked: {question_count}
+
+**📊 Engagement Level:**
+{self._generate_engagement_bar(message_count, len(users))}
+
+**🔍 Recent Activity Sample:**
+{chr(10).join(lines[:5])}
+...
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ Channel analysis complete
+"""
+            return analysis
+        
+        except Exception as e:
+            logger.error(f"Error analyzing channel: {e}")
+            return f"❌ Error analyzing channel: {str(e)}"
+    
+    def _generate_engagement_bar(self, message_count: int, user_count: int) -> str:
+        """Generate visual engagement bar."""
+        if message_count < 10:
+            level = "Low"
+            bar = "█░░░░░░░░░"
+        elif message_count < 50:
+            level = "Medium"
+            bar = "████░░░░░░"
+        elif message_count < 100:
+            level = "High"
+            bar = "███████░░░"
+        else:
+            level = "Very High"
+            bar = "██████████"
+        
+        return f"{level}: {bar} ({message_count} messages, {user_count} users)"
     
     def get_langchain_tools(self) -> List[Tool]:
         """Get list of LangChain tools.

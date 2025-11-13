@@ -3,95 +3,170 @@ import { useChatStore } from '../../store/chatStore'
 import { useWebSocket } from '../../hooks/useWebSocket'
 import MessageList from './MessageList'
 import MessageInput from './MessageInput'
-import SourcesSidebar from './SourcesSidebar'
-import { Bot, Menu, X } from 'lucide-react'
+import ChatHistorySidebar from './ChatHistorySidebar'
+import QuickActions from './QuickActions'
+import { Bot, History, Sparkles } from 'lucide-react'
 
 export default function ChatInterface() {
-  const { messages, streamingMessage, sources, isStreaming } = useChatStore()
+  const { messages, streamingMessage, isStreaming } = useChatStore()
   const { sendMessage, isConnected } = useWebSocket()
-  const [showSources, setShowSources] = useState(true)
+  const [showHistory, setShowHistory] = useState(true)
+  const [showQuickActions, setShowQuickActions] = useState(true)
   
-  const handleSendMessage = (content: string) => {
+  const handleSendMessage = async (content: string, files?: File[]) => {
+    const currentSessionId = useChatStore.getState().currentSessionId
+    let fullMessage = content
+    let uploadedFiles: any[] = []
+    
+    // Upload files if present
+    if (files && files.length > 0) {
+      try {
+        const formData = new FormData()
+        files.forEach(file => formData.append('files', file))
+        formData.append('session_id', currentSessionId)
+        
+        const response = await fetch('http://localhost:8000/api/files/upload', {
+          method: 'POST',
+          body: formData
+        })
+        
+        if (response.ok) {
+          const data = await response.json()
+          uploadedFiles = data.files
+          
+          // Add file info to message
+          const fileInfo = uploadedFiles.map(f => 
+            `${f.filename} (${(f.file_size / 1024).toFixed(1)}KB)`
+          ).join(', ')
+          fullMessage += `\n\n📎 Uploaded: ${fileInfo}`
+        } else {
+          const error = await response.json()
+          fullMessage += `\n\n⚠️ File upload failed: ${error.detail}`
+        }
+      } catch (error) {
+        console.error('File upload error:', error)
+        fullMessage += `\n\n⚠️ File upload error: ${error}`
+      }
+    }
+    
     // Add user message immediately
     useChatStore.getState().addMessage({
       role: 'user',
-      content,
+      content: fullMessage,
     })
     
-    // Send to WebSocket
-    sendMessage(content)
+    // Hide quick actions when sending message
+    if (messages.length === 0) {
+      setShowQuickActions(false)
+    }
+    
+    // Send to backend with file references
+    let messageToSend = content
+    if (uploadedFiles.length > 0) {
+      messageToSend += `\n\nFiles uploaded: ${uploadedFiles.map(f => f.stored_filename).join(', ')}`
+    }
+    sendMessage(messageToSend)
+  }
+
+  const handleQuickAction = (prompt: string) => {
+    handleSendMessage(prompt)
   }
   
   return (
-    <div className="flex h-full flex-col bg-gray-50">
-      {/* Header */}
-      <header className="border-b bg-white px-6 py-4 shadow-sm">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-blue-600">
-              <Bot className="h-6 w-6 text-white" />
-            </div>
-            <div>
-              <h1 className="text-xl font-semibold text-gray-900">
-                Workforce AI Agent
-              </h1>
-              <p className="text-sm text-gray-500">
-                {isConnected ? (
-                  <span className="flex items-center gap-1">
-                    <span className="h-2 w-2 rounded-full bg-green-500" />
-                    Connected
-                  </span>
-                ) : (
-                  <span className="flex items-center gap-1">
-                    <span className="h-2 w-2 rounded-full bg-red-500" />
-                    Disconnected
-                  </span>
-                )}
-              </p>
-            </div>
-          </div>
-          
-          <button
-            onClick={() => setShowSources(!showSources)}
-            className="rounded-lg p-2 hover:bg-gray-100 lg:hidden"
-          >
-            {showSources ? (
-              <X className="h-5 w-5" />
-            ) : (
-              <Menu className="h-5 w-5" />
-            )}
-          </button>
-        </div>
-      </header>
+    <div className="flex h-full bg-gray-50">
+      {/* Chat history sidebar */}
+      <aside
+        className={`w-64 border-r bg-gray-900 transition-all ${
+          showHistory ? 'block' : 'hidden lg:block'
+        }`}
+      >
+        <ChatHistorySidebar />
+      </aside>
       
-      {/* Main content */}
-      <div className="flex flex-1 overflow-hidden">
-        {/* Chat messages */}
-        <div className="flex flex-1 flex-col">
-          <div className="flex-1 overflow-y-auto">
-            <MessageList
-              messages={messages}
-              streamingMessage={streamingMessage}
-              isStreaming={isStreaming}
-            />
+      {/* Main content area */}
+      <div className="flex flex-1 flex-col">
+        {/* Header */}
+        <header className="border-b bg-white px-6 py-4 shadow-sm">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <button
+                onClick={() => setShowHistory(!showHistory)}
+                className="rounded-lg p-2 hover:bg-gray-100 lg:hidden"
+                title="Toggle chat history"
+              >
+                <History className="h-5 w-5" />
+              </button>
+              <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-blue-600">
+                <Bot className="h-6 w-6 text-white" />
+              </div>
+              <div>
+                <h1 className="text-xl font-semibold text-gray-900 flex items-center gap-2">
+                  Workforce AI Agent
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium bg-purple-100 text-purple-700">
+                    <Sparkles className="h-3 w-3" />
+                    GPT-4o-mini
+                  </span>
+                </h1>
+                <p className="text-sm text-gray-500">
+                  {isConnected ? (
+                    <span className="flex items-center gap-1">
+                      <span className="h-2 w-2 rounded-full bg-green-500" />
+                      Connected · Ready for automation
+                    </span>
+                  ) : (
+                    <span className="flex items-center gap-1">
+                      <span className="h-2 w-2 rounded-full bg-red-500" />
+                      Disconnected
+                    </span>
+                  )}
+                </p>
+              </div>
+            </div>
+            
           </div>
-          
-          <div className="border-t bg-white p-4">
-            <MessageInput
-              onSendMessage={handleSendMessage}
-              disabled={isStreaming || !isConnected}
-            />
-          </div>
-        </div>
+        </header>
         
-        {/* Sources sidebar */}
-        <aside
-          className={`w-80 border-l bg-white transition-all ${
-            showSources ? 'block' : 'hidden lg:block'
-          }`}
-        >
-          <SourcesSidebar sources={sources} />
-        </aside>
+        {/* Chat area */}
+        <div className="flex flex-1 flex-col overflow-hidden">
+            <div className="flex-1 overflow-y-auto">
+              {/* Show Quick Actions when no messages */}
+              {messages.length === 0 && showQuickActions && (
+                <div className="flex items-center justify-center h-full p-8">
+                  <div className="max-w-3xl w-full">
+                    <div className="text-center mb-8">
+                      <div className="inline-flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-blue-500 to-purple-600 mb-4">
+                        <Bot className="h-10 w-10 text-white" />
+                      </div>
+                      <h2 className="text-2xl font-bold text-gray-900 mb-2">
+                        Hi! I'm your Workforce AI Agent
+                      </h2>
+                      <p className="text-gray-600">
+                        I can help you with Slack, Gmail, and Notion. Try a quick action or ask me anything!
+                      </p>
+                    </div>
+                    <QuickActions onActionClick={handleQuickAction} />
+                  </div>
+                </div>
+              )}
+              
+              {/* Regular message list */}
+              {messages.length > 0 && (
+                <MessageList
+                  messages={messages}
+                  streamingMessage={streamingMessage}
+                  isStreaming={isStreaming}
+                />
+              )}
+            </div>
+            
+            
+            <div className="border-t bg-white p-4">
+              <MessageInput
+                onSendMessage={handleSendMessage}
+                disabled={isStreaming || !isConnected}
+              />
+            </div>
+        </div>
       </div>
     </div>
   )

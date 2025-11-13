@@ -94,7 +94,9 @@ function MessageBubble({ message }: { message: Message }) {
             {isUser ? 'You' : 'AI Assistant'}
           </span>
           <span className="text-xs text-gray-500">
-            {message.timestamp.toLocaleTimeString()}
+            {message.timestamp instanceof Date 
+              ? message.timestamp.toLocaleTimeString() 
+              : new Date(message.timestamp).toLocaleTimeString()}
           </span>
         </div>
         
