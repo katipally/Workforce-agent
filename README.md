@@ -1,11 +1,4 @@
 # 🤖 Workforce AI Agent
-
-**Your intelligent AI assistant that talks to Slack, Gmail, and Notion in plain English.**
-
-Ask questions like "Get messages from #social" or "Find emails from John" and the AI figures out what to do. Now powered by **GPT-4o-mini** (November 2025) - 80% cheaper, faster, and fully capable!
-
-**🎯 NEW: Cross-Platform Project Tracking** - Track projects across all platforms, auto-update Notion pages, generate reports, and more!
-
 ---
 
 ## ✨ What Can It Do?
