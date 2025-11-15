@@ -9,6 +9,7 @@ export default function ChatHistorySidebar() {
   // Load sessions on mount
   useEffect(() => {
     loadSessions()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const loadSessions = async () => {
@@ -25,8 +26,9 @@ export default function ChatHistorySidebar() {
   }
 
   const handleNewChat = () => {
+    // Create a new local session immediately so the sidebar updates.
+    // The backend session row will be created lazily on first message send.
     createNewSession()
-    loadSessions() // Refresh sessions list
   }
 
   const handleSelectSession = async (sessionId: string) => {

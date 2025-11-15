@@ -1,6 +1,8 @@
 # 🛠️ Workforce AI Agent - Complete Tools Catalog
 
-This document lists **ALL 40+ tools** available in the Workforce AI Agent, organized by platform.
+This document lists the core tools available in the Workforce AI Agent, organized by platform.
+
+> 💡 **November 2025 Update**: The agent now has **60+ tools** including advanced Gmail thread tools, Notion workspace tools, cross-platform project tracking, and utilities. This catalog focuses on the core set; see the README for a high-level overview of all capabilities.
 
 ---
 
@@ -232,7 +234,7 @@ Edit existing Slack messages
 
 ---
 
-## 📧 GMAIL TOOLS (15 Tools)
+## 📧 GMAIL TOOLS (15+ Tools)
 
 ### **Core Email Operations**
 
@@ -373,47 +375,38 @@ AI calls: add_gmail_label(message_id="18abc", label_name="Important")
 
 ---
 
-### **Thread Operations**
+### **Thread Operations & Advanced Search (NEW - Nov 2025)**
 
-#### 29. **get_email_thread**
-**What it does:** Gets all messages in an email conversation/thread.
+#### 29. **search_email_threads**
+**What it does:** Searches for email *threads* (conversations) using any Gmail search query and returns thread summaries with message counts.
 
-**Use when:** User wants to see full email chain, conversation history
+**Use when:** User asks "find the thread about X" or "show conversations about Y".
+
+**Parameters:**
+- `query` (required): Gmail search query (supports `from:`, `to:`, `subject:`, `has:attachment`, `after:`, `before:`, etc.)
+- `limit` (optional): Max threads (default: 10)
+
+#### 30. **get_complete_email_thread**
+**What it does:** Retrieves the **ENTIRE** email thread with *all messages* and full bodies, no matter how long the chain is.
+
+**Use when:** User wants to read the full conversation history.
 
 **Parameters:**
 - `thread_id` (required): Gmail thread ID
 
-**Example:**
-```
-User: "Show me the full conversation"
-AI calls: get_email_thread(thread_id="18abc123")
-```
+#### 31. **get_recent_email_thread_between_people**
+**What it does:** Finds the most recent email thread between two people (by name or email) and returns the full conversation.
+
+**Use when:** User asks "get our recent email thread between Yash and Ivan Lee".
+
+**Parameters:**
+- `person_a` (required): First person (name or email)
+- `person_b` (required): Second person (name or email)
+- `days_back` (optional): How many days back to search (default: 60)
 
 ---
 
-### **Advanced Features (Available in Gmail API)**
-
-#### 30. **create_draft** (Not yet implemented)
-Create email drafts
-
-#### 31. **send_draft** (Not yet implemented)
-Send a saved draft
-
-#### 32. **delete_draft** (Not yet implemented)
-Delete a draft
-
-#### 33. **get_attachments** (Not yet implemented)
-Download email attachments
-
-#### 34. **send_with_attachment** (Not yet implemented)
-Send email with file attachments
-
-#### 35. **set_auto_reply** (Not yet implemented)
-Configure vacation responder
-
----
-
-## 📝 NOTION TOOLS (10 Tools)
+## 📝 NOTION TOOLS (10+ Tools)
 
 ### **Page Operations**
 
@@ -486,9 +479,9 @@ AI calls: update_notion_page(page_id="abc123", title="New Title")
 ---
 
 #### 40. **search_notion_content**
-**What it does:** Searches Notion pages by content keywords.
+**What it does:** Searches Notion pages by content keywords using the Notion Search API.
 
-**Use when:** User asks "search notion for X", "find pages about Y"
+**Use when:** User asks "search notion for X", "find pages about Y".
 
 **Parameters:**
 - `query` (required): Search query
@@ -501,26 +494,26 @@ AI calls: search_notion_content(query="budget")
 
 ---
 
-### **Advanced Features (Available in Notion API)**
+### **Workspace Search & Databases (NEW - Nov 2025)**
 
-#### 41. **create_database** (Not yet implemented)
-Create new Notion databases
+#### 41. **search_notion_workspace**
+**What it does:** Searches across the entire Notion workspace (pages + databases) for a query.
 
-#### 42. **query_database** (Not yet implemented)
-Query database with filters
+**Use when:** User asks "search all notion for X", "what pages mention Y".
 
-#### 43. **update_page_properties** (Not yet implemented)
-Update database page properties
+#### 42. **list_notion_databases**
+**What it does:** Lists recent Notion databases in the workspace using the Notion Search API.
 
-#### 44. **append_blocks** (Not yet implemented)
-Add content to existing pages
+**Use when:** User asks "what databases do we have", "list notion databases".
 
-#### 45. **create_comment** (Not yet implemented)
-Add comments to pages
+#### 43. **append_to_notion_page**
+**What it does:** Appends formatted content blocks to an existing Notion page (used heavily by project tracking).
+
+**Use when:** User asks "update the project page with latest status".
 
 ---
 
-## 🔍 WORKSPACE SEARCH (1 Tool)
+## 🔍 WORKSPACE & PROJECT TOOLS (4+ Tools)
 
 #### 46. **search_workspace**
 **What it does:** Semantic search across ALL platforms (Slack, Gmail, Notion) using AI embeddings.
@@ -543,15 +536,39 @@ Returns: Top 10 most relevant results from all sources
 
 ---
 
+### **Cross-Platform Project Tracking (NEW - Nov 2025)**
+
+#### 47. **track_project**
+Aggregates updates from Slack, Gmail, and Notion for a given project, analyzes key points/action items/blockers, and computes progress.
+
+#### 48. **generate_project_report**
+Produces a stakeholder-ready text report with progress bars and sections for highlights, action items, and blockers.
+
+#### 49. **update_project_notion_page**
+Takes the latest tracked project status and appends it to an existing Notion page (does **not** create new pages).
+
+### **Cross-Platform Utilities**
+
+#### 50. **search_all_platforms**
+Runs a unified search across Slack, Gmail, and Notion and returns a combined view.
+
+#### 51. **get_team_activity_summary**
+Summarizes what a specific person has been doing across Slack, Gmail, and Notion.
+
+#### 52. **analyze_slack_channel**
+Analyzes a Slack channel for activity level, most active users, and basic sentiment (positive/negative/questions).
+
+---
+
 ## 🎯 Tool Categories Summary
 
-| Category | Count | Description |
-|----------|-------|-------------|
-| **Slack** | 20 tools | Messages, channels, users, threads, reactions |
-| **Gmail** | 15 tools | Send, read, search, labels, threads, drafts |
-| **Notion** | 10 tools | Create, read, update, search pages & databases |
-| **Workspace** | 1 tool | Cross-platform semantic search |
-| **TOTAL** | **46 tools** | Comprehensive workspace automation |
+| Category | Approx. Count | Description |
+|----------|---------------|-------------|
+| **Slack** | 20+ tools | Messages, channels, users, threads, reactions, files |
+| **Gmail** | 15+ tools | Send, read, search, labels, threads, advanced search |
+| **Notion** | 10+ tools | Create, read, update, search pages & databases |
+| **Workspace & Projects** | 6+ tools | Semantic search, project tracking, analytics |
+| **TOTAL** | **60+ tools** | Comprehensive workspace automation |
 
 ---
 
@@ -609,16 +626,16 @@ AI Workflow:
 
 ## 🔧 Implementation Status
 
-✅ **Fully Implemented** (30 tools)
+✅ **Fully Implemented / Active** (majority of tools)
 - All core Slack, Gmail, Notion operations
-- Workspace semantic search
+- Advanced Gmail threads, Notion workspace search, project tracking
+- Cross-platform semantic search and team analytics
 
-🟡 **API Available, Not Yet Exposed** (16 tools)
-- Advanced Slack features (file upload, scheduling)
-- Gmail drafts and attachments
-- Notion databases and blocks
+🟡 **Planned / Experimental**
+- Additional advanced Slack features (scheduling, bookmarks, reminders)
+- Deeper Notion database automations and workflows
 
 ---
 
 **Last Updated:** November 2025  
-**Total Tools:** 46 (30 active, 16 planned)
+**Total Tools:** 60+ (majority active; some advanced tools planned)

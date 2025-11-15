@@ -154,7 +154,7 @@ The AI agent has access to **66+ comprehensive tools** with all major API featur
 - **Single Source of Truth**: All data synced to PostgreSQL with pgvector
 
 ### 🆕 **November 2025 Updates**
-- ✨ **GPT-4o-mini**: Upgraded to latest OpenAI model (80% cost reduction)
+- ✨ **gpt-5-nano**: Upgraded to latest OpenAI lightweight reasoning model (optimized for speed & cost)
 - 🎯 **PROJECT TRACKING**: Cross-platform project management! (**6 NEW TOOLS**)
   - Track projects across Slack, Gmail, and Notion automatically
   - Generate stakeholder-ready reports
@@ -275,8 +275,9 @@ SLACK_BOT_TOKEN=xoxb-your-slack-bot-token
 SLACK_APP_TOKEN=xapp-your-slack-app-token
 
 # Optional (add if you want Gmail/Notion)
-GMAIL_CREDENTIALS_PATH=backend/core/credentials/gmail/credentials.json
-NOTION_API_KEY=secret_your-notion-key
+GMAIL_CREDENTIALS_FILE=credentials/gmail_credentials.json
+GMAIL_TOKEN_FILE=data/gmail_token.pickle
+NOTION_TOKEN=secret_your-notion-key
 NOTION_PARENT_PAGE_ID=your-page-id
 
 # Database
@@ -449,7 +450,7 @@ lsof -ti:5173 | xargs kill -9
 Workforce-agent/
 ├── backend/
 │   ├── agent/              # AI brain & tools
-│   │   ├── ai_brain.py     # GPT-4 + multi-tool logic
+│   │   ├── ai_brain.py     # gpt-5-nano + multi-tool logic
 │   │   └── langchain_tools.py  # 26 API tools
 │   ├── api/                # FastAPI server
 │   │   └── main.py         # WebSocket endpoints
@@ -472,10 +473,8 @@ Workforce-agent/
 
 ## 📚 Documentation
 
-- **📖 [Complete Tool Catalog](./TOOLS_CATALOG.md)** - All 46 tools with examples
-- **🔄 [System Architecture & Flowchart](./SYSTEM_FLOWCHART.md)** - End-to-end system flow
+- **📖 [Complete Tool Catalog](./TOOLS_CATALOG.md)** - Core 46 tools with examples (Slack, Gmail, Notion, Workspace)
 - **🔑 [API Setup Guide](./Documentation/api_guide.md)** - Step-by-step API configuration
-- **📱 [Slack API Details](./Documentation/SLACK_API_GUIDE.md)** - Slack-specific setup
 - **⚡ [API Endpoints](http://localhost:8000/docs)** - Interactive API docs (when running)
 
 ---
@@ -499,7 +498,7 @@ Workforce-agent/
 
 ## 🎯 What Makes This Special
 
-- **Latest AI Model**: GPT-4o-mini (Nov 2025) - 80% cheaper, same capabilities
+- **Latest AI Model**: gpt-5-nano (Nov 2025) - fast, cost-efficient reasoning with tools
 - **Single Source of Truth**: PostgreSQL with pgvector stores all cross-platform data
 - **Hybrid Interface**: Chatbot UX + AI agent automation in one
 - **Smart AI**: Automatically selects and chains tools
@@ -516,4 +515,4 @@ MIT License - See LICENSE file
 
 ---
 
-**Made with ❤️ | Built for productivity | Powered by GPT-4o-mini (Nov 2025)**
+**Made with ❤️ | Built for productivity | Powered by gpt-5-nano (Nov 2025)**

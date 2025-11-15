@@ -15,6 +15,7 @@ import numpy as np
 import os
 import sys
 from pathlib import Path
+import requests
 
 # Add core directory to path
 core_path = Path(__file__).parent.parent / 'core'
@@ -25,6 +26,7 @@ from .qwen_engine import QwenEmbedding, QwenReranker
 from .langchain_tools import WorkforceTools
 from database.db_manager import DatabaseManager
 from database.models import Message, GmailMessage, Channel, User
+from config import Config
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -65,12 +67,15 @@ class HybridRAGEngine:
         self.reranker_model = qwen_reranker
         
         # Initialize OpenAI (for LLM calls)
-        # Using gpt-4o-mini: Latest cost-efficient model (Nov 2025)
-        # 80% cheaper than GPT-4, full streaming and tool calling support
+        # Using Config.LLM_MODEL (default: gpt-5-nano) for hybrid RAG and intent classification
+        # GPT-5 series models only support the default temperature (1.0), so we avoid custom values there.
+        base_temperature = 0.1
+        if Config.LLM_MODEL.startswith("gpt-5"):
+            base_temperature = 1.0
         self.llm = ChatOpenAI(
-            model="gpt-4o-mini",
+            model=Config.LLM_MODEL,
             api_key=openai_api_key,
-            temperature=0.1,
+            temperature=base_temperature,
             streaming=True
         )
         
@@ -96,6 +101,159 @@ class HybridRAGEngine:
             logger.info("Loading Qwen3-Reranker-4B...")
             self.reranker_model = QwenReranker()
     
+    def _search_notion_pages(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Search Notion workspace for pages matching the query.
+        
+        Uses the Notion Search API at query time (no DB storage) so that
+        Notion content can participate in hybrid RAG without schema changes.
+        """
+        if not Config.NOTION_TOKEN:
+            # Notion is optional; just skip if not configured
+            logger.debug("NOTION_TOKEN not configured; skipping Notion search")
+            return []
+
+        headers = {
+            "Authorization": f"Bearer {Config.NOTION_TOKEN}",
+            "Notion-Version": "2022-06-28",
+            "Content-Type": "application/json",
+        }
+
+        payload = {
+            "query": query,
+            "filter": {"property": "object", "value": "page"},
+            "sort": {"direction": "descending", "timestamp": "last_edited_time"},
+            "page_size": min(max(limit, 1), 25),  # keep small for latency
+        }
+
+        try:
+            response = requests.post(
+                "https://api.notion.com/v1/search",
+                headers=headers,
+                json=payload,
+                timeout=10,
+            )
+        except Exception as e:
+            logger.error(f"Error calling Notion search API: {e}", exc_info=True)
+            return []
+
+        if response.status_code != 200:
+            logger.error(
+                f"Notion search API error {response.status_code}: {response.text[:200]}"
+            )
+            return []
+
+        data = response.json()
+        results: List[Dict[str, Any]] = []
+        for page in data.get("results", [])[:limit]:
+            if page.get("object") != "page":
+                continue
+
+            properties = page.get("properties", {})
+            title_prop = properties.get("title", {}) or properties.get("Name", {})
+            title_array = title_prop.get("title") or []
+            title = "Untitled"
+            if title_array:
+                # Use first title segment
+                title = title_array[0].get("plain_text") or title
+
+            results.append(
+                {
+                    "id": page.get("id"),
+                    "title": title,
+                    "last_edited_time": page.get("last_edited_time"),
+                }
+            )
+
+        return results
+
+    def _get_notion_page_text(self, page_id: str, max_blocks: int = 50) -> str:
+        """Retrieve and flatten a Notion page's top blocks into plain text.
+
+        This is intentionally shallow (first N blocks) to keep latency and
+        token usage under control, while still giving the RAG engine a solid
+        textual representation of the page.
+        """
+        if not Config.NOTION_TOKEN or not page_id:
+            return ""
+
+        headers = {
+            "Authorization": f"Bearer {Config.NOTION_TOKEN}",
+            "Notion-Version": "2022-06-28",
+        }
+
+        url = f"https://api.notion.com/v1/blocks/{page_id}/children"
+        blocks: List[Dict[str, Any]] = []
+        next_cursor: Optional[str] = None
+
+        # Paginate until we have max_blocks or run out of content
+        while len(blocks) < max_blocks:
+            params: Dict[str, Any] = {
+                "page_size": min(max_blocks - len(blocks), 100),
+            }
+            if next_cursor:
+                params["start_cursor"] = next_cursor
+
+            try:
+                resp = requests.get(
+                    url,
+                    headers=headers,
+                    params=params,
+                    timeout=10,
+                )
+            except Exception as e:
+                logger.error(f"Error calling Notion blocks API: {e}", exc_info=True)
+                break
+
+            if resp.status_code != 200:
+                logger.error(
+                    f"Notion blocks API error {resp.status_code}: {resp.text[:200]}"
+                )
+                break
+
+            data = resp.json()
+            batch = data.get("results", [])
+            if not batch:
+                break
+
+            blocks.extend(batch)
+            has_more = data.get("has_more")
+            next_cursor = data.get("next_cursor")
+            if not has_more or not next_cursor:
+                break
+
+        lines: List[str] = []
+
+        for block in blocks[:max_blocks]:
+            block_type = block.get("type")
+            rich_text_list = None
+
+            if block_type in ("paragraph", "heading_1", "heading_2", "heading_3"):
+                rich_text_list = block.get(block_type, {}).get("rich_text", [])
+            elif block_type in ("bulleted_list_item", "numbered_list_item", "to_do"):
+                rich_text_list = block.get(block_type, {}).get("rich_text", [])
+
+            if not rich_text_list:
+                continue
+
+            text = "".join(rt.get("plain_text", "") for rt in rich_text_list).strip()
+            if not text:
+                continue
+
+            if block_type == "heading_1":
+                lines.append(f"# {text}")
+            elif block_type == "heading_2":
+                lines.append(f"## {text}")
+            elif block_type == "heading_3":
+                lines.append(f"### {text}")
+            else:
+                lines.append(text)
+
+        content = "\n".join(lines).strip()
+        # Avoid extremely long contexts
+        if len(content) > 2000:
+            content = content[:2000] + "..."
+        return content
+    
     def _classify_intent(self, query: str) -> str:
         """Classify user intent (search, action, or hybrid).
         
@@ -105,7 +263,7 @@ class HybridRAGEngine:
         Returns:
             Intent type: "search", "action", or "hybrid"
         """
-        # Use GPT-4 for intent classification
+        # Use main LLM (Config.LLM_MODEL) for intent classification
         system_prompt = """Classify the user's intent into ONE of these categories:
         - "search": User wants to find/retrieve information (e.g., "what did John say?", "find emails about...")
         - "action": User wants to perform an action (e.g., "send a message", "create a page")
@@ -184,6 +342,47 @@ class HybridRAGEngine:
                         }
                     })
         
+        # Search Notion pages semantically at query time (no DB storage)
+        try:
+            notion_pages = self._search_notion_pages(query, limit=min(limit, 10))
+        except Exception as e:
+            logger.error(f"Error searching Notion for vector search: {e}", exc_info=True)
+            notion_pages = []
+
+        if notion_pages:
+            texts: List[str] = []
+            meta: List[Dict[str, Any]] = []
+            for page in notion_pages:
+                page_text = self._get_notion_page_text(page.get('id'), max_blocks=50)
+                if not page_text:
+                    continue
+                full_text = f"{page.get('title', 'Untitled')}\n{page_text}"
+                texts.append(full_text)
+                meta.append(page)
+
+            if texts:
+                try:
+                    doc_embs = self.embedding_model.encode(
+                        texts,
+                        batch_size=min(len(texts), 8),
+                        is_query=False,
+                        show_progress=False,
+                    )
+                    for text_doc, emb, page_meta in zip(texts, doc_embs, meta):
+                        score = float(np.dot(query_emb, emb))
+                        results.append({
+                            'type': 'notion',
+                            'text': text_doc,
+                            'score': score,
+                            'metadata': {
+                                'page_id': page_meta.get('id'),
+                                'title': page_meta.get('title'),
+                                'last_edited_time': page_meta.get('last_edited_time')
+                            }
+                        })
+                except Exception as e:
+                    logger.error(f"Error embedding Notion documents: {e}", exc_info=True)
+        
         # Sort by score descending
         results.sort(key=lambda x: x['score'], reverse=True)
         
@@ -237,6 +436,27 @@ class HybridRAGEngine:
                         'from': email.from_address,
                         'subject': email.subject,
                         'date': email.date
+                    }
+                })
+        
+            # Keyword-style Notion search (via Notion Search API)
+            try:
+                notion_pages = self._search_notion_pages(query, limit=limit)
+            except Exception as e:
+                logger.error(f"Error searching Notion for keyword search: {e}", exc_info=True)
+                notion_pages = []
+
+            for page in notion_pages:
+                page_text = self._get_notion_page_text(page.get('id'), max_blocks=20)
+                preview = page_text[:500] if page_text else ""
+                results.append({
+                    'type': 'notion',
+                    'text': f"{page.get('title', 'Untitled')}\n{preview}",
+                    'score': 1.0,
+                    'metadata': {
+                        'page_id': page.get('id'),
+                        'title': page.get('title'),
+                        'last_edited_time': page.get('last_edited_time')
                     }
                 })
         
@@ -351,7 +571,7 @@ class HybridRAGEngine:
         def execute_tools_node(state: AgentState) -> AgentState:
             """Execute tools if action intent."""
             if state['intent'] in ['action', 'hybrid']:
-                # Use GPT-4 to determine which tool to call
+                # Use LLM (Config.LLM_MODEL, gpt-5-nano by default) to determine which tool to call
                 tool_prompt = f"""Based on this user query: "{state['query']}"
                 
 Available tools:

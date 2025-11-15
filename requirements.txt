@@ -7,8 +7,14 @@ aiohttp>=3.10.0
 asyncio>=3.4.3
 
 # Database
-sqlalchemy>=2.0.35
+sqlalchemy>=2.0.44
 alembic>=1.13.3
+psycopg2-binary>=2.9.9
+pgvector>=0.3.5
+
+# API (optional)
+fastapi>=0.115.0
+uvicorn>=0.32.0
 
 # Retry logic
 tenacity>=9.0.0
@@ -19,18 +25,6 @@ python-dotenv>=1.0.1
 # CLI
 click>=8.1.7
 rich>=13.9.0
-
-<<<<<<< Updated upstream
-# API (optional)
-fastapi>=0.115.0
-uvicorn>=0.32.0
-=======
-# Database
-sqlalchemy>=2.0.44
-alembic>=1.11.1
-psycopg2-binary>=2.9.9
-pgvector>=0.3.5
->>>>>>> Stashed changes
 
 # Date/time
 python-dateutil>=2.9.0

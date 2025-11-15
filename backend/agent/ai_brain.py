@@ -5,7 +5,7 @@ This module implements a production-ready AI agent that:
 1. Knows its identity and capabilities
 2. Can use tools (Slack, Gmail, Notion)
 3. Has access to RAG for context retrieval
-4. Uses GPT-4 for better reasoning
+4. Uses gpt-5-nano (or compatible gpt-5 family models) for lightweight reasoning
 """
 
 import json
@@ -35,7 +35,7 @@ SYSTEM_PROMPT = """You are the Workforce AI Assistant, an intelligent agent desi
 - Capabilities: You have direct access to Slack, Gmail, and Notion through API integrations
 
 ## YOUR TOOLS
-You have access to 13 powerful tools to interact with the user's workspace:
+You have access to many powerful tools (60+ as of Nov 2025) to interact with the user's workspace.
 
 ### SLACK TOOLS (5 tools)
 1. **get_all_slack_channels** - List ALL Slack channels
@@ -60,7 +60,7 @@ You have access to 13 powerful tools to interact with the user's workspace:
    - Post messages to any Slack channel
    - Example: "Send 'Meeting at 3pm' to #general"
 
-### GMAIL TOOLS (4 tools)
+### GMAIL TOOLS (core examples)
 6. **get_emails_from_sender** - Get ALL emails from a person
    - Retrieve all emails from a specific sender
    - Example: "Get all emails from john@company.com"
@@ -78,7 +78,7 @@ You have access to 13 powerful tools to interact with the user's workspace:
    - Send emails to any recipient
    - Example: "Send an email to team@company.com"
 
-### NOTION TOOLS (3 tools)
+### NOTION TOOLS (core examples)
 10. **list_notion_pages** - List Notion pages
     - Get list of pages in workspace
     - Example: "Show me my Notion pages"
@@ -91,28 +91,51 @@ You have access to 13 powerful tools to interact with the user's workspace:
     - Create new pages with rich content
     - Example: "Save these notes to Notion"
 
-### WORKSPACE SEARCH (1 tool)
+### WORKSPACE SEARCH (core examples)
 13. **search_workspace** - Search EVERYTHING
     - Semantic search across Slack, Gmail, and Notion
     - Uses AI to find most relevant information
     - Example: "What did anyone say about Q4 across all platforms?"
 
 ## CAPABILITIES
-- **SLACK**: List channels, get ALL messages, summarize channels, search, send messages
-- **GMAIL**: Get emails from specific people, search by subject, broad search, send emails
-- **NOTION**: List pages, search content, create new pages
-- **WORKSPACE**: Cross-platform semantic search
-- **INTELLIGENCE**: Can analyze, summarize, and provide insights from retrieved data
-- **AUTOMATION**: Can perform actions (send, create) on behalf of user
+- **SLACK**: List channels, get ALL messages, summarize channels, search, send messages, manage pins, channels, and users
+- **GMAIL**: Full email bodies, advanced search with ALL operators, complete thread retrieval (all messages), search email threads, get unread counts, send emails
+- **NOTION**: List pages via workspace search API, search content across workspace, create and append to pages, update existing project pages
+- **WORKSPACE**: Cross-platform semantic search and project tracking across Slack, Gmail, and Notion
+- **INTELLIGENCE**: Analyze, summarize, and provide insights from retrieved data
+- **AUTOMATION**: Perform actions (send, create, update) on behalf of user, and update existing Notion pages instead of creating duplicates
+
+## ADVANCED TOOLS (NOV 2025)
+- **GMAIL THREADS**:
+  - `search_email_threads` – find email threads (conversations) using any Gmail query
+  - `get_complete_email_thread` – retrieve the ENTIRE thread with ALL messages and full bodies
+  - `get_recent_email_thread_between_people` – get the most recent thread between two people (names or emails)
+- **NOTION WORKSPACE**:
+  - `list_notion_pages` – list recent pages in the workspace via Notion Search API
+  - `search_notion_workspace` – search for pages anywhere in the workspace
+  - `append_to_notion_page` – update existing Notion pages with new content (DO NOT create duplicates)
+- **PROJECT TRACKING**:
+  - `track_project` – aggregate project updates from Slack, Gmail, and Notion
+  - `generate_project_report` – create stakeholder-ready project reports
+  - `update_project_notion_page` – write project status updates into existing Notion pages
+- **CROSS-PLATFORM UTILITIES**:
+  - `search_all_platforms` – search Slack, Gmail, and Notion simultaneously
+  - `get_team_activity_summary` – summarize a team member's activity across tools
+  - `analyze_slack_channel` – channel analytics and engagement metrics
 
 ## TOOL SELECTION GUIDE
 - User asks "get all messages from #channel" → Use `get_channel_messages`
 - User asks "summarize #channel" → Use `summarize_slack_channel`
 - User asks "list channels" → Use `get_all_slack_channels`
-- User asks "emails from person@email.com" → Use `get_emails_from_sender`
-- User asks "find email about X" → Use `get_email_by_subject`
+- User asks "emails from person@email.com" → Use `get_emails_from_sender` or `advanced_gmail_search` with a `from:` query
+- User asks "find email about X" → Use `get_email_by_subject` or `advanced_gmail_search`
+- User asks "get our recent email thread between A and B" → Prefer `get_recent_email_thread_between_people` (it will internally use thread search + full-thread retrieval)
+- User asks "show all Notion pages" → Use `list_notion_pages`
+- User asks "find Notion pages about X" → Use `search_notion_workspace` or `search_notion_content`
 - User asks "what channels exist" → Use `get_all_slack_channels`
-- User asks for summary → Get data first, then summarize in your response
+- User asks "overall project status" → Use `track_project` (optionally followed by `update_project_notion_page`)
+- User asks "search everywhere for X" → Use `search_all_platforms`
+- User asks for summary → Get data first with tools, then summarize in your response
 
 ## MULTI-TOOL WORKFLOWS
 You can call MULTIPLE tools in sequence for complex tasks:
@@ -161,6 +184,27 @@ You: I'll create a Notion page for your meeting notes. Please provide the notes 
 - Ask for clarification if the request is ambiguous
 - Prioritize user privacy and data security
 
+## DESTRUCTIVE ACTIONS & CONFIRMATION GUARDRAILS
+Some tools perform **destructive or hard-to-undo actions**, for example:
+- Slack: `archive_slack_channel`, `delete_slack_message`, `update_slack_message`
+- Gmail: `send_gmail`, `send_gmail_with_attachments`
+- Notion: `create_notion_page`, `append_to_notion_page`, `update_project_notion_page`, `update_notion_database_item`
+
+For ALL of these tools you MUST follow a strict TWO-STEP pattern:
+1. **Step 1 – Plan & Explain (no `confirmed=true`)**
+   - First, respond to the user in natural language, clearly explaining:
+     - What you intend to do
+     - Which items will be affected (channel, message, email, Notion page, etc.)
+   - Ask the user to explicitly confirm before proceeding.
+   - If you call a destructive tool **without** `confirmed=true`, the backend will NOT execute it and will instead remind you to ask the user.
+
+2. **Step 2 – Execute after explicit confirmation**
+   - Only after the user clearly confirms (e.g. "Yes, archive #channel", "Yes, send that email"), you may call the tool again.
+   - In that second call, set `confirmed=true` in the tool arguments.
+   - NEVER set `confirmed=true` on the first call, and NEVER assume consent.
+
+If you are not 100% sure the user has explicitly confirmed, DO NOT set `confirmed=true`. Ask them to confirm again.
+
 Now, help the user with their request!"""
 
 
@@ -171,7 +215,7 @@ class WorkforceAIBrain:
         self,
         openai_api_key: str,
         rag_engine: HybridRAGEngine,
-        model: str = "gpt-4o-mini",
+        model: str = "gpt-5-nano",
         temperature: float = 0.7
     ):
         """Initialize the AI brain.
@@ -179,8 +223,8 @@ class WorkforceAIBrain:
         Args:
             openai_api_key: OpenAI API key
             rag_engine: RAG engine for context retrieval
-            model: OpenAI model to use (default: gpt-4o-mini - cost-efficient, Nov 2025)
-                   Options: gpt-4o-mini (cheapest), gpt-4o (best), gpt-4-turbo (legacy)
+            model: OpenAI model to use (default: gpt-5-nano - fast, cost-efficient reasoning, Nov 2025)
+                   Examples: gpt-5-nano (default), gpt-5-mini, gpt-5 (if available)
             temperature: Model temperature (0.7 for balanced creativity)
         """
         self.client = AsyncOpenAI(api_key=openai_api_key)
@@ -377,6 +421,11 @@ class WorkforceAIBrain:
                             "body": {
                                 "type": "string",
                                 "description": "Email body (plain text or HTML)"
+                            },
+                            "confirmed": {
+                                "type": "boolean",
+                                "description": "MUST be true ONLY after the user explicitly confirmed sending this email.",
+                                "default": False
                             }
                         },
                         "required": ["to", "subject", "body"]
@@ -398,6 +447,59 @@ class WorkforceAIBrain:
                             }
                         },
                         "required": []
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "query_notion_database",
+                    "description": "Query a Notion database and list matching rows. Use this when user asks to filter or view items in a Notion project/task database.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "database_id": {
+                                "type": "string",
+                                "description": "Notion database ID to query"
+                            },
+                            "filter_json": {
+                                "type": "string",
+                                "description": "Optional JSON string for Notion filter object (e.g., status or owner filters)",
+                                "nullable": True
+                            },
+                            "page_size": {
+                                "type": "integer",
+                                "description": "Maximum rows to return (default: 10)",
+                                "default": 10
+                            }
+                        },
+                        "required": ["database_id"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "update_notion_database_item",
+                    "description": "Update properties of an existing Notion database item (page). IMPORTANT: only updates existing items; does not create new pages.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "page_id": {
+                                "type": "string",
+                                "description": "Notion page ID belonging to the database"
+                            },
+                            "properties_json": {
+                                "type": "string",
+                                "description": "JSON string representing Notion properties to set (e.g., status, owner)"
+                            },
+                            "confirmed": {
+                                "type": "boolean",
+                                "description": "MUST be true ONLY after the user explicitly confirmed updating this database item.",
+                                "default": False
+                            }
+                        },
+                        "required": ["page_id", "properties_json"]
                     }
                 }
             },
@@ -433,6 +535,11 @@ class WorkforceAIBrain:
                             "content": {
                                 "type": "string",
                                 "description": "Page content (supports markdown)"
+                            },
+                            "confirmed": {
+                                "type": "boolean",
+                                "description": "MUST be true ONLY after the user explicitly confirmed creating this page.",
+                                "default": False
                             }
                         },
                         "required": ["title", "content"]
@@ -555,6 +662,108 @@ class WorkforceAIBrain:
                     }
                 }
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_recent_email_thread_between_people",
+                    "description": "Get the most recent email thread between two people (names or email addresses) and return the FULL thread content. Use this when user asks for 'recent thread between X and Y'.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "person_a": {
+                                "type": "string",
+                                "description": "First person (name or email)"
+                            },
+                            "person_b": {
+                                "type": "string",
+                                "description": "Second person (name or email)"
+                            },
+                            "days_back": {
+                                "type": "integer",
+                                "description": "How many days back to search (default: 60)",
+                                "default": 60
+                            }
+                        },
+                        "required": ["person_a", "person_b"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_gmail_attachments_for_message",
+                    "description": "List all attachments for a Gmail message and show their filenames, sizes, and attachment IDs.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "message_id": {
+                                "type": "string",
+                                "description": "Gmail message ID whose attachments should be listed"
+                            }
+                        },
+                        "required": ["message_id"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "download_gmail_attachment",
+                    "description": "Download a Gmail attachment and save it into the local files directory for the agent to use.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "message_id": {
+                                "type": "string",
+                                "description": "Gmail message ID containing the attachment"
+                            },
+                            "attachment_id": {
+                                "type": "string",
+                                "description": "Attachment ID as returned by list_gmail_attachments_for_message"
+                            },
+                            "filename": {
+                                "type": "string",
+                                "description": "Preferred filename for storing the attachment locally"
+                            }
+                        },
+                        "required": ["message_id", "attachment_id", "filename"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "send_gmail_with_attachments",
+                    "description": "Send an email via Gmail with one or more local files attached. Use after the user uploads or references files.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "to": {
+                                "type": "string",
+                                "description": "Recipient email address"
+                            },
+                            "subject": {
+                                "type": "string",
+                                "description": "Email subject line"
+                            },
+                            "body": {
+                                "type": "string",
+                                "description": "Plain-text email body"
+                            },
+                            "file_paths": {
+                                "type": "string",
+                                "description": "Comma-separated list of local file paths to attach"
+                            },
+                            "confirmed": {
+                                "type": "boolean",
+                                "description": "MUST be true ONLY after the user explicitly confirmed sending this email with attachments.",
+                                "default": False
+                            }
+                        },
+                        "required": ["to", "subject", "body", "file_paths"]
+                    }
+                }
+            },
             # NEW SLACK TOOLS - Nov 2025
             {
                 "type": "function",
@@ -665,7 +874,12 @@ class WorkforceAIBrain:
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "channel": {"type": "string", "description": "Channel ID to archive"}
+                            "channel": {"type": "string", "description": "Channel ID to archive"},
+                            "confirmed": {
+                                "type": "boolean",
+                                "description": "MUST be true ONLY after the user explicitly confirmed archiving this channel.",
+                                "default": False
+                            }
                         },
                         "required": ["channel"]
                     }
@@ -696,7 +910,12 @@ class WorkforceAIBrain:
                         "properties": {
                             "channel": {"type": "string", "description": "Channel ID"},
                             "timestamp": {"type": "string", "description": "Message timestamp"},
-                            "text": {"type": "string", "description": "New message text"}
+                            "text": {"type": "string", "description": "New message text"},
+                            "confirmed": {
+                                "type": "boolean",
+                                "description": "MUST be true ONLY after the user explicitly confirmed editing this message.",
+                                "default": False
+                            }
                         },
                         "required": ["channel", "timestamp", "text"]
                     }
@@ -711,7 +930,12 @@ class WorkforceAIBrain:
                         "type": "object",
                         "properties": {
                             "channel": {"type": "string", "description": "Channel ID"},
-                            "timestamp": {"type": "string", "description": "Message timestamp"}
+                            "timestamp": {"type": "string", "description": "Message timestamp"},
+                            "confirmed": {
+                                "type": "boolean",
+                                "description": "MUST be true ONLY after the user explicitly confirmed deleting this message.",
+                                "default": False
+                            }
                         },
                         "required": ["channel", "timestamp"]
                     }
@@ -739,9 +963,32 @@ class WorkforceAIBrain:
                         "type": "object",
                         "properties": {
                             "page_id": {"type": "string", "description": "Page ID to append to"},
-                            "content": {"type": "string", "description": "Content to append"}
+                            "content": {"type": "string", "description": "Content to append"},
+                            "confirmed": {
+                                "type": "boolean",
+                                "description": "MUST be true ONLY after the user explicitly confirmed appending to this page.",
+                                "default": False
+                            }
                         },
                         "required": ["page_id", "content"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_notion_databases",
+                    "description": "List Notion databases in the workspace using the Notion Search API. Use when user asks about available databases or project tables.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum databases to list (default: 20)",
+                                "default": 20
+                            }
+                        },
+                        "required": []
                     }
                 }
             },
@@ -829,6 +1076,11 @@ class WorkforceAIBrain:
                                 "type": "integer",
                                 "description": "Days of history to include (default: 7)",
                                 "default": 7
+                            },
+                            "confirmed": {
+                                "type": "boolean",
+                                "description": "MUST be true ONLY after the user explicitly confirmed updating this Notion project page.",
+                                "default": False
                             }
                         },
                         "required": ["page_id", "project_name"]
@@ -917,6 +1169,29 @@ class WorkforceAIBrain:
         logger.info(f"Executing tool: {tool_name}")
         logger.debug(f"Arguments: {arguments}")
         
+        destructive_tools = {
+            "send_gmail": "sending an email",
+            "send_gmail_with_attachments": "sending an email with attachments",
+            "archive_slack_channel": "archiving a Slack channel",
+            "update_slack_message": "editing a Slack message",
+            "delete_slack_message": "deleting a Slack message",
+            "create_notion_page": "creating a new Notion page",
+            "append_to_notion_page": "appending content to a Notion page",
+            "update_project_notion_page": "updating a Notion project page",
+            "update_notion_database_item": "updating a Notion database item",
+        }
+
+        if tool_name in destructive_tools:
+            confirmed = bool(arguments.get("confirmed"))
+            if not confirmed:
+                explanation = destructive_tools[tool_name]
+                return (
+                    f"Safety guardrail: refusing to execute {tool_name} ({explanation}) "
+                    "without explicit user confirmation. Explain to the user what you plan "
+                    "to do and ask them to confirm, then call this tool again with "
+                    "confirmed=true."
+                )
+
         try:
             # SLACK TOOLS
             if tool_name == "get_all_slack_channels":
@@ -1023,6 +1298,33 @@ class WorkforceAIBrain:
                     limit=arguments.get("limit", 10)
                 )
             
+            elif tool_name == "get_recent_email_thread_between_people":
+                result = self.tools_handler.get_recent_email_thread_between_people(
+                    person_a=arguments.get("person_a", ""),
+                    person_b=arguments.get("person_b", ""),
+                    days_back=arguments.get("days_back", 60)
+                )
+            
+            elif tool_name == "list_gmail_attachments_for_message":
+                result = self.tools_handler.list_gmail_attachments_for_message(
+                    message_id=arguments.get("message_id", "")
+                )
+            
+            elif tool_name == "download_gmail_attachment":
+                result = self.tools_handler.download_gmail_attachment(
+                    message_id=arguments.get("message_id", ""),
+                    attachment_id=arguments.get("attachment_id", ""),
+                    filename=arguments.get("filename", "attachment")
+                )
+            
+            elif tool_name == "send_gmail_with_attachments":
+                result = self.tools_handler.send_gmail_with_attachments(
+                    to=arguments.get("to", ""),
+                    subject=arguments.get("subject", ""),
+                    body=arguments.get("body", ""),
+                    file_paths=arguments.get("file_paths", "")
+                )
+            
             # NEW SLACK TOOLS - Nov 2025
             elif tool_name == "upload_file_to_slack":
                 result = self.tools_handler.upload_file_to_slack(
@@ -1089,9 +1391,27 @@ class WorkforceAIBrain:
                     content=arguments.get("content", "")
                 )
             
+            elif tool_name == "list_notion_databases":
+                result = self.tools_handler.list_notion_databases(
+                    limit=arguments.get("limit", 20)
+                )
+            
             elif tool_name == "search_notion_workspace":
                 result = self.tools_handler.search_notion_workspace(
                     query=arguments.get("query", "")
+                )
+            
+            elif tool_name == "query_notion_database":
+                result = self.tools_handler.query_notion_database(
+                    database_id=arguments.get("database_id", ""),
+                    filter_json=arguments.get("filter_json"),
+                    page_size=arguments.get("page_size", 10)
+                )
+            
+            elif tool_name == "update_notion_database_item":
+                result = self.tools_handler.update_notion_database_item(
+                    page_id=arguments.get("page_id", ""),
+                    properties_json=arguments.get("properties_json", "")
                 )
             
             # PROJECT TRACKING TOOLS
@@ -1166,14 +1486,16 @@ class WorkforceAIBrain:
         
         # First call to GPT-4 with tools
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                tools=self.tools,
-                tool_choice="auto",
-                temperature=self.temperature,
-                stream=True
-            )
+            first_call_kwargs = {
+                "model": self.model,
+                "messages": messages,
+                "tools": self.tools,
+                "tool_choice": "auto",
+                "stream": True,
+            }
+            if not self.model.startswith("gpt-5"):
+                first_call_kwargs["temperature"] = self.temperature
+            response = await self.client.chat.completions.create(**first_call_kwargs)
             
             # Stream response
             function_name = None
@@ -1211,18 +1533,83 @@ class WorkforceAIBrain:
             while function_name and iteration < max_iterations:
                 iteration += 1
                 logger.info(f"Tool iteration {iteration}: {function_name}")
-                
-                yield {
-                    "type": "status",
-                    "content": f"Step {iteration}: Using {function_name}..."
-                }
-                
-                # Parse arguments
+
+                # Parse arguments for richer reasoning/status messages
                 try:
                     args = json.loads(function_args)
-                except:
+                except Exception:
                     args = {}
-                
+
+                # Build a high-level reasoning description for the UI
+                try:
+                    args_preview = json.dumps(args, ensure_ascii=False)
+                except Exception:
+                    args_preview = str(args) if args else ""
+
+                # More natural, user-facing description inspired by "Thinking" UIs
+                human_step = ""
+                if function_name == "get_emails_from_sender":
+                    sender = args.get("sender") or "the requested sender"
+                    human_step = (
+                        f"Step {iteration}: Reading recent emails from {sender} to understand what they've said and what might matter for your question."
+                    )
+                elif function_name == "get_email_by_subject":
+                    subj = args.get("subject") or "the requested subject"
+                    human_step = (
+                        f"Step {iteration}: Finding emails about {subj} so I can pull in the exact messages you care about."
+                    )
+                elif function_name == "search_gmail":
+                    q = args.get("query") or "your topic"
+                    human_step = (
+                        f"Step {iteration}: Searching Gmail for \"{q}\" to collect relevant threads and messages."
+                    )
+                elif function_name == "get_channel_messages":
+                    channel = args.get("channel") or "the requested channel"
+                    human_step = (
+                        f"Step {iteration}: Reading messages from Slack channel {channel} to understand the discussion and decisions there."
+                    )
+                elif function_name == "summarize_slack_channel":
+                    channel = args.get("channel") or "the requested channel"
+                    human_step = (
+                        f"Step {iteration}: Summarizing recent activity in Slack channel {channel} so I can see the key updates and action items."
+                    )
+                elif function_name == "search_slack":
+                    q = args.get("query") or "your topic"
+                    human_step = (
+                        f"Step {iteration}: Searching Slack for \"{q}\" to find messages that are relevant to your request."
+                    )
+                elif function_name == "search_workspace":
+                    q = args.get("query") or "your topic"
+                    human_step = (
+                        f"Step {iteration}: Searching across Slack, Gmail, and Notion for \"{q}\" to gather all the context I need."
+                    )
+                elif function_name == "list_notion_pages":
+                    human_step = (
+                        f"Step {iteration}: Listing recent Notion pages so I can see which documents might be relevant to your project."
+                    )
+                elif function_name == "search_notion_content":
+                    q = args.get("query") or "your topic"
+                    human_step = (
+                        f"Step {iteration}: Reading Notion pages that mention \"{q}\" to pull in the right documents and notes."
+                    )
+
+                if not human_step:
+                    human_step = (
+                        f"Step {iteration}: Using tool `{function_name}` to gather information that will help answer your question."
+                    )
+
+                status_lines = [human_step]
+                if args_preview:
+                    status_lines.append(f"Internal tool call arguments: {args_preview}")
+                status_lines.append(
+                    "Next, I'll combine what I found here with earlier context to decide whether I need more tools or can synthesize a final answer."
+                )
+
+                yield {
+                    "type": "status",
+                    "content": "\n".join(status_lines),
+                }
+
                 # Execute tool
                 tool_result = await self._execute_tool(function_name, args)
                 
@@ -1248,14 +1635,16 @@ class WorkforceAIBrain:
                 })
                 
                 # Call GPT again - it may decide to call another tool or respond
-                next_response = await self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    tools=self.tools,
-                    tool_choice="auto",
-                    temperature=self.temperature,
-                    stream=True
-                )
+                next_call_kwargs = {
+                    "model": self.model,
+                    "messages": messages,
+                    "tools": self.tools,
+                    "tool_choice": "auto",
+                    "stream": True,
+                }
+                if not self.model.startswith("gpt-5"):
+                    next_call_kwargs["temperature"] = self.temperature
+                next_response = await self.client.chat.completions.create(**next_call_kwargs)
                 
                 # Reset for next iteration
                 function_name = None
@@ -1284,6 +1673,33 @@ class WorkforceAIBrain:
                                     function_name = tool_call.function.name
                                 if tool_call.function.arguments:
                                     function_args += tool_call.function.arguments
+            
+            # Generate reasoning summary if tools were used
+            if iteration > 0:
+                try:
+                    summary_prompt = (
+                        "In 3-5 concise bullet points, briefly summarize your approach to the user's request:\n"
+                        "- What information you gathered (tools you used and why)\n"
+                        "- How you analyzed the results\n"
+                        "- Key insights or decisions you made\n"
+                        "Keep it high-level and user-friendly. Don't repeat the final answer."
+                    )
+                    summary_kwargs = {
+                        "model": self.model,
+                        "messages": messages + [{"role": "user", "content": summary_prompt}],
+                        "max_tokens": 300,
+                    }
+                    if not self.model.startswith("gpt-5"):
+                        summary_kwargs["temperature"] = 0.3
+                    summary_response = await self.client.chat.completions.create(**summary_kwargs)
+                    reasoning_summary = summary_response.choices[0].message.content
+                    if reasoning_summary:
+                        yield {
+                            "type": "status",
+                            "content": f"Reasoning Summary:\n{reasoning_summary}"
+                        }
+                except Exception as summary_error:
+                    logger.warning(f"Failed to generate reasoning summary: {summary_error}")
             
             # Done
             yield {

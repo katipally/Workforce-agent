@@ -18,7 +18,6 @@ export default function ChatInterface() {
     let fullMessage = content
     let uploadedFiles: any[] = []
     
-    // Upload files if present
     if (files && files.length > 0) {
       try {
         const formData = new FormData()
@@ -34,7 +33,6 @@ export default function ChatInterface() {
           const data = await response.json()
           uploadedFiles = data.files
           
-          // Add file info to message
           const fileInfo = uploadedFiles.map(f => 
             `${f.filename} (${(f.file_size / 1024).toFixed(1)}KB)`
           ).join(', ')
@@ -49,18 +47,15 @@ export default function ChatInterface() {
       }
     }
     
-    // Add user message immediately
     useChatStore.getState().addMessage({
       role: 'user',
       content: fullMessage,
     })
     
-    // Hide quick actions when sending message
     if (messages.length === 0) {
       setShowQuickActions(false)
     }
     
-    // Send to backend with file references
     let messageToSend = content
     if (uploadedFiles.length > 0) {
       messageToSend += `\n\nFiles uploaded: ${uploadedFiles.map(f => f.stored_filename).join(', ')}`
@@ -73,26 +68,27 @@ export default function ChatInterface() {
   }
   
   return (
-    <div className="flex h-full bg-gray-50">
-      {/* Chat history sidebar */}
+    <div className="flex h-full bg-background">
+      {/* History sidebar */}
       <aside
-        className={`w-64 border-r bg-gray-900 transition-all ${
+        className={`w-64 border-r border-border bg-gray-900 transition-all ${
           showHistory ? 'block' : 'hidden lg:block'
         }`}
       >
         <ChatHistorySidebar />
       </aside>
       
-      {/* Main content area */}
+      {/* Main chat area */}
       <div className="flex flex-1 flex-col">
         {/* Header */}
-        <header className="border-b bg-white px-6 py-4 shadow-sm">
+        <header className="border-b border-border bg-card px-6 py-4 shadow-sm">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
               <button
                 onClick={() => setShowHistory(!showHistory)}
-                className="rounded-lg p-2 hover:bg-gray-100 lg:hidden"
+                className="rounded-lg p-2 hover:bg-muted lg:hidden"
                 title="Toggle chat history"
+                aria-label="Toggle chat history"
               >
                 <History className="h-5 w-5" />
               </button>
@@ -100,14 +96,14 @@ export default function ChatInterface() {
                 <Bot className="h-6 w-6 text-white" />
               </div>
               <div>
-                <h1 className="text-xl font-semibold text-gray-900 flex items-center gap-2">
+                <h1 className="text-xl font-semibold text-foreground flex items-center gap-2">
                   Workforce AI Agent
-                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium bg-purple-100 text-purple-700">
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium bg-purple-100 text-purple-700 dark:bg-purple-900 dark:text-purple-300">
                     <Sparkles className="h-3 w-3" />
-                    GPT-4o-mini
+                    GPT-5 nano
                   </span>
                 </h1>
-                <p className="text-sm text-gray-500">
+                <p className="text-sm text-muted-foreground">
                   {isConnected ? (
                     <span className="flex items-center gap-1">
                       <span className="h-2 w-2 rounded-full bg-green-500" />
@@ -122,50 +118,45 @@ export default function ChatInterface() {
                 </p>
               </div>
             </div>
-            
           </div>
         </header>
         
-        {/* Chat area */}
+        {/* Chat content */}
         <div className="flex flex-1 flex-col overflow-hidden">
-            <div className="flex-1 overflow-y-auto">
-              {/* Show Quick Actions when no messages */}
-              {messages.length === 0 && showQuickActions && (
-                <div className="flex items-center justify-center h-full p-8">
-                  <div className="max-w-3xl w-full">
-                    <div className="text-center mb-8">
-                      <div className="inline-flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-blue-500 to-purple-600 mb-4">
-                        <Bot className="h-10 w-10 text-white" />
-                      </div>
-                      <h2 className="text-2xl font-bold text-gray-900 mb-2">
-                        Hi! I'm your Workforce AI Agent
-                      </h2>
-                      <p className="text-gray-600">
-                        I can help you with Slack, Gmail, and Notion. Try a quick action or ask me anything!
-                      </p>
-                    </div>
-                    <QuickActions onActionClick={handleQuickAction} />
+          {messages.length === 0 && showQuickActions && !streamingMessage ? (
+            <div className="flex items-center justify-center h-full p-8">
+              <div className="max-w-3xl w-full">
+                <div className="text-center mb-8">
+                  <div className="inline-flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-blue-500 to-purple-600 mb-4">
+                    <Bot className="h-10 w-10 text-white" />
                   </div>
+                  <h2 className="text-2xl font-bold text-foreground mb-2">
+                    Hi! I'm your Workforce AI Agent
+                  </h2>
+                  <p className="text-muted-foreground">
+                    I can help you with Slack, Gmail, and Notion. Try a quick action or ask me anything!
+                  </p>
                 </div>
-              )}
-              
-              {/* Regular message list */}
-              {messages.length > 0 && (
-                <MessageList
-                  messages={messages}
-                  streamingMessage={streamingMessage}
-                  isStreaming={isStreaming}
-                />
-              )}
+                <QuickActions onActionClick={handleQuickAction} />
+              </div>
             </div>
-            
-            
-            <div className="border-t bg-white p-4">
-              <MessageInput
-                onSendMessage={handleSendMessage}
-                disabled={isStreaming || !isConnected}
-              />
-            </div>
+          ) : (
+            <MessageList
+              messages={messages}
+              streamingMessage={streamingMessage}
+              isStreaming={isStreaming}
+            />
+          )}
+        </div>
+        
+        {/* Input area */}
+        <div className="border-t border-border bg-card p-4">
+          <div className="mx-auto w-full max-w-3xl">
+            <MessageInput
+              onSendMessage={handleSendMessage}
+              disabled={isStreaming || !isConnected}
+            />
+          </div>
         </div>
       </div>
     </div>

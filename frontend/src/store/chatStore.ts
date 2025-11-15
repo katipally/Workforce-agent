@@ -6,6 +6,7 @@ export interface Message {
   role: 'user' | 'assistant'
   content: string
   sources?: Source[]
+  reasoningSteps?: string[]
   timestamp: Date
 }
 
@@ -45,6 +46,7 @@ interface ChatState {
   streamingMessage: string
   sources: Source[]
   isStreaming: boolean
+  currentReasoningSteps: string[]
   
   // Sessions list
   sessions: ChatSession[]
@@ -61,6 +63,8 @@ interface ChatState {
   setSources: (sources: Source[]) => void
   setIsStreaming: (isStreaming: boolean) => void
   finishStreaming: () => void
+  addReasoningStep: (step: string) => void
+  clearReasoningSteps: () => void
   clearMessages: () => void
   setSessions: (sessions: ChatSession[]) => void
   createNewSession: () => void
@@ -82,6 +86,7 @@ export const useChatStore = create<ChatState>()(
       streamingMessage: '',
       sources: [],
       isStreaming: false,
+      currentReasoningSteps: [],
       sessions: [],
       
       setCurrentSessionId: (sessionId: string) => {
@@ -92,18 +97,26 @@ export const useChatStore = create<ChatState>()(
       
       loadSessionMessages: async (sessionId: string) => {
         try {
-          const response = await fetch(`http://localhost:8000/api/chat/sessions/${sessionId}/messages`)
+          const response = await fetch(`http://localhost:8000/api/chat/sessions/${sessionId}`)
           if (response.ok) {
             const data = await response.json()
-            // CRITICAL: Convert timestamp strings to Date objects
-            const messages = (data.messages || []).map((msg: any) => ({
-              ...msg,
-              timestamp: msg.timestamp ? new Date(msg.timestamp) : new Date()
+
+            const messages: Message[] = (data.messages || []).map((msg: any, index: number) => ({
+              id: `${data.session_id || sessionId}_${index}`,
+              role: msg.role,
+              content: msg.content,
+              sources: msg.sources || [],
+              reasoningSteps: [],
+              timestamp: msg.created_at ? new Date(msg.created_at) : new Date(),
             }))
+
             set((state) => ({
               sessionMessages: { ...state.sessionMessages, [sessionId]: messages },
-              messages: state.currentSessionId === sessionId ? messages : state.messages
+              // When we explicitly load a session, we always want to show its messages
+              messages,
             }))
+          } else {
+            console.error('Failed to load session from backend:', response.status, response.statusText)
           }
         } catch (error) {
           console.error('Failed to load session messages:', error)
@@ -145,13 +158,14 @@ export const useChatStore = create<ChatState>()(
       },
       
       finishStreaming: () => {
-        const { streamingMessage, sources, currentSessionId, sessionMessages } = get()
+        const { streamingMessage, sources, currentSessionId, sessionMessages, currentReasoningSteps } = get()
         if (streamingMessage) {
           const newMessage: Message = {
             id: Date.now().toString(),
             role: 'assistant',
             content: streamingMessage,
             sources,
+            reasoningSteps: currentReasoningSteps,
             timestamp: new Date(),
           }
           const currentMessages = sessionMessages[currentSessionId] || []
@@ -162,12 +176,23 @@ export const useChatStore = create<ChatState>()(
             sessionMessages: { ...sessionMessages, [currentSessionId]: updatedMessages },
             streamingMessage: '',
             isStreaming: false,
+            currentReasoningSteps: [],
           })
         }
       },
+
+      addReasoningStep: (step) => {
+        set((state) => ({
+          currentReasoningSteps: [...state.currentReasoningSteps, step],
+        }))
+      },
+
+      clearReasoningSteps: () => {
+        set({ currentReasoningSteps: [] })
+      },
       
       clearMessages: () => {
-        set({ messages: [], streamingMessage: '', sources: [], isStreaming: false })
+        set({ messages: [], streamingMessage: '', sources: [], isStreaming: false, currentReasoningSteps: [] })
       },
       
       setSessions: (sessions: ChatSession[]) => {
@@ -176,13 +201,30 @@ export const useChatStore = create<ChatState>()(
       
       createNewSession: () => {
         const newSessionId = generateSessionId()
-        set({ 
+        const nowIso = new Date().toISOString()
+        set((state) => ({ 
           currentSessionId: newSessionId, 
           messages: [],
           streamingMessage: '',
           sources: [],
-          isStreaming: false
-        })
+          isStreaming: false,
+          currentReasoningSteps: [],
+          // Show the new conversation immediately in the sidebar
+          sessions: [
+            {
+              session_id: newSessionId,
+              title: 'New Chat',
+              created_at: nowIso,
+              updated_at: nowIso,
+            },
+            ...state.sessions,
+          ],
+          // Initialize empty messages bucket for this session
+          sessionMessages: {
+            ...state.sessionMessages,
+            [newSessionId]: [],
+          },
+        }))
       },
       
       deleteSession: (sessionId: string) => {

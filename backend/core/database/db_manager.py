@@ -467,14 +467,22 @@ class DatabaseManager:
             List of message dicts with 'role' and 'content' keys
         """
         with self.get_session() as session:
-            messages = session.query(ChatMessage).filter_by(
-                session_id=session_id
-            ).order_by(
-                ChatMessage.created_at.asc()
-            ).limit(limit).all()
-            
+            messages = (
+                session.query(ChatMessage)
+                .filter_by(session_id=session_id)
+                .order_by(ChatMessage.created_at.asc())
+                .limit(limit)
+                .all()
+            )
+
+            # Return rich message objects so the frontend can render full history
             return [
-                {"role": msg.role, "content": msg.content}
+                {
+                    "role": msg.role,
+                    "content": msg.content,
+                    "sources": msg.sources,
+                    "created_at": msg.created_at.isoformat() if msg.created_at else None,
+                }
                 for msg in messages
             ]
     
