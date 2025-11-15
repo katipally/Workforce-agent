@@ -9,6 +9,11 @@ from pydantic import BaseModel, Field
 import sys
 import os
 import base64
+import json
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
 from pathlib import Path
 
 # Add core directory to path
@@ -595,17 +600,116 @@ class WorkforceTools:
             List of Notion pages
         """
         try:
-            notion_client = NotionClient()
-            if not notion_client.test_connection():
-                return "✗ Notion connection failed"
-            
-            # Note: This requires database query capability
-            # For now, return status
-            return "✓ Notion connected. Note: Listing pages requires database integration (coming soon)"
-        
+            import requests
+
+            if not Config.NOTION_TOKEN:
+                return "❌ NOTION_TOKEN is not configured. Please set it in your environment."
+
+            # Use Notion search API to list pages, ordered by last edited time
+            headers = {
+                "Authorization": f"Bearer {Config.NOTION_TOKEN}",
+                "Notion-Version": "2022-06-28",
+                "Content-Type": "application/json",
+            }
+
+            payload = {
+                "page_size": min(max(limit, 1), 100),
+                "filter": {"property": "object", "value": "page"},
+                "sort": {"direction": "descending", "timestamp": "last_edited_time"},
+            }
+
+            response = requests.post(
+                "https://api.notion.com/v1/search",
+                headers=headers,
+                json=payload,
+            )
+
+            if response.status_code != 200:
+                logger.error(f"Notion list pages error {response.status_code}: {response.text}")
+                return f"❌ Notion API error {response.status_code}: {response.text[:200]}"
+
+            data = response.json()
+            results = data.get("results", [])
+
+            if not results:
+                return "No Notion pages found. Make sure your integration has access to the workspace/pages."
+
+            lines = []
+            for page in results[:limit]:
+                title = "Untitled"
+                properties = page.get("properties", {})
+                title_prop = properties.get("title", {}) or properties.get("Name", {})
+                title_array = title_prop.get("title") or []
+                if title_array:
+                    title = title_array[0].get("plain_text") or title
+
+                last_edited = page.get("last_edited_time", "")
+                lines.append(f"📄 {title} (ID: {page['id']}) - Last edited: {last_edited}")
+
+            return "🔍 Recent Notion pages:\n" + "\n".join(lines)
+
         except Exception as e:
-            logger.error(f"Error listing Notion pages: {e}")
-            return f"Error: {str(e)}"
+            logger.error(f"Error listing Notion pages: {e}", exc_info=True)
+            return f"Error listing Notion pages: {str(e)}"
+    
+    def list_notion_databases(self, limit: int = 20) -> str:
+        """List recent Notion databases in the workspace.
+        
+        Args:
+            limit: Maximum databases to list
+            
+        Returns:
+            List of Notion databases with IDs
+        """
+        try:
+            import requests
+
+            if not Config.NOTION_TOKEN:
+                return "❌ NOTION_TOKEN is not configured. Please set it in your environment."
+
+            headers = {
+                "Authorization": f"Bearer {Config.NOTION_TOKEN}",
+                "Notion-Version": "2022-06-28",
+                "Content-Type": "application/json",
+            }
+
+            payload = {
+                "page_size": min(max(limit, 1), 100),
+                "filter": {"property": "object", "value": "database"},
+                "sort": {"direction": "descending", "timestamp": "last_edited_time"},
+            }
+
+            response = requests.post(
+                "https://api.notion.com/v1/search",
+                headers=headers,
+                json=payload,
+            )
+
+            if response.status_code != 200:
+                logger.error(f"Notion list databases error {response.status_code}: {response.text}")
+                return f"❌ Notion API error {response.status_code}: {response.text[:200]}"
+
+            data = response.json()
+            results = data.get("results", [])
+
+            if not results:
+                return "No Notion databases found. Make sure your integration has access to the workspace/databases."
+
+            lines = []
+            for db in results[:limit]:
+                title = "Untitled Database"
+                title_prop = db.get("title") or []
+                if title_prop:
+                    title = title_prop[0].get("plain_text") or title
+
+                last_edited = db.get("last_edited_time", "")
+                lines.append(f"📚 {title} (ID: {db['id']}) - Last edited: {last_edited}")
+
+            return "🔍 Recent Notion databases:\n" + "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"Error listing Notion databases: {e}", exc_info=True)
+            return f"Error listing Notion databases: {str(e)}"
     
     def search_notion_content(self, query: str) -> str:
         """Search Notion pages by content.
@@ -617,12 +721,12 @@ class WorkforceTools:
             Matching Notion pages
         """
         try:
-            # Note: Notion Search API requires specific setup
-            return f"Notion search for '{query}' - Feature requires Notion Search API setup"
-        
+            # Delegate to workspace search helper which already uses Notion Search API
+            return self.search_notion_workspace(query)
+
         except Exception as e:
-            logger.error(f"Error searching Notion: {e}")
-            return f"Error: {str(e)}"
+            logger.error(f"Error searching Notion: {e}", exc_info=True)
+            return f"Error searching Notion: {str(e)}"
     
     def create_notion_page(self, title: str, content: str) -> str:
         """Create a Notion page.
@@ -871,6 +975,181 @@ class WorkforceTools:
             logger.error(f"Error getting thread: {e}")
             return f"Error: {str(e)}"
     
+    def list_gmail_attachments_for_message(self, message_id: str) -> str:
+        """List attachments for a specific Gmail message - CALLS GMAIL API DIRECTLY.
+        
+        Args:
+            message_id: Gmail message ID
+            
+        Returns:
+            Human-readable list of attachments with attachment IDs
+        """
+        try:
+            if not self.gmail_client or not self.gmail_client.authenticate():
+                return "❌ Gmail not authenticated"
+            
+            msg = self.gmail_client.service.users().messages().get(
+                userId='me',
+                id=message_id,
+                format='full'
+            ).execute()
+            
+            payload = msg.get('payload', {}) or {}
+            attachments: List[Dict[str, Any]] = []
+            
+            def extract_parts(part: Dict[str, Any]):
+                filename = part.get('filename')
+                body = part.get('body', {}) or {}
+                
+                if filename and body.get('attachmentId'):
+                    attachments.append({
+                        'filename': filename,
+                        'attachment_id': body.get('attachmentId'),
+                        'mime_type': part.get('mimeType', ''),
+                        'size': body.get('size', 0)
+                    })
+                
+                for sub in part.get('parts', []) or []:
+                    extract_parts(sub)
+            
+            extract_parts(payload)
+            
+            if not attachments:
+                return f"No attachments found for message {message_id}"
+            
+            lines = [f"📎 Attachments for message {message_id}:"]
+            for idx, att in enumerate(attachments, 1):
+                lines.append(
+                    f"{idx}. {att['filename']} "
+                    f"(MIME: {att['mime_type']}, Size: {att['size']} bytes, "
+                    f"attachment_id: {att['attachment_id']})"
+                )
+            
+            return "\n".join(lines)
+        
+        except Exception as e:
+            logger.error(f"Error listing attachments: {e}", exc_info=True)
+            return f"❌ Error listing attachments: {str(e)}"
+    
+    def download_gmail_attachment(
+        self,
+        message_id: str,
+        attachment_id: str,
+        filename: str
+    ) -> str:
+        """Download a specific Gmail attachment and save it to local files directory.
+        
+        Args:
+            message_id: Gmail message ID
+            attachment_id: Attachment ID from Gmail
+            filename: Desired filename for local storage
+            
+        Returns:
+            Success/error message with local path
+        """
+        try:
+            if not self.gmail_client or not self.gmail_client.authenticate():
+                return "❌ Gmail not authenticated"
+            
+            data = self.gmail_client.get_attachment(message_id, attachment_id)
+            if not data:
+                return "❌ Failed to download attachment (no data returned)"
+            
+            # Determine target directory
+            base_dir = Config.FILES_DIR / "gmail_attachments"
+            base_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Use only the basename to avoid directory traversal
+            safe_name = os.path.basename(filename) or f"attachment_{attachment_id}"
+            file_path = base_dir / safe_name
+            
+            # Handle duplicate filenames
+            if file_path.exists():
+                stem = file_path.stem
+                suffix = file_path.suffix
+                file_path = base_dir / f"{stem}_{attachment_id[:8]}{suffix}"
+            
+            with open(file_path, "wb") as f:
+                f.write(data)
+            
+            return f"✅ Attachment saved to {file_path}"
+        
+        except Exception as e:
+            logger.error(f"Error downloading attachment: {e}", exc_info=True)
+            return f"❌ Error downloading attachment: {str(e)}"
+    
+    def send_gmail_with_attachments(
+        self,
+        to: str,
+        subject: str,
+        body: str,
+        file_paths: str
+    ) -> str:
+        """Send an email with one or more file attachments via Gmail.
+        
+        Args:
+            to: Recipient email address
+            subject: Email subject
+            body: Plain-text email body
+            file_paths: Comma-separated list of file paths to attach
+            
+        Returns:
+            Success/error message
+        """
+        try:
+            gmail_client = self.gmail_client or GmailClient()
+            if not gmail_client.authenticate():
+                return "✗ Gmail authentication failed"
+            
+            msg = MIMEMultipart()
+            msg["to"] = to
+            msg["subject"] = subject
+            
+            # Body
+            msg.attach(MIMEText(body, "plain"))
+            
+            # Attach files
+            attached_files: List[str] = []
+            paths = [p.strip() for p in (file_paths or "").split(",") if p.strip()]
+            for path in paths:
+                try:
+                    file_path = Path(path)
+                    if not file_path.is_absolute():
+                        file_path = Config.PROJECT_ROOT / file_path
+                    
+                    if not file_path.exists():
+                        logger.warning(f"Attachment file not found: {file_path}")
+                        continue
+                    
+                    with open(file_path, "rb") as f:
+                        part = MIMEBase("application", "octet-stream")
+                        part.set_payload(f.read())
+                    encoders.encode_base64(part)
+                    part.add_header(
+                        "Content-Disposition",
+                        f'attachment; filename="{file_path.name}"',
+                    )
+                    msg.attach(part)
+                    attached_files.append(str(file_path))
+                except Exception as att_err:
+                    logger.error(f"Error attaching file {path}: {att_err}")
+                    continue
+            
+            raw_message = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+            result = gmail_client.send_message({"raw": raw_message})
+            
+            if result:
+                return (
+                    f"✓ Email with {len(attached_files)} attachment(s) sent to {to}. "
+                    f"Attached files: {', '.join(attached_files)}"
+                )
+            else:
+                return f"✗ Failed to send email with attachments to {to}"
+        
+        except Exception as e:
+            logger.error(f"Error sending email with attachments: {e}", exc_info=True)
+            return f"Error: {str(e)}"
+    
     # ========================================
     # ADVANCED NOTION TOOLS
     # ========================================
@@ -941,6 +1220,145 @@ class WorkforceTools:
         except Exception as e:
             logger.error(f"Error updating page: {e}")
             return f"Error: {str(e)}"
+    
+    def query_notion_database(
+        self,
+        database_id: str,
+        filter_json: Optional[str] = None,
+        page_size: int = 10
+    ) -> str:
+        """Query a Notion database and list matching rows.
+        
+        Args:
+            database_id: ID of the Notion database to query
+            filter_json: Optional Notion filter object as JSON string
+            page_size: Maximum number of rows to return
+        """
+        try:
+            import requests
+            
+            if not Config.NOTION_TOKEN:
+                return "❌ NOTION_TOKEN is not configured. Please set it in your environment."
+            
+            headers = {
+                "Authorization": f"Bearer {Config.NOTION_TOKEN}",
+                "Notion-Version": "2022-06-28",
+                "Content-Type": "application/json",
+            }
+            
+            payload: Dict[str, Any] = {
+                "page_size": min(max(page_size, 1), 100),
+            }
+            
+            if filter_json:
+                try:
+                    payload["filter"] = json.loads(filter_json)
+                except json.JSONDecodeError:
+                    return "❌ Invalid filter_json. It must be valid JSON representing a Notion filter object."
+            
+            response = requests.post(
+                f"https://api.notion.com/v1/databases/{database_id}/query",
+                headers=headers,
+                json=payload,
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"Notion database query error {response.status_code}: {response.text}")
+                return f"❌ Notion API error {response.status_code}: {response.text[:200]}"
+            
+            data = response.json()
+            results = data.get("results", [])
+            
+            if not results:
+                return "No rows found for this database query."
+            
+            lines = [
+                f"🔍 Rows in database {database_id} (showing up to {min(len(results), page_size)}):"
+            ]
+            
+            for page in results[:page_size]:
+                props = page.get("properties", {}) or {}
+                title = "Untitled"
+                title_prop = props.get("Name") or props.get("title") or {}
+                title_array = title_prop.get("title") or []
+                if title_array:
+                    title = title_array[0].get("plain_text", title)
+                
+                summary_parts = []
+                for name, prop in list(props.items())[:5]:
+                    prop_type = prop.get("type")
+                    value_str = ""
+                    if prop_type == "title":
+                        texts = prop.get("title") or []
+                        if texts:
+                            value_str = texts[0].get("plain_text", "")
+                    elif prop_type == "rich_text":
+                        texts = prop.get("rich_text") or []
+                        if texts:
+                            value_str = texts[0].get("plain_text", "")
+                    elif prop_type == "select":
+                        sel = prop.get("select") or {}
+                        value_str = sel.get("name", "")
+                    elif prop_type == "status":
+                        st = prop.get("status") or {}
+                        value_str = st.get("name", "")
+                    elif prop_type == "checkbox":
+                        value_str = str(prop.get("checkbox"))
+                    elif prop_type == "number":
+                        value_str = str(prop.get("number"))
+                    
+                    if value_str:
+                        summary_parts.append(f"{name}: {value_str}")
+                
+                summary = "; ".join(summary_parts)
+                if summary:
+                    lines.append(f"• {title} (Page ID: {page['id']}) — {summary}")
+                else:
+                    lines.append(f"• {title} (Page ID: {page['id']})")
+            
+            return "\n".join(lines)
+        except Exception as e:
+            logger.error(f"Error querying Notion database: {e}", exc_info=True)
+            return f"❌ Error querying Notion database: {str(e)}"
+    
+    def update_notion_database_item(self, page_id: str, properties_json: str) -> str:
+        """Update properties of an existing Notion database item (page).
+        
+        Args:
+            page_id: Notion page ID
+            properties_json: JSON string representing Notion properties object
+        """
+        try:
+            import requests
+            
+            if not Config.NOTION_TOKEN:
+                return "❌ NOTION_TOKEN is not configured. Please set it in your environment."
+            
+            try:
+                properties = json.loads(properties_json)
+            except json.JSONDecodeError:
+                return "❌ Invalid properties_json. It must be valid JSON representing Notion properties."
+            
+            response = requests.patch(
+                f"https://api.notion.com/v1/pages/{page_id}",
+                headers={
+                    "Authorization": f"Bearer {Config.NOTION_TOKEN}",
+                    "Notion-Version": "2022-06-28",
+                    "Content-Type": "application/json",
+                },
+                json={"properties": properties},
+            )
+            
+            if response.status_code == 200:
+                return f"✅ Notion database item {page_id} updated successfully"
+            else:
+                logger.error(
+                    f"Notion database item update error {response.status_code}: {response.text}"
+                )
+                return f"❌ Notion API error {response.status_code}: {response.text[:200]}"
+        except Exception as e:
+            logger.error(f"Error updating Notion database item: {e}", exc_info=True)
+            return f"❌ Error updating Notion database item: {str(e)}"
     
     # ========================================
     # CRITICAL NEW TOOLS - Nov 2025 Features
@@ -1200,6 +1618,78 @@ Subject: {subject}
         except Exception as e:
             logger.error(f"Error searching threads: {e}")
             return f"❌ Error: {str(e)}"
+    
+    def get_recent_email_thread_between_people(
+        self,
+        person_a: str,
+        person_b: str,
+        days_back: int = 60
+    ) -> str:
+        """Get the most recent email thread between two people and return full content.
+        
+        This is a high-level helper for natural queries like
+        "get our recent email thread between Yash and Ivan".
+        
+        Args:
+            person_a: Name or email of first person
+            person_b: Name or email of second person
+            days_back: How many days back to search (default: 60)
+            
+        Returns:
+            Full formatted email thread, or explanation if nothing found
+        """
+        try:
+            from datetime import datetime, timedelta
+
+            if not self.gmail_client or not self.gmail_client.authenticate():
+                return "❌ Gmail not authenticated"
+
+            # Build date filter
+            date_filter = (datetime.now() - timedelta(days=days_back)).strftime("%Y/%m/%d")
+
+            def norm_identifier(person: str) -> str:
+                person = (person or "").strip()
+                if "@" in person:
+                    # Likely an email address
+                    return person
+                # For names, wrap in quotes so Gmail searches the phrase
+                return f'"{person}"'
+
+            a = norm_identifier(person_a)
+            b = norm_identifier(person_b)
+
+            # Query that captures both directions of conversation
+            # and general mentions of both participants.
+            query = (
+                f"((from:{a} to:{b}) OR (from:{b} to:{a}) OR ({a} {b})) "
+                f"after:{date_filter}"
+            )
+
+            # Search for threads matching this pattern (most recent first)
+            service = self.gmail_client.service
+            result = service.users().threads().list(
+                userId="me",
+                q=query,
+                maxResults=5
+            ).execute()
+
+            threads = result.get("threads", [])
+            if not threads:
+                return (
+                    "No recent email threads found between these people.\n"
+                    f"Searched with query: {query}\n"
+                    "Try providing exact email addresses if possible."
+                )
+
+            # Use the most recent thread
+            thread_id = threads[0]["id"]
+
+            # Delegate to full-thread helper to get complete content
+            return self.get_complete_email_thread(thread_id)
+
+        except Exception as e:
+            logger.error(f"Error getting recent thread between people: {e}")
+            return f"❌ Error getting recent thread: {str(e)}"
     
     def advanced_gmail_search(self, query: str, limit: int = 20) -> str:
         """Advanced Gmail search with ALL operators supported.

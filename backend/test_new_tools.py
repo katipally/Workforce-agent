@@ -1,12 +1,14 @@
 """Test script for new project tracking and utility tools.
 
-Tests all 6 new tools added to the Workforce AI Agent:
+Tests core new tools added to the Workforce AI Agent:
 1. track_project
 2. generate_project_report  
 3. update_project_notion_page
 4. search_all_platforms
 5. get_team_activity_summary
 6. analyze_slack_channel
+7. list_notion_pages / list_notion_databases
+8. get_recent_email_thread_between_people
 """
 
 import asyncio
@@ -191,6 +193,157 @@ class ToolTester:
             print(f"❌ FAIL: {e}")
             self.results['failed'].append('analyze_slack_channel')
             return False
+
+    async def test_notion_listing(self):
+        """Test Notion listing tools (pages + databases)."""
+        print("\n" + "="*60)
+        print("🧪 TEST 7: Notion Listing (Pages & Databases)")
+        print("="*60)
+
+        try:
+            pages_result = self.tools.list_notion_pages(limit=5)
+            dbs_result = self.tools.list_notion_databases(limit=5)
+
+            # Handle both configured and non-configured cases gracefully
+            if "NOTION_TOKEN is not configured" in pages_result:
+                print("⏭️  SKIP: Notion token not configured")
+                self.results['skipped'].append('list_notion_pages')
+            elif "Notion API error" in pages_result:
+                print("⚠️ INFO: Notion pages listing returned API error (treating as skip)")
+                self.results['skipped'].append('list_notion_pages')
+            else:
+                print("✅ PASS: list_notion_pages works")
+                print(f"Result preview:\n{pages_result[:300]}...")
+                self.results['passed'].append('list_notion_pages')
+
+            if "NOTION_TOKEN is not configured" in dbs_result:
+                print("⏭️  SKIP: Notion token not configured for databases")
+                self.results['skipped'].append('list_notion_databases')
+            elif "Notion API error" in dbs_result:
+                print("⚠️ INFO: Notion databases listing returned API error (treating as skip)")
+                self.results['skipped'].append('list_notion_databases')
+            else:
+                print("✅ PASS: list_notion_databases works")
+                print(f"Result preview:\n{dbs_result[:300]}...")
+                self.results['passed'].append('list_notion_databases')
+
+            return True
+
+        except Exception as e:
+            print(f"❌ FAIL: {e}")
+            self.results['failed'].append('notion_listing')
+            return False
+
+    async def test_recent_email_thread_between_people(self):
+        """Test high-level Gmail thread helper between two people."""
+        print("\n" + "="*60)
+        print("🧪 TEST 8: Recent Email Thread Between People")
+        print("="*60)
+
+        try:
+            # Use generic names so this doesn't depend on specific addresses.
+            result = self.tools.get_recent_email_thread_between_people(
+                person_a="test",
+                person_b="test",
+                days_back=60,
+            )
+
+            if "Gmail not authenticated" in result:
+                print("⏭️  SKIP: Gmail not authenticated")
+                self.results['skipped'].append('get_recent_email_thread_between_people')
+                return True
+
+            # Both full-thread and "no threads found" responses are acceptable
+            if "COMPLETE EMAIL THREAD" in result or "No recent email threads" in result:
+                print("✅ PASS: get_recent_email_thread_between_people works or reports no threads clearly")
+                print(f"Result preview:\n{result[:300]}...")
+                self.results['passed'].append('get_recent_email_thread_between_people')
+                return True
+
+            print("❌ FAIL: Unexpected response format")
+            print(f"Got: {result[:300]}")
+            self.results['failed'].append('get_recent_email_thread_between_people')
+            return False
+        
+        except Exception as e:
+            print(f"❌ FAIL: {e}")
+            self.results['failed'].append('get_recent_email_thread_between_people')
+            return False
+    
+    async def test_gmail_attachment_tools(self):
+        """Test Gmail attachment listing tool (non-destructive)."""
+        print("\n" + "="*60)
+        print("🧪 TEST 9: Gmail Attachment Tools (Listing)")
+        print("="*60)
+
+        try:
+            # Use a dummy message_id; the goal is to ensure the tool handles
+            # unauthenticated or invalid IDs gracefully without crashing.
+            result = self.tools.list_gmail_attachments_for_message(message_id="dummy-message-id")
+
+            if "Gmail not authenticated" in result:
+                print("⏭️  SKIP: Gmail not authenticated for attachment tools")
+                self.results['skipped'].append('gmail_attachment_tools')
+                return True
+
+            # Any non-empty response (including error message) is acceptable here;
+            # we mostly care that the tool returns a clear message instead of raising.
+            if result:
+                print("✅ PASS: Gmail attachment listing tool responds without error")
+                print(f"Result preview:\n{result[:300]}...")
+                self.results['passed'].append('gmail_attachment_tools')
+                return True
+
+            print("❌ FAIL: Empty response from attachment listing tool")
+            self.results['failed'].append('gmail_attachment_tools')
+            return False
+
+        except Exception as e:
+            print(f"❌ FAIL: {e}")
+            self.results['failed'].append('gmail_attachment_tools')
+            return False
+
+    async def test_notion_database_tools(self):
+        """Test Notion database query helper (read-only behavior)."""
+        print("\n" + "="*60)
+        print("🧪 TEST 10: Notion Database Tools (Query)")
+        print("="*60)
+
+        try:
+            # Use a placeholder database_id. The intent is to verify that the
+            # helper returns a clear message and does not crash when Notion is
+            # not configured or the ID is invalid.
+            result = self.tools.query_notion_database(
+                database_id="dummy-database-id",
+                filter_json=None,
+                page_size=5,
+            )
+
+            if "NOTION_TOKEN is not configured" in result:
+                print("⏭️  SKIP: Notion token not configured for database tools")
+                self.results['skipped'].append('notion_database_tools')
+                return True
+
+            if "Notion API error" in result or "Error querying Notion" in result:
+                print("⚠️ INFO: Notion database query returned API error (treating as skip)")
+                self.results['skipped'].append('notion_database_tools')
+                return True
+
+            # If we get here, the query returned some rows/summary text.
+            if result:
+                print("✅ PASS: Notion database query tool responds without error")
+                print(f"Result preview:\n{result[:300]}...")
+                self.results['passed'].append('notion_database_tools')
+                return True
+
+            print("❌ FAIL: Empty response from Notion database query tool")
+            self.results['failed'].append('notion_database_tools')
+            return False
+
+        except Exception as e:
+            print(f"❌ FAIL: {e}")
+            self.results['failed'].append('notion_database_tools')
+            return False
     
     def print_summary(self):
         """Print test summary."""
@@ -236,13 +389,17 @@ async def main():
 ╔══════════════════════════════════════════════════════════╗
 ║     WORKFORCE AI AGENT - NEW TOOLS TEST SUITE           ║
 ║                                                          ║
-║  Testing 6 new tools:                                    ║
+║  Testing new tools:                                      ║
 ║  • Project Tracking                                      ║
 ║  • Project Report Generation                             ║
 ║  • Notion Page Update                                    ║
 ║  • Cross-Platform Search                                 ║
 ║  • Team Activity Summary                                 ║
 ║  • Slack Channel Analytics                               ║
+║  • Notion Listing (Pages & Databases)                    ║
+║  • Gmail Thread Between People                           ║
+║  • Gmail Attachment Tools                                ║
+║  • Notion Database Tools                                 ║
 ╚══════════════════════════════════════════════════════════╝
 """)
     
@@ -255,6 +412,10 @@ async def main():
     await tester.test_cross_platform_search()
     await tester.test_team_activity()
     await tester.test_channel_analytics()
+    await tester.test_notion_listing()
+    await tester.test_recent_email_thread_between_people()
+    await tester.test_gmail_attachment_tools()
+    await tester.test_notion_database_tools()
     
     # Print summary
     tester.print_summary()

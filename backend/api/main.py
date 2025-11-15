@@ -3,6 +3,8 @@
 Main application with WebSocket streaming support.
 """
 
+import asyncio
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -44,6 +46,8 @@ from agent.ai_brain import WorkforceAIBrain
 # Global variables
 rag_engine = None
 ai_brain = None
+rag_lock: asyncio.Lock | None = None
+ai_brain_lock: asyncio.Lock | None = None
 
 # Import appropriate embedding engine based on model name
 def _get_embedding_classes():
@@ -66,56 +70,78 @@ def _get_embedding_classes():
 QwenEmbedding, QwenReranker = _get_embedding_classes()
 
 
-def get_rag_engine() -> HybridRAGEngine:
-    """Lazy load and return the RAG engine."""
-    global rag_engine
-    
-    if rag_engine is None:
+async def get_rag_engine() -> HybridRAGEngine:
+    """Lazy load and return the RAG engine with concurrency guard."""
+    global rag_engine, rag_lock
+
+    if rag_engine:
+        return rag_engine
+
+    if rag_lock is None:
+        rag_lock = asyncio.Lock()
+
+    async with rag_lock:
+        if rag_engine:
+            return rag_engine
+
+        loop = asyncio.get_running_loop()
         logger.info("Initializing RAG engine...")
-        
-        embedding = QwenEmbedding(
-            model_name=Config.EMBEDDING_MODEL,
-            use_gpu=Config.USE_GPU
+
+        embedding, reranker = await loop.run_in_executor(
+            None,
+            lambda: (
+                QwenEmbedding(
+                    model_name=Config.EMBEDDING_MODEL,
+                    use_gpu=Config.USE_GPU
+                ),
+                QwenReranker(
+                    model_name=Config.RERANKER_MODEL,
+                    use_gpu=Config.USE_GPU
+                ),
+            ),
         )
-        
-        reranker = QwenReranker(
-            model_name=Config.RERANKER_MODEL,
-            use_gpu=Config.USE_GPU
-        )
-        
+
         rag_engine = HybridRAGEngine(
             openai_api_key=Config.OPENAI_API_KEY,
             qwen_embedding=embedding,
             qwen_reranker=reranker
         )
-        
+
         logger.info("✓ RAG engine initialized")
-    
-    return rag_engine
+        return rag_engine
 
 
-def get_ai_brain() -> WorkforceAIBrain:
+async def get_ai_brain() -> WorkforceAIBrain:
     """Lazy load and return the AI brain (self-aware agent with tools)."""
-    global ai_brain
-    
-    if ai_brain is None:
-        logger.info("Initializing AI Brain (GPT-4)...")
-        
-        # Ensure RAG engine is initialized first
-        rag = get_rag_engine()
-        
-        # Initialize AI brain with GPT-4o-mini (Nov 2025)
-        # 80% cheaper than GPT-4, maintains full capabilities
-        ai_brain = WorkforceAIBrain(
-            openai_api_key=Config.OPENAI_API_KEY,
-            rag_engine=rag,
-            model=Config.LLM_MODEL,  # Defaults to gpt-4o-mini, configurable via .env
-            temperature=0.7
+    global ai_brain, ai_brain_lock
+
+    if ai_brain:
+        return ai_brain
+
+    if ai_brain_lock is None:
+        ai_brain_lock = asyncio.Lock()
+
+    async with ai_brain_lock:
+        if ai_brain:
+            return ai_brain
+
+        logger.info("Initializing AI Brain (gpt-5-nano)...")
+        rag = await get_rag_engine()
+
+        loop = asyncio.get_running_loop()
+        ai_brain_instance = await loop.run_in_executor(
+            None,
+            lambda: WorkforceAIBrain(
+                openai_api_key=Config.OPENAI_API_KEY,
+                rag_engine=rag,
+                model=Config.LLM_MODEL,
+                temperature=0.7,
+            ),
         )
-        
+
+        ai_brain = ai_brain_instance
         logger.info("✓ AI Brain initialized with tool calling")
-    
-    return ai_brain
+        return ai_brain
 
 
 # Initialize FastAPI app
@@ -190,7 +216,7 @@ async def chat_message(request: ChatRequest):
         Chat response with answer and sources
     """
     try:
-        engine = get_rag_engine()
+        engine = await get_rag_engine()
         result = await engine.query(
             request.query,
             conversation_history=request.conversation_history
@@ -207,6 +233,28 @@ async def chat_message(request: ChatRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _truncate_history(history: List[Dict[str, str]], max_messages: int = 40, max_chars: int = 8000) -> List[Dict[str, str]]:
+    """Trim conversation history to keep context bounded."""
+    if not history:
+        return []
+
+    trimmed = history[-max_messages:]
+    total_chars = 0
+    result = []
+    for message in reversed(trimmed):
+        content = message.get("content", "")
+        total_chars += len(content)
+        result.append(message)
+        if total_chars >= max_chars:
+            break
+    return list(reversed(result))
+
+
+async def _run_in_executor(func, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+
+
 @app.websocket("/api/chat/ws")
 async def websocket_chat(websocket: WebSocket):
     """Production-ready WebSocket endpoint with conversation history support.
@@ -214,7 +262,7 @@ async def websocket_chat(websocket: WebSocket):
     Features:
     - Self-aware AI that knows its capabilities (Slack, Gmail, Notion)
     - Automatic tool calling based on user intent
-    - GPT-4 for better reasoning
+    - gpt-5-nano as the main reasoning model
     - Conversation history persistence in database
     - Session management for multiple chats
     - Proper disconnect handling (1000, 1001, 1006)
@@ -225,7 +273,7 @@ async def websocket_chat(websocket: WebSocket):
     # Initialize AI Brain (self-aware agent)
     brain = None
     try:
-        brain = get_ai_brain()
+        brain = await get_ai_brain()
         logger.debug("AI Brain ready (GPT-4 + tools)")
     except Exception as e:
         logger.error(f"Failed to initialize AI Brain: {e}", exc_info=True)
@@ -280,26 +328,27 @@ async def websocket_chat(websocket: WebSocket):
                 
                 # Ensure session exists
                 try:
-                    chat_session = db_manager.get_chat_session(session_id)
+                    chat_session = await _run_in_executor(db_manager.get_chat_session, session_id)
                     if not chat_session:
-                        # Create new session
-                        db_manager.create_chat_session(session_id)
+                        await _run_in_executor(db_manager.create_chat_session, session_id)
                         logger.debug(f"Created new chat session: {session_id}")
                 except Exception as db_error:
                     logger.error(f"Database error: {db_error}", exc_info=True)
-                    # Continue without persistence if DB fails
-                
-                # Load conversation history from database
-                conversation_history = []
+
+                conversation_history: List[Dict[str, str]] = []
                 try:
-                    conversation_history = db_manager.get_chat_history(session_id)
-                    logger.debug(f"Loaded {len(conversation_history)} messages from history")
+                    history = await _run_in_executor(db_manager.get_chat_history, session_id)
+                    conversation_history = _truncate_history(history)
+                    logger.debug(
+                        "Loaded %s messages from history (trimmed to %s)",
+                        len(history),
+                        len(conversation_history),
+                    )
                 except Exception as db_error:
                     logger.error(f"Error loading history: {db_error}")
-                
-                # Save user message to database
+
                 try:
-                    db_manager.add_chat_message(session_id, 'user', query)
+                    await _run_in_executor(db_manager.add_chat_message, session_id, 'user', query)
                 except Exception as db_error:
                     logger.error(f"Error saving user message: {db_error}")
                 
@@ -331,18 +380,17 @@ async def websocket_chat(websocket: WebSocket):
                     # Save assistant response to database
                     if assistant_response:
                         try:
-                            db_manager.add_chat_message(
-                                session_id, 
-                                'assistant', 
+                            await _run_in_executor(
+                                db_manager.add_chat_message,
+                                session_id,
+                                'assistant',
                                 assistant_response,
-                                assistant_sources
+                                assistant_sources,
                             )
-                            
-                            # Auto-generate title from first user message if session is new
-                            if len(conversation_history) == 0:
-                                # Generate concise title from first message
+
+                            if not conversation_history:
                                 title = query[:50] + ('...' if len(query) > 50 else '')
-                                db_manager.update_session_title(session_id, title)
+                                await _run_in_executor(db_manager.update_session_title, session_id, title)
                         except Exception as db_error:
                             logger.error(f"Error saving assistant message: {db_error}")
                 
@@ -393,7 +441,7 @@ async def load_models():
         Status message
     """
     try:
-        get_rag_engine()
+        await get_rag_engine()
         return {"status": "ok", "message": "Models loaded successfully"}
     
     except Exception as e:

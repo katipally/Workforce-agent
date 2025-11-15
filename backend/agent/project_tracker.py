@@ -18,10 +18,13 @@ Key Features:
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 from dataclasses import dataclass
+import asyncio
 import json
 import re
 from pathlib import Path
 import sys
+
+from sqlalchemy import or_
 
 # Add core directory to path
 core_path = Path(__file__).parent.parent / 'core'
@@ -29,6 +32,7 @@ if str(core_path) not in sys.path:
     sys.path.insert(0, str(core_path))
 
 from utils.logger import get_logger
+from database.models import Message, Channel, User, GmailMessage
 
 logger = get_logger(__name__)
 
@@ -119,55 +123,59 @@ class ProjectTracker:
         days_back: int = 7,
         channels: Optional[List[str]] = None
     ) -> List[ProjectUpdate]:
-        """Gather project updates from Slack.
-        
-        Args:
-            project_name: Name of the project to track
-            days_back: Number of days to look back
-            channels: Optional list of specific channels to search
-            
-        Returns:
-            List of Slack updates related to the project
-        """
+        """Gather project updates from Slack via structured DB queries."""
         logger.info(f"Gathering Slack updates for '{project_name}' (last {days_back} days)")
-        updates = []
-        keywords = self.extract_keywords(project_name)
-        
-        try:
-            # Search across all keywords
-            for keyword in keywords:
-                result = self.tools.search_slack_messages(
-                    query=keyword,
-                    limit=50
+        keywords = self.extract_keywords(project_name) or [project_name]
+        cutoff_ts = (datetime.utcnow() - timedelta(days=days_back)).timestamp()
+
+        def query_slack() -> List[ProjectUpdate]:
+            updates: List[ProjectUpdate] = []
+            with self.tools.db.get_session() as session:
+                keyword_filters = [Message.text.ilike(f"%{kw}%") for kw in keywords]
+                if channels:
+                    channel_filters = [Channel.name.ilike(f"%{ch.strip('#')}%") for ch in channels]
+                    keyword_filters.append(or_(*channel_filters))
+
+                message_query = (
+                    session.query(Message, Channel, User)
+                    .join(Channel, Message.channel_id == Channel.channel_id)
+                    .outerjoin(User, Message.user_id == User.user_id)
+                    .filter(Message.timestamp >= cutoff_ts)
+                    .order_by(Message.timestamp.desc())
+                    .limit(200)
                 )
-                
-                # Parse results
-                if "Found" in result:
-                    # Extract message details from result string
-                    # This is a simplified parser - in production, would parse actual Slack API response
-                    lines = result.split('\n')
-                    for line in lines:
-                        if 'From:' in line and 'in #' in line:
-                            try:
-                                # Extract basic info
-                                parts = line.split('in #')
-                                author_part = parts[0].split('From:')[1].strip()
-                                channel = parts[1].split('at')[0].strip()
-                                
-                                updates.append(ProjectUpdate(
-                                    source='slack',
-                                    timestamp=datetime.now() - timedelta(days=1),  # Approximate
-                                    author=author_part,
-                                    content=line,
-                                    channel_or_thread=channel,
-                                    metadata={'keyword': keyword}
-                                ))
-                            except:
-                                pass
-            
+
+                if keyword_filters:
+                    message_query = message_query.filter(or_(*keyword_filters))
+
+                for message, channel, user in message_query.all():
+                    author = (
+                        user.display_name
+                        or user.real_name
+                        or user.username
+                        or message.user_id
+                        or "Unknown"
+                    ) if user else (message.user_id or "Unknown")
+
+                    updates.append(
+                        ProjectUpdate(
+                            source='slack',
+                            timestamp=datetime.fromtimestamp(message.timestamp),
+                            author=author,
+                            content=message.text or "(no content)",
+                            channel_or_thread=f"#{channel.name}" if channel else message.channel_id,
+                            metadata={
+                                'message_id': message.message_id,
+                                'channel_id': message.channel_id,
+                            }
+                        )
+                    )
+            return updates
+
+        try:
+            updates = await asyncio.to_thread(query_slack)
             logger.info(f"Found {len(updates)} Slack updates")
             return updates
-        
         except Exception as e:
             logger.error(f"Error gathering Slack updates: {e}")
             return []
@@ -177,54 +185,50 @@ class ProjectTracker:
         project_name: str,
         days_back: int = 7
     ) -> List[ProjectUpdate]:
-        """Gather project updates from Gmail.
-        
-        Args:
-            project_name: Name of the project to track
-            days_back: Number of days to look back
-            
-        Returns:
-            List of Gmail updates related to the project
-        """
+        """Gather project updates from Gmail via structured DB queries."""
         logger.info(f"Gathering Gmail updates for '{project_name}' (last {days_back} days)")
-        updates = []
-        keywords = self.extract_keywords(project_name)
-        
+        keywords = self.extract_keywords(project_name) or [project_name]
+        cutoff_date = datetime.utcnow() - timedelta(days=days_back)
+
+        def query_gmail() -> List[ProjectUpdate]:
+            updates: List[ProjectUpdate] = []
+            with self.tools.db.get_session() as session:
+                keyword_filters = [
+                    GmailMessage.subject.ilike(f"%{kw}%") |
+                    GmailMessage.body_text.ilike(f"%{kw}%")
+                    for kw in keywords
+                ]
+
+                message_query = (
+                    session.query(GmailMessage)
+                    .filter(GmailMessage.date >= cutoff_date)
+                    .order_by(GmailMessage.date.desc())
+                    .limit(200)
+                )
+
+                if keyword_filters:
+                    message_query = message_query.filter(or_(*keyword_filters))
+
+                for message in message_query.all():
+                    updates.append(
+                        ProjectUpdate(
+                            source='gmail',
+                            timestamp=message.date or datetime.utcnow(),
+                            author=message.from_address or "Unknown",
+                            content=(message.snippet or message.body_text or "(no content)")[:500],
+                            channel_or_thread=message.subject or "(no subject)",
+                            metadata={
+                                'message_id': message.message_id,
+                                'thread_id': message.thread_id,
+                            }
+                        )
+                    )
+            return updates
+
         try:
-            # Calculate date range
-            date_filter = (datetime.now() - timedelta(days=days_back)).strftime("%Y/%m/%d")
-            
-            # Search for email threads containing project keywords
-            for keyword in keywords:
-                query = f"subject:({keyword}) OR {keyword} after:{date_filter}"
-                result = self.tools.search_email_threads(query, limit=20)
-                
-                # Parse thread results
-                if "threads found" in result.lower():
-                    # Extract thread info
-                    lines = result.split('\n')
-                    for line in lines:
-                        if 'Thread ID:' in line:
-                            try:
-                                thread_id = line.split('Thread ID:')[1].split()[0].strip()
-                                
-                                # Get complete thread
-                                thread_content = self.tools.get_complete_email_thread(thread_id)
-                                
-                                updates.append(ProjectUpdate(
-                                    source='gmail',
-                                    timestamp=datetime.now(),
-                                    author='Email Participants',
-                                    content=thread_content[:500],  # Summary
-                                    channel_or_thread=f"Thread {thread_id}",
-                                    metadata={'thread_id': thread_id, 'keyword': keyword}
-                                ))
-                            except:
-                                pass
-            
+            updates = await asyncio.to_thread(query_gmail)
             logger.info(f"Found {len(updates)} Gmail updates")
             return updates
-        
         except Exception as e:
             logger.error(f"Error gathering Gmail updates: {e}")
             return []

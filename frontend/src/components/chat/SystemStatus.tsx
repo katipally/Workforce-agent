@@ -14,7 +14,7 @@ interface SystemStatusProps {
 }
 
 export default function SystemStatus({ wsConnected }: SystemStatusProps) {
-  const [platforms, setPlatforms] = useState<PlatformStatus[]>([
+  const [platforms] = useState<PlatformStatus[]>([
     {
       name: 'Slack',
       icon: <MessageSquare className="h-4 w-4" />,
@@ -39,7 +39,7 @@ export default function SystemStatus({ wsConnected }: SystemStatusProps) {
   ])
 
   const [dbStatus, setDbStatus] = useState<'healthy' | 'warning' | 'error'>('healthy')
-  const [vectorSearch, setVectorSearch] = useState(true)
+  const vectorSearch = true
 
   useEffect(() => {
     // Poll for system status
@@ -162,8 +162,8 @@ export default function SystemStatus({ wsConnected }: SystemStatusProps) {
             <Activity className="h-5 w-5 text-white" />
           </div>
           <div>
-            <div className="text-sm font-semibold text-gray-900">GPT-4o-mini</div>
-            <div className="text-xs text-gray-600">Latest OpenAI Model (Nov 2025)</div>
+            <div className="text-sm font-semibold text-gray-900">gpt-5-nano</div>
+            <div className="text-xs text-gray-600">Latest lightweight reasoning model (Nov 2025)</div>
           </div>
         </div>
         <div className="grid grid-cols-2 gap-2 mt-3">

@@ -56,10 +56,10 @@ class Config:
     # AI Agent Configuration
     EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-8B")
     RERANKER_MODEL = os.getenv("RERANKER_MODEL", "Qwen/Qwen3-Reranker-4B")
-    # LLM Model - Default to gpt-4o-mini (Nov 2025)
-    # gpt-4o-mini: Latest cost-efficient model, 80% cheaper, full tool calling, streaming
-    # gpt-4o: More expensive flagship model for complex tasks
-    LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+    # LLM Model - default to gpt-5-nano (Nov 2025)
+    # gpt-5-nano: Latest lightweight reasoning model, optimized for speed & cost with tool calling + streaming
+    # Other options (if enabled for your account): gpt-5-mini, gpt-5
+    LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5-nano")
     EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "32"))
     USE_GPU = os.getenv("USE_GPU", "false").lower() == "true"
     

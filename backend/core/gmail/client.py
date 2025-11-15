@@ -2,6 +2,7 @@
 
 import os
 import pickle
+import base64
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from google.auth.transport.requests import Request
@@ -191,6 +192,45 @@ class GmailClient:
             logger.error(f"Error getting message {message_id}: {error}")
             return None
     
+    def get_attachment(
+        self,
+        message_id: str,
+        attachment_id: str
+    ) -> Optional[bytes]:
+        """Get raw attachment data for a given message.
+        
+        Uses the Gmail API users.messages.attachments.get endpoint and returns
+        the decoded bytes for the attachment body.
+        
+        Args:
+            message_id: Gmail message ID the attachment belongs to
+            attachment_id: Attachment ID from the message payload
+        
+        Returns:
+            Attachment bytes or None if not found/failed
+        """
+        if not self.service:
+            logger.error("Not authenticated")
+            return None
+
+        try:
+            attachment = self.service.users().messages().attachments().get(
+                userId='me',
+                messageId=message_id,
+                id=attachment_id
+            ).execute()
+
+            data = attachment.get('data')
+            if not data:
+                return None
+
+            # Gmail API returns base64url-encoded data; decode to raw bytes
+            return base64.urlsafe_b64decode(data.encode('utf-8'))
+
+        except HttpError as error:
+            logger.error(f"Error getting attachment {attachment_id} for message {message_id}: {error}")
+            return None
+
     def send_message(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Send an email message.
         

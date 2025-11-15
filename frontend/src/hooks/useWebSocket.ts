@@ -24,6 +24,8 @@ export function useWebSocket(): WebSocketHook {
     setSources,
     setIsStreaming,
     finishStreaming,
+    addReasoningStep,
+    clearReasoningSteps,
   } = useChatStore()
   
   const connect = useCallback(() => {
@@ -57,8 +59,16 @@ export function useWebSocket(): WebSocketHook {
           // Streaming complete
           finishStreaming()
         } else if (data.type === 'status') {
-          // Status message
+          // Status message from backend (safe, high-level reasoning/steps)
+          // Treat step messages and final reasoning summary as "thinking" entries.
           console.log('Status:', data.content)
+          if (typeof data.content === 'string') {
+            if (data.content.startsWith('Step ')) {
+              addReasoningStep(data.content)
+            } else if (data.content.startsWith('Reasoning Summary')) {
+              addReasoningStep(data.content)
+            }
+          }
         } else if (data.type === 'error') {
           console.error('Server error:', data.content)
           setIsStreaming(false)
@@ -98,7 +108,7 @@ export function useWebSocket(): WebSocketHook {
     }
     
     wsRef.current = ws
-  }, [appendStreamingToken, setSources, setIsStreaming, finishStreaming, setStreamingMessage])
+  }, [appendStreamingToken, setSources, setIsStreaming, finishStreaming, setStreamingMessage, addReasoningStep])
   
   useEffect(() => {
     connect()
@@ -120,6 +130,7 @@ export function useWebSocket(): WebSocketHook {
       setStreamingMessage('')
       setSources([])
       setIsStreaming(true)
+      clearReasoningSteps()
       
       // Get current session ID from store
       const { currentSessionId } = useChatStore.getState()
@@ -145,7 +156,7 @@ export function useWebSocket(): WebSocketHook {
         connect()
       }
     }
-  }, [setStreamingMessage, setSources, setIsStreaming, connectionStatus, connect])
+  }, [setStreamingMessage, setSources, setIsStreaming, clearReasoningSteps, connectionStatus, connect])
   
   return {
     sendMessage,

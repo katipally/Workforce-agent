@@ -41,13 +41,12 @@ This agent calls APIs **directly in real-time** - no database setup required fir
 
 ### Pricing (Pay-as-you-go) - November 2025
 
-- **GPT-4o-mini** (Recommended): ~$0.15/$0.60 per 1M tokens (80% cheaper!)
-- **GPT-4o**: ~$2.50/$10 per 1M tokens (best performance)
-- **GPT-4 Turbo** (Legacy): ~$10/$30 per 1M tokens
-- **Typical query cost**: $0.0001 - $0.001 per query (with GPT-4o-mini)
-- **Free tier**: $5 credit for new accounts
+- **gpt-5-nano** (Recommended): lightweight reasoning model optimized for cost and speed
+- Other gpt-5 family models (if enabled): higher quality at higher cost
+- **Typical query cost**: low fractions of a cent per query; see OpenAI pricing page for latest numbers
+- **Free tier**: OpenAI may offer starter credits for new accounts
 
-**Estimated monthly cost for normal use:** $1-5/month (with GPT-4o-mini)
+**Estimated monthly cost for normal use:** a few dollars/month with gpt-5-nano (depends on your usage and OpenAI pricing)
 
 ---
 
@@ -462,8 +461,8 @@ Before creating credentials, you must configure the consent screen.
 Add to `.env`:
 ```bash
 # Gmail API (Optional - for Gmail features)
-GMAIL_CREDENTIALS_PATH=backend/core/credentials/gmail/credentials.json
-GMAIL_TOKEN_PATH=backend/core/credentials/gmail/token.pickle
+GMAIL_CREDENTIALS_FILE=credentials/gmail_credentials.json
+GMAIL_TOKEN_FILE=data/gmail_token.pickle
 ```
 
 **Note:** Place `credentials.json` in `backend/core/credentials/gmail/` folder (create folders if needed).
@@ -587,9 +586,9 @@ EOF
 | `OPENAI_API_KEY` | ✅ **YES** | `sk-...` | https://platform.openai.com/api-keys |
 | `SLACK_BOT_TOKEN` | For Slack | `xoxb-...` | Slack App → Install App |
 | `SLACK_APP_TOKEN` | For Slack | `xapp-...` | Slack App → Socket Mode |
-| `GMAIL_CREDENTIALS_PATH` | For Gmail | Path to JSON | Google Cloud Console |
-| `GMAIL_TOKEN_PATH` | For Gmail | Path to pickle | Auto-generated after OAuth |
-| `NOTION_API_KEY` | For Notion | `secret_...` | Notion → My Integrations |
+| `GMAIL_CREDENTIALS_FILE` | For Gmail | Path to JSON | Google Cloud Console |
+| `GMAIL_TOKEN_FILE` | For Gmail | Path to pickle | Auto-generated after OAuth |
+| `NOTION_TOKEN` | For Notion | `secret_...` | Notion → My Integrations |
 | `NOTION_PARENT_PAGE_ID` | For Notion | Page ID | Notion page URL |
 | `DATABASE_URL` | Optional | postgres://... | PostgreSQL connection |
 
@@ -604,16 +603,15 @@ SLACK_BOT_TOKEN=xoxb-your-bot-token
 SLACK_APP_TOKEN=xapp-your-app-token
 
 # Gmail (Optional - for Gmail features)
-GMAIL_CREDENTIALS_PATH=backend/core/credentials/gmail/credentials.json
-GMAIL_TOKEN_PATH=backend/core/credentials/gmail/token.pickle
+GMAIL_CREDENTIALS_FILE=backend/core/credentials/gmail/credentials.json
+GMAIL_TOKEN_FILE=backend/core/credentials/gmail/token.pickle
 
 # Notion (Optional - for Notion features)
-NOTION_API_KEY=secret_your-token
+NOTION_TOKEN=secret_your-token
 NOTION_PARENT_PAGE_ID=your-page-id
 
 # Database (Optional - auto-caching)
 DATABASE_URL=postgresql://localhost:5432/workforce_agent
-```
 
 ### Setup Summary
 
