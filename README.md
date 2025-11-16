@@ -10,9 +10,9 @@ Ask questions like "Get messages from #social" or "Find emails from John" and th
 
 ## ✨ What Can It Do?
 
-### 🚀 **66+ Powerful Tools Across 3 Platforms** (November 2025 Update)
+### 🚀 **60+ Powerful Tools Across 3 Platforms** (November 2025 Update)
 
-The AI agent has access to **66+ comprehensive tools** with all major API features including **cross-platform project tracking**:
+The AI agent has access to **60+ comprehensive tools** with all major API features including **cross-platform project tracking**:
 
 ### 📱 **Slack (30+ Tools)** ✨ EXPANDED
 
@@ -169,7 +169,7 @@ The AI agent has access to **66+ comprehensive tools** with all major API featur
   - Team activity summaries
   - Channel analytics
   - Cross-platform search
-- 🛠️ **26+ NEW TOOLS**: Comprehensive API coverage (**66+ total tools**)
+- 🛠️ **26+ NEW TOOLS**: Comprehensive API coverage (**60+ total tools**)
   - **Slack**: File uploads, pins, channel management, user management
   - **Gmail**: Full email bodies, advanced search, unread count, all operators
   - **Notion**: Update pages, append content, workspace search
@@ -179,7 +179,7 @@ The AI agent has access to **66+ comprehensive tools** with all major API featur
 - 🔧 **Fixed RAG Bug**: Vector search now uses correct 8192-dim embeddings
 - ✅ **100% Test Coverage**: All new tools tested and verified
 
-**📖 [View Complete Tool Catalog](./TOOLS_CATALOG.md)** - Detailed documentation of all 66+ tools
+**📖 [View Complete Tool Catalog](./TOOLS_CATALOG.md)** - Detailed documentation of all 60+ tools
 
 ---
 
@@ -480,7 +480,7 @@ Workforce-agent/
 
 ## 📚 Documentation
 
-- **📖 [Complete Tool Catalog](./TOOLS_CATALOG.md)** - Core 46 tools with examples (Slack, Gmail, Notion, Workspace)
+- **📖 [Complete Tool Catalog](./TOOLS_CATALOG.md)** - All Slack, Gmail, Notion, workspace, and project tools with examples
 - **🔑 [API Setup Guide](./Documentation/api_guide.md)** - Step-by-step API configuration
 - **⚡ [API Endpoints](http://localhost:8000/docs)** - Interactive API docs (when running)
 

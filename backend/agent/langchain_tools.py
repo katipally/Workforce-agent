@@ -15,6 +15,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
 from pathlib import Path
+from sqlalchemy import or_
 
 # Add core directory to path
 core_path = Path(__file__).parent.parent / 'core'
@@ -162,9 +163,70 @@ class WorkforceTools:
         logger.info("Workforce tools initialized with all API clients")
     
     # ========================================
-    # HELPER METHODS - Cache to Database
+    # HELPER METHODS - Safety, Permissions & Caching
     # ========================================
     
+    def _normalize_slack_channel(self, channel: Optional[str]) -> str:
+        """Normalize Slack channel identifiers by stripping '#' and whitespace."""
+        if not channel:
+            return ""
+        return channel.strip().lstrip("#")
+
+    def _check_slack_read_allowed(self, channel: Optional[str]) -> Optional[str]:
+        """Return error message if reading from a Slack channel is blocked."""
+        normalized = self._normalize_slack_channel(channel)
+        if not normalized:
+            return None
+        blocked_raw = Config.SLACK_BLOCKED_CHANNELS or ""
+        blocked = {c.strip().lstrip("#") for c in blocked_raw.split(",") if c.strip()}
+        if normalized in blocked:
+            return f"Slack channel '{channel}' is blocked by configuration; read actions are not allowed."
+        return None
+
+    def _check_slack_write_allowed(self, channel: Optional[str] = None) -> Optional[str]:
+        """Return error message if writing to Slack is disallowed by configuration."""
+        mode = (Config.SLACK_MODE or "standard").lower()
+        if mode == "read_only":
+            return "Slack is configured in read_only mode; write actions are disabled by configuration."
+        normalized = self._normalize_slack_channel(channel)
+        if normalized:
+            blocked_raw = Config.SLACK_BLOCKED_CHANNELS or ""
+            blocked = {c.strip().lstrip("#") for c in blocked_raw.split(",") if c.strip()}
+            if normalized in blocked:
+                return f"Slack channel '{channel}' is blocked by configuration; this action is not allowed."
+            readonly_raw = Config.SLACK_READONLY_CHANNELS or ""
+            readonly = {c.strip().lstrip("#") for c in readonly_raw.split(",") if c.strip()}
+            if normalized in readonly:
+                return f"Slack channel '{channel}' is read-only by configuration; write actions are not allowed."
+        return None
+
+    def _check_notion_write_allowed(self) -> Optional[str]:
+        """Return error message if writing to Notion is disallowed by configuration."""
+        mode = (Config.NOTION_MODE or "standard").lower()
+        if mode == "read_only":
+            return "Notion is configured in read_only mode; write actions are disabled by configuration."
+        return None
+
+    def _parse_domain_list(self, raw: str) -> List[str]:
+        """Parse a comma-separated list of domains from configuration."""
+        return [d.strip() for d in (raw or "").split(",") if d.strip()]
+
+    def _is_domain_allowed_for_send(self, email: str) -> bool:
+        """Check if an email's domain is allowed for sending."""
+        allowed = self._parse_domain_list(Config.GMAIL_ALLOWED_SEND_DOMAINS)
+        if not allowed or not email:
+            return True
+        lower_email = email.lower()
+        return any(lower_email.endswith(dom.lower()) for dom in allowed)
+
+    def _is_sender_allowed_for_read(self, sender: str) -> bool:
+        """Check if a sender/address is allowed to be read based on domain filters."""
+        allowed = self._parse_domain_list(Config.GMAIL_ALLOWED_READ_DOMAINS)
+        if not allowed or not sender:
+            return True
+        lower_sender = sender.lower()
+        return any(dom.lower() in lower_sender for dom in allowed)
+
     def _cache_channels_to_db(self, channels: list):
         """Cache Slack channels to database."""
         try:
@@ -238,6 +300,10 @@ class WorkforceTools:
         try:
             if not self.slack_client:
                 return "❌ Slack API not configured"
+            # Enforce Slack read permissions
+            err = self._check_slack_read_allowed(channel)
+            if err:
+                return f"❌ {err}"
             
             # Get channel ID if name provided
             channel_id = channel
@@ -329,6 +395,9 @@ class WorkforceTools:
                 
                 # Filter by channel if specified
                 if channel:
+                    err = self._check_slack_read_allowed(channel)
+                    if err:
+                        return f"❌ {err}"
                     db_query = db_query.filter(
                         (Channel.name == channel) | (Channel.id == channel)
                     )
@@ -369,6 +438,9 @@ class WorkforceTools:
             Success/error message
         """
         try:
+            err = self._check_slack_write_allowed(channel)
+            if err:
+                return f"❌ {err}"
             result = self.slack_sender.send_message(channel, text)
             if result:
                 return f"✓ Message sent to {channel}"
@@ -395,6 +467,13 @@ class WorkforceTools:
             
             if not self.gmail_client.authenticate():
                 return "❌ Gmail authentication failed. Run authentication setup first."
+
+            # Enforce Gmail read domain restrictions (if configured)
+            if not self._is_sender_allowed_for_read(sender):
+                return (
+                    "❌ Gmail read from this sender is blocked by configuration. "
+                    "Update GMAIL_ALLOWED_READ_DOMAINS if you want to include this address."
+                )
             
             # Call Gmail API with search query
             gmail_query = f"from:{sender}"
@@ -491,6 +570,10 @@ class WorkforceTools:
                     subj = next((h['value'] for h in headers if h['name'] == 'Subject'), 'No Subject')
                     date = next((h['value'] for h in headers if h['name'] == 'Date'), 'No Date')
                     from_addr = next((h['value'] for h in headers if h['name'] == 'From'), 'Unknown')
+
+                    # Apply read-domain filter if configured
+                    if not self._is_sender_allowed_for_read(from_addr):
+                        continue
                     
                     results.append(
                         f"\n[{date}] From: {from_addr}\n"
@@ -526,9 +609,18 @@ class WorkforceTools:
                 # Text search in subject and body
                 if query:
                     db_query = db_query.filter(
-                        (GmailMessage.subject.ilike(f'%{query}%')) |
-                        (GmailMessage.body_text.ilike(f'%{query}%'))
+                        (GmailMessage.subject.ilike(f"%{query}%")) |
+                        (GmailMessage.body_text.ilike(f"%{query}%"))
                     )
+
+                # Apply global Gmail read-domain restriction if configured
+                allowed_domains = self._parse_domain_list(Config.GMAIL_ALLOWED_READ_DOMAINS)
+                if allowed_domains:
+                    domain_filters = [
+                        GmailMessage.from_address.ilike(f"%{dom}%")
+                        for dom in allowed_domains
+                    ]
+                    db_query = db_query.filter(or_(*domain_filters))
                 
                 # Order by most recent
                 messages = db_query.order_by(GmailMessage.date.desc()).limit(limit).all()
@@ -568,17 +660,30 @@ class WorkforceTools:
             gmail_client = GmailClient()
             if not gmail_client.authenticate():
                 return "✗ Gmail authentication failed"
-            
+
+            # Enforce allowed send domains (if configured)
+            if not self._is_domain_allowed_for_send(to):
+                return (
+                    "✗ Sending email blocked by configuration: recipient domain is not allowed. "
+                    "Update GMAIL_ALLOWED_SEND_DOMAINS if you want to send to this address."
+                )
+
+            mode = (Config.GMAIL_SEND_MODE or "confirm").lower()
+
             # Create message
-            from email.mime.text import MIMEText
-            
             message = MIMEText(body)
             message['to'] = to
             message['subject'] = subject
-            
             raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
-            
-            # Send
+
+            if mode == "draft":
+                # Never actually send - just return a draft preview
+                return (
+                    "✉️ Draft email (NOT SENT because GMAIL_SEND_MODE=draft):\n"
+                    f"To: {to}\nSubject: {subject}\n\n{body}"
+                )
+
+            # confirm and auto_limited both send, but we still rely on AI guardrails
             result = gmail_client.send_message({'raw': raw_message})
             
             if result:
@@ -739,6 +844,10 @@ class WorkforceTools:
             Success/error message
         """
         try:
+            err = self._check_notion_write_allowed()
+            if err:
+                return f"❌ {err}"
+
             notion_client = NotionClient()
             if not notion_client.test_connection():
                 return "✗ Notion connection failed"
@@ -854,6 +963,9 @@ class WorkforceTools:
         try:
             if not self.slack_client:
                 return "Slack client not available"
+            err = self._check_slack_write_allowed(channel)
+            if err:
+                return f"❌ {err}"
             
             self.slack_client.conversations_setTopic(
                 channel=channel,
@@ -1100,7 +1212,16 @@ class WorkforceTools:
             gmail_client = self.gmail_client or GmailClient()
             if not gmail_client.authenticate():
                 return "✗ Gmail authentication failed"
-            
+
+            # Enforce allowed send domains (if configured)
+            if not self._is_domain_allowed_for_send(to):
+                return (
+                    "✗ Sending email blocked by configuration: recipient domain is not allowed. "
+                    "Update GMAIL_ALLOWED_SEND_DOMAINS if you want to send to this address."
+                )
+
+            mode = (Config.GMAIL_SEND_MODE or "confirm").lower()
+
             msg = MIMEMultipart()
             msg["to"] = to
             msg["subject"] = subject
@@ -1136,6 +1257,15 @@ class WorkforceTools:
                     continue
             
             raw_message = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+
+            if mode == "draft":
+                # Never send - just describe the draft
+                return (
+                    "✉️ Draft email with attachments (NOT SENT because GMAIL_SEND_MODE=draft):\n"
+                    f"To: {to}\nSubject: {subject}\n"
+                    f"Attachments prepared: {', '.join(attached_files) if attached_files else 'none'}"
+                )
+
             result = gmail_client.send_message({"raw": raw_message})
             
             if result:
@@ -1165,7 +1295,7 @@ class WorkforceTools:
             response = requests.get(
                 f"https://api.notion.com/v1/blocks/{page_id}/children",
                 headers={
-                    "Authorization": f"Bearer {Config.NOTION_API_KEY}",
+                    "Authorization": f"Bearer {Config.NOTION_TOKEN}",
                     "Notion-Version": "2022-06-28"
                 }
             )
@@ -1386,8 +1516,9 @@ class WorkforceTools:
                 format='full'
             ).execute()
             
-            # Extract headers
-            headers = msg['payload']['headers']
+            # Extract headers safely
+            payload = msg.get('payload') or {}
+            headers = payload.get('headers') or []
             subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
             from_addr = next((h['value'] for h in headers if h['name'].lower() == 'from'), 'Unknown')
             to_addr = next((h['value'] for h in headers if h['name'].lower() == 'to'), 'Unknown')
@@ -1414,7 +1545,7 @@ class WorkforceTools:
                                 body = nested
                 return body
             
-            body = extract_body(msg['payload'])
+            body = extract_body(payload)
             
             result = f"""
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1481,7 +1612,7 @@ COMPLETE MESSAGE BODY:
                 format='full'  # Get complete message content for ALL messages
             ).execute()
             
-            messages = thread.get('messages', [])
+            messages = thread.get('messages') or []
             message_count = len(messages)
             
             if message_count == 0:
@@ -1520,14 +1651,15 @@ Total Messages: {message_count}
             
             # Process ALL messages in thread
             for idx, msg in enumerate(messages, 1):
-                headers = msg['payload']['headers']
+                payload = msg.get('payload') or {}
+                headers = payload.get('headers') or []
                 subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
                 from_addr = next((h['value'] for h in headers if h['name'].lower() == 'from'), 'Unknown')
                 to_addr = next((h['value'] for h in headers if h['name'].lower() == 'to'), 'Unknown')
                 date = next((h['value'] for h in headers if h['name'].lower() == 'date'), 'Unknown')
                 
                 # Extract full body
-                body = extract_body(msg['payload'])
+                body = extract_body(payload)
                 
                 result.append(f"""
 MESSAGE {idx} of {message_count}:
@@ -1591,11 +1723,15 @@ Subject: {subject}
                         metadataHeaders=['Subject', 'From', 'Date']
                     ).execute()
                     
-                    message_count = len(thread.get('messages', []))
+                    messages = thread.get('messages') or []
+                    message_count = len(messages)
+                    if not messages:
+                        continue
                     
-                    # Get first message headers
-                    first_msg = thread['messages'][0]
-                    headers = first_msg['payload']['headers']
+                    # Get first message headers safely
+                    first_msg = messages[0]
+                    payload = first_msg.get('payload') or {}
+                    headers = payload.get('headers') or []
                     subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
                     from_addr = next((h['value'] for h in headers if h['name'].lower() == 'from'), 'Unknown')
                     date = next((h['value'] for h in headers if h['name'].lower() == 'date'), 'Unknown')
@@ -1719,11 +1855,16 @@ Subject: {subject}
         try:
             if not self.gmail_client or not self.gmail_client.authenticate():
                 return "❌ Gmail not authenticated"
-            
+
+            # Apply default label scoping if configured and no label: is present
+            search_query = query
+            if Config.GMAIL_DEFAULT_LABEL and "label:" not in (query or ""):
+                search_query = f"label:{Config.GMAIL_DEFAULT_LABEL} {query}" if query else f"label:{Config.GMAIL_DEFAULT_LABEL}"
+
             # Execute advanced search
             results_response = self.gmail_client.service.users().messages().list(
                 userId='me',
-                q=query,
+                q=search_query,
                 maxResults=limit
             ).execute()
             
@@ -1747,7 +1888,11 @@ Subject: {subject}
                     subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
                     from_addr = next((h['value'] for h in headers if h['name'].lower() == 'from'), 'Unknown')
                     date = next((h['value'] for h in headers if h['name'].lower() == 'date'), 'Unknown')
-                    
+
+                    # Enforce read-domain filter if configured
+                    if not self._is_sender_allowed_for_read(from_addr):
+                        continue
+
                     # Get snippet or body preview
                     snippet = msg.get('snippet', 'No preview')
                     
@@ -1783,6 +1928,9 @@ Subject: {subject}
         try:
             if not self.slack_client:
                 return "❌ Slack not configured"
+            err = self._check_slack_write_allowed(channel)
+            if err:
+                return f"❌ {err}"
             
             # Check if file_content is a path
             if os.path.exists(file_content):
@@ -1879,7 +2027,11 @@ Subject: {subject}
         try:
             if not self.slack_client:
                 return "❌ Slack not configured"
-            
+
+            err = self._check_slack_write_allowed(name)
+            if err:
+                return f"❌ {err}"
+
             result = self.slack_client.conversations_create(
                 name=name,
                 is_private=is_private
@@ -1897,6 +2049,9 @@ Subject: {subject}
         try:
             if not self.slack_client:
                 return "❌ Slack not configured"
+            err = self._check_slack_write_allowed(channel)
+            if err:
+                return f"❌ {err}"
             
             self.slack_client.conversations_archive(channel=channel)
             return f"✅ Channel archived successfully"

@@ -323,7 +323,7 @@ This step is CRITICAL - without it, the integration cannot access the page.
 Add to `.env`:
 ```bash
 # Notion API (Optional - for Notion features)
-NOTION_API_KEY=secret_your-notion-token-here
+NOTION_TOKEN=secret_your-notion-token-here
 NOTION_PARENT_PAGE_ID=your-parent-page-id-here
 ```
 
@@ -591,6 +591,14 @@ EOF
 | `NOTION_TOKEN` | For Notion | `secret_...` | Notion → My Integrations |
 | `NOTION_PARENT_PAGE_ID` | For Notion | Page ID | Notion page URL |
 | `DATABASE_URL` | Optional | postgres://... | PostgreSQL connection |
+| `SLACK_MODE` | Optional | `read_only` \| `standard` \| `admin` | Safety mode for Slack tools |
+| `SLACK_READONLY_CHANNELS` | Optional | `channel-a,channel-b` | Comma-separated Slack channels/IDs to treat as read-only |
+| `SLACK_BLOCKED_CHANNELS` | Optional | `channel-a,channel-b` | Comma-separated Slack channels/IDs to fully block |
+| `GMAIL_SEND_MODE` | Optional | `draft` \| `confirm` \| `auto_limited` | Safe-send behavior for Gmail tools |
+| `GMAIL_ALLOWED_SEND_DOMAINS` | Optional | `@company.com,@partner.com` | Limit sending to specific domains |
+| `GMAIL_ALLOWED_READ_DOMAINS` | Optional | `@company.com` | Limit Gmail search/reads to specific domains |
+| `GMAIL_DEFAULT_LABEL` | Optional | `Work/Projects` | Default Gmail label for advanced searches |
+| `NOTION_MODE` | Optional | `standard` \| `read_only` | Control whether Notion tools can write |
 
 ### Complete .env Template
 
@@ -603,12 +611,27 @@ SLACK_BOT_TOKEN=xoxb-your-bot-token
 SLACK_APP_TOKEN=xapp-your-app-token
 
 # Gmail (Optional - for Gmail features)
-GMAIL_CREDENTIALS_FILE=backend/core/credentials/gmail/credentials.json
-GMAIL_TOKEN_FILE=backend/core/credentials/gmail/token.pickle
+GMAIL_CREDENTIALS_FILE=credentials/gmail_credentials.json
+GMAIL_TOKEN_FILE=data/gmail_token.pickle
 
 # Notion (Optional - for Notion features)
 NOTION_TOKEN=secret_your-token
 NOTION_PARENT_PAGE_ID=your-page-id
+
+# Safety & permissions (Optional)
+# Slack modes: read_only, standard, admin
+SLACK_MODE=standard
+SLACK_READONLY_CHANNELS=
+SLACK_BLOCKED_CHANNELS=
+
+# Gmail safe-send modes: draft, confirm, auto_limited
+GMAIL_SEND_MODE=confirm
+GMAIL_ALLOWED_SEND_DOMAINS=
+GMAIL_ALLOWED_READ_DOMAINS=
+GMAIL_DEFAULT_LABEL=
+
+# Notion safety mode: standard or read_only
+NOTION_MODE=standard
 
 # Database (Optional - auto-caching)
 DATABASE_URL=postgresql://localhost:5432/workforce_agent
