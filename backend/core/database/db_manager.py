@@ -9,7 +9,7 @@ Handles all database operations including:
 """
 from datetime import datetime
 from typing import Optional, List, Dict, Any
-from sqlalchemy import create_engine, func
+from sqlalchemy import create_engine, func, text, inspect
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.exc import IntegrityError
 
@@ -17,6 +17,7 @@ from config import Config
 from .models import (
     Base, Workspace, User, Channel, Message, File, 
     MessageFile, Reaction, SyncStatus,
+    NotionWorkspace, NotionPage,
     GmailAccount, GmailLabel, GmailThread, GmailMessage, GmailAttachment,
     ChatSession, ChatMessage
 )
@@ -56,7 +57,62 @@ class DatabaseManager:
         """Initialize database schema."""
         logger.info("Initializing database schema")
         Base.metadata.create_all(bind=self.engine)
+        self._run_schema_upgrades()
         logger.info("Database schema initialized")
+
+    def _run_schema_upgrades(self):
+        """Apply lightweight, in-process schema upgrades when needed."""
+
+        try:
+            inspector = inspect(self.engine)
+            table_names = set(inspector.get_table_names())
+
+            if "notion_pages" in table_names:
+                columns = {col["name"] for col in inspector.get_columns("notion_pages")}
+                needs_object_type = "object_type" not in columns
+                needs_url = "url" not in columns
+                needs_raw = "raw_data" not in columns
+
+                if needs_object_type or needs_url or needs_raw:
+                    dialect = self.engine.dialect.name
+                    json_type = "JSON" if dialect == "postgresql" else "TEXT"
+
+                    with self.engine.begin() as conn:
+                        if needs_object_type:
+                            conn.execute(
+                                text("ALTER TABLE notion_pages ADD COLUMN object_type VARCHAR(20)")
+                            )
+                        if needs_url:
+                            conn.execute(
+                                text("ALTER TABLE notion_pages ADD COLUMN url VARCHAR(500)")
+                            )
+                        if needs_raw:
+                            conn.execute(
+                                text(f"ALTER TABLE notion_pages ADD COLUMN raw_data {json_type}")
+                            )
+
+                # Older schemas had a self-referential foreign key on parent_id
+                # (notion_pages_parent_id_fkey). This breaks when Notion returns
+                # parents that aren't stored locally (e.g., workspace or
+                # un-synced pages). Drop that constraint if present.
+                fks = inspector.get_foreign_keys("notion_pages")
+                parent_fk_names = [
+                    fk["name"]
+                    for fk in fks
+                    if "parent_id" in fk.get("constrained_columns", []) and fk.get("name")
+                ]
+
+                if parent_fk_names:
+                    with self.engine.begin() as conn:
+                        for fk_name in parent_fk_names:
+                            conn.execute(
+                                text(
+                                    f"ALTER TABLE notion_pages DROP CONSTRAINT {fk_name}"
+                                )
+                            )
+
+        except Exception as e:  # pragma: no cover - defensive logging
+            logger.error(f"Schema upgrade error: {e}", exc_info=True)
     
     def get_session(self) -> Session:
         """Get database session."""

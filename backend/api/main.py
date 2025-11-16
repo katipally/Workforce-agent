@@ -9,7 +9,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Uplo
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import json
 import os
 import sys
@@ -38,7 +38,17 @@ if str(agent_path) not in sys.path:
 from config import Config
 from utils.logger import get_logger
 from database.db_manager import DatabaseManager
-from database.models import Workspace, Channel, Message, User, GmailAccount, GmailMessage, GmailThread
+from database.models import (
+    Workspace,
+    Channel,
+    Message,
+    User,
+    GmailAccount,
+    GmailMessage,
+    GmailThread,
+    NotionWorkspace,
+    NotionPage,
+)
 from slack.extractor import ExtractionCoordinator
 from gmail import GmailClient
 from notion_export import NotionClient
@@ -1177,6 +1187,9 @@ def _run_gmail_pipeline(run_id: str, label_id: str) -> None:
                 headers = {h.get("name", "").lower(): h.get("value", "") for h in headers_list}
 
                 from_raw = headers.get("from", "")
+                to_raw = headers.get("to")
+                cc_raw = headers.get("cc")
+                bcc_raw = headers.get("bcc")
                 subject = headers.get("subject", "")
                 date_str = headers.get("date")
                 try:
@@ -1194,6 +1207,9 @@ def _run_gmail_pipeline(run_id: str, label_id: str) -> None:
                     "id": msg_id,
                     "thread_id": full_msg.get("threadId"),
                     "from": from_raw,
+                    "to": to_raw,
+                    "cc": cc_raw,
+                    "bcc": bcc_raw,
                     "subject": subject,
                     "date": date_val.isoformat() if date_val else None,
                     "snippet": full_msg.get("snippet", ""),
@@ -1240,6 +1256,9 @@ def _run_gmail_pipeline(run_id: str, label_id: str) -> None:
                     headers = {h.get("name", "").lower(): h.get("value", "") for h in headers_list}
 
                     from_raw = headers.get("from", "")
+                    to_raw = headers.get("to")
+                    cc_raw = headers.get("cc")
+                    bcc_raw = headers.get("bcc")
                     subject = headers.get("subject", "")
                     date_str = headers.get("date")
                     try:
@@ -1257,6 +1276,9 @@ def _run_gmail_pipeline(run_id: str, label_id: str) -> None:
                         "id": msg_id,
                         "thread_id": full_msg.get("threadId"),
                         "from": from_raw,
+                        "to": to_raw,
+                        "cc": cc_raw,
+                        "bcc": bcc_raw,
                         "subject": subject,
                         "date": date_val.isoformat() if date_val else None,
                         "snippet": full_msg.get("snippet", ""),
@@ -1397,6 +1419,9 @@ async def get_gmail_pipeline_messages(run_id: str):
                             "id": msg.message_id,
                             "thread_id": msg.thread_id,
                             "from": msg.from_address,
+                            "to": msg.to_addresses,
+                            "cc": msg.cc_addresses,
+                            "bcc": msg.bcc_addresses,
                             "subject": msg.subject,
                             "date": msg.date.isoformat() if msg.date else None,
                             "snippet": msg.snippet,
@@ -1453,6 +1478,9 @@ async def get_gmail_messages_by_label(label_id: str, limit: int = 200):
                         "id": msg.message_id,
                         "thread_id": msg.thread_id,
                         "from": msg.from_address,
+                        "to": msg.to_addresses,
+                        "cc": msg.cc_addresses,
+                        "bcc": msg.bcc_addresses,
                         "subject": msg.subject,
                         "date": msg.date.isoformat() if msg.date else None,
                         "snippet": msg.snippet,
@@ -1462,14 +1490,10 @@ async def get_gmail_messages_by_label(label_id: str, limit: int = 200):
                 )
 
         return {"label_id": label_id, "messages": messages}
-
     except Exception as e:  # pragma: no cover - defensive logging
         logger.error(f"Error fetching Gmail messages for label {label_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to load Gmail messages for label")
 
-
-# ============================================================================
-# Notion Pipeline Endpoints (pages under NOTION_PARENT_PAGE_ID)
 # ============================================================================
 
 
@@ -1484,14 +1508,248 @@ def _extract_notion_title(page: Dict[str, Any]) -> str:
     for prop in properties.values():
         if prop.get("type") == "title":
             title_parts = prop.get("title", []) or []
-            texts = []
+            texts: List[str] = []
             for part in title_parts:
                 text_obj = part.get("plain_text") or part.get("text", {}).get("content")
                 if text_obj:
                     texts.append(text_obj)
             if texts:
                 return "".join(texts)
+
+    # Fallback for database objects which expose their title at the top level
+    top_title = page.get("title")
+    if isinstance(top_title, list):
+        texts: List[str] = []
+        for part in top_title:
+            if not isinstance(part, dict):
+                continue
+            text_obj = part.get("plain_text") or part.get("text", {}).get("content")
+            if text_obj:
+                texts.append(text_obj)
+        if texts:
+            return "".join(texts)
     return "Untitled"
+
+
+def _summarize_notion_properties(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return a lightweight summary of Notion page/database properties.
+
+    This is used by the Pipelines UI to show a Gmail-like info panel when a
+    page or database row is expanded in the accordion.
+    """
+
+    if not isinstance(raw, dict):
+        return []
+
+    properties = raw.get("properties", {}) or {}
+    items: List[Dict[str, Any]] = []
+
+    for name, prop in properties.items():
+        if not isinstance(prop, dict):
+            continue
+        p_type = prop.get("type") or "unknown"
+        value_str = ""
+
+        try:
+            if p_type in ("title", "rich_text"):
+                parts = prop.get(p_type, []) or []
+                texts: List[str] = []
+                for part in parts:
+                    if not isinstance(part, dict):
+                        continue
+                    text_obj = part.get("plain_text") or part.get("text", {}).get("content")
+                    if text_obj:
+                        texts.append(text_obj)
+                value_str = "".join(texts)
+            elif p_type in ("select", "status"):
+                opt = prop.get(p_type) or {}
+                if isinstance(opt, dict):
+                    value_str = opt.get("name") or ""
+            elif p_type == "multi_select":
+                opts = prop.get("multi_select", []) or []
+                names = [o.get("name") for o in opts if isinstance(o, dict) and o.get("name")]
+                value_str = ", ".join(names)
+            elif p_type == "checkbox":
+                value_str = "true" if prop.get("checkbox") else "false"
+            elif p_type == "number":
+                num = prop.get("number")
+                value_str = str(num) if num is not None else ""
+            elif p_type == "date":
+                date_obj = prop.get("date") or {}
+                if isinstance(date_obj, dict):
+                    start = date_obj.get("start") or ""
+                    end = date_obj.get("end") or ""
+                    value_str = f"{start} → {end}" if end else start
+            else:
+                # Fallback: best-effort stringification of the typed value
+                inner = prop.get(p_type)
+                if isinstance(inner, (str, int, float)):
+                    value_str = str(inner)
+        except Exception:  # pragma: no cover - defensive
+            value_str = ""
+
+        items.append({"name": name, "type": p_type, "value": value_str})
+
+    return items
+
+
+def _summarize_notion_blocks(blocks: List[Dict[str, Any]]) -> Tuple[List[str], List[Dict[str, Any]]]:
+    lines: List[str] = []
+    attachments: List[Dict[str, Any]] = []
+
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if not block_type:
+            continue
+
+        value = block.get(block_type) or {}
+
+        if block_type in (
+            "paragraph",
+            "heading_1",
+            "heading_2",
+            "heading_3",
+            "quote",
+            "callout",
+            "to_do",
+            "bulleted_list_item",
+            "numbered_list_item",
+        ):
+            rich_text = value.get("rich_text") or []
+            parts: List[str] = []
+            for rt in rich_text:
+                if not isinstance(rt, dict):
+                    continue
+                text_obj = rt.get("plain_text") or rt.get("text", {}).get("content")
+                if text_obj:
+                    parts.append(text_obj)
+            text_line = "".join(parts).strip()
+            if text_line:
+                lines.append(text_line)
+
+        if block_type in ("image", "file", "pdf", "video"):
+            caption_texts: List[str] = []
+            for rt in value.get("caption") or []:
+                if not isinstance(rt, dict):
+                    continue
+                txt = rt.get("plain_text") or rt.get("text", {}).get("content")
+                if txt:
+                    caption_texts.append(txt)
+            name = "".join(caption_texts) if caption_texts else None
+
+            url: Optional[str] = None
+            file_kind = value.get("type")
+            if file_kind == "file":
+                inner = value.get("file") or {}
+                url = inner.get("url")
+            elif file_kind == "external":
+                inner = value.get("external") or {}
+                url = inner.get("url")
+
+            attachments.append(
+                {
+                    "id": block.get("id"),
+                    "type": block_type,
+                    "name": name or block.get("id"),
+                    "url": url,
+                }
+            )
+
+    return lines, attachments
+
+
+def _persist_notion_pages(
+    workspace_id: str,
+    workspace_name: str,
+    pages: List[Dict[str, Any]],
+    full_refresh: bool = False,
+) -> None:
+    """Persist Notion pages into the local database.
+
+    When ``full_refresh`` is True, pages that are no longer returned by the
+    workspace-wide search are removed from the local table so deletions and
+    unshared pages are reflected in the UI. For cancelled runs we keep
+    ``full_refresh`` False so we don't accidentally delete data based on a
+    partial result set.
+    """
+
+    if not pages:
+        return
+
+    try:
+        with db_manager.get_session() as session:
+            workspace = (
+                session.query(NotionWorkspace)
+                .filter_by(workspace_id=workspace_id)
+                .first()
+            )
+
+            if not workspace:
+                workspace = NotionWorkspace(
+                    workspace_id=workspace_id,
+                    name=workspace_name or "Notion Workspace",
+                )
+                session.add(workspace)
+            else:
+                if workspace_name:
+                    workspace.name = workspace_name
+                workspace.updated_at = datetime.utcnow()
+
+            seen_ids: set[str] = set()
+
+            for p in pages:
+                page_id = p.get("id")
+                if not page_id:
+                    continue
+
+                seen_ids.add(page_id)
+
+                db_page = (
+                    session.query(NotionPage)
+                    .filter_by(page_id=page_id)
+                    .first()
+                )
+
+                if not db_page:
+                    db_page = NotionPage(
+                        page_id=page_id,
+                        workspace_id=workspace.workspace_id,
+                    )
+                    session.add(db_page)
+
+                db_page.object_type = p.get("object_type")
+                db_page.title = p.get("title")
+                db_page.url = p.get("url")
+                db_page.parent_id = p.get("parent_id")
+
+                last_edited_str = p.get("last_edited_time")
+                if last_edited_str:
+                    try:
+                        db_page.last_edited_time = datetime.fromisoformat(
+                            last_edited_str.replace("Z", "+00:00")
+                        )
+                    except Exception:
+                        pass
+
+                raw = p.get("raw")
+                if raw is not None:
+                    db_page.raw_data = raw
+
+            session.commit()
+
+            if full_refresh and seen_ids:
+                (
+                    session.query(NotionPage)
+                    .filter(NotionPage.workspace_id == workspace_id)
+                    .filter(~NotionPage.page_id.in_(seen_ids))
+                    .delete(synchronize_session=False)
+                )
+                session.commit()
+
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(f"Failed to persist Notion pages: {e}", exc_info=True)
 
 
 def _run_notion_pipeline(run_id: str) -> None:
@@ -1511,17 +1769,8 @@ def _run_notion_pipeline(run_id: str) -> None:
         logger.error("Notion pipeline run %s failed: NOTION_TOKEN is not configured", run_id)
         return
 
-    parent_id_raw = Config.NOTION_PARENT_PAGE_ID or None
-    parent_id = None
-    if parent_id_raw:
-        cleaned = parent_id_raw.replace("-", "")
-        if len(cleaned) == 32:
-            parent_id = (
-                f"{cleaned[0:8]}-{cleaned[8:12]}-{cleaned[12:16]}-"
-                f"{cleaned[16:20]}-{cleaned[20:32]}"
-            )
-        else:
-            parent_id = parent_id_raw
+    workspace_id = Config.WORKSPACE_ID or "default-notion-workspace"
+    workspace_name = Config.WORKSPACE_NAME or "Notion Workspace"
 
     pages: List[Dict[str, Any]] = []
     max_pages = 500
@@ -1535,7 +1784,8 @@ def _run_notion_pipeline(run_id: str) -> None:
 
         base_payload: Dict[str, Any] = {
             "page_size": 50,
-            "filter": {"property": "object", "value": "page"},
+            # No filter here so we see both pages and databases that are
+            # shared with the integration across the workspace.
             "sort": {"direction": "descending", "timestamp": "last_edited_time"},
         }
         start_cursor: Optional[str] = None
@@ -1548,6 +1798,7 @@ def _run_notion_pipeline(run_id: str) -> None:
                 run_info["finished_at"] = datetime.utcnow().isoformat()
                 run_info["page_count"] = len(pages)
                 notion_run_pages[run_id] = pages
+                _persist_notion_pages(workspace_id, workspace_name, pages, full_refresh=False)
                 logger.info("Notion pipeline run %s cancelled", run_id)
                 return
 
@@ -1580,16 +1831,17 @@ def _run_notion_pipeline(run_id: str) -> None:
             results = data.get("results", []) or []
 
             for page in results:
-                parent = page.get("parent", {}) or {}
-                parent_page_id = None
-                p_type = parent.get("type")
-                if p_type == "page_id":
-                    parent_page_id = parent.get("page_id")
-                elif p_type == "database_id":
-                    parent_page_id = parent.get("database_id")
-
-                if parent_id and parent_page_id != parent_id:
+                obj_type = page.get("object")
+                if obj_type not in ("page", "database"):
                     continue
+
+                parent_obj = page.get("parent", {}) or {}
+                parent_type = parent_obj.get("type")
+                parent_id: Optional[str] = None
+                if parent_type == "page_id":
+                    parent_id = parent_obj.get("page_id")
+                elif parent_type == "database_id":
+                    parent_id = parent_obj.get("database_id")
 
                 pages.append(
                     {
@@ -1597,6 +1849,9 @@ def _run_notion_pipeline(run_id: str) -> None:
                         "title": _extract_notion_title(page),
                         "url": page.get("url"),
                         "last_edited_time": page.get("last_edited_time"),
+                        "object_type": obj_type,
+                        "parent_id": parent_id,
+                        "raw": page,
                     }
                 )
 
@@ -1611,6 +1866,7 @@ def _run_notion_pipeline(run_id: str) -> None:
             start_cursor = data.get("next_cursor")
 
         notion_run_pages[run_id] = pages
+        _persist_notion_pages(workspace_id, workspace_name, pages, full_refresh=True)
         run_info["status"] = "completed"
         run_info["finished_at"] = datetime.utcnow().isoformat()
         run_info["page_count"] = len(pages)
@@ -1676,6 +1932,146 @@ async def get_notion_pipeline_pages(run_id: str):
 
     pages = notion_run_pages.get(run_id, [])
     return {"run_id": run_id, "pages": pages}
+
+
+@app.get("/api/notion/hierarchy")
+async def get_notion_hierarchy():
+    """Return Notion workspace name and page hierarchy from the local DB.
+
+    The hierarchy groups pages by their parent_id so the frontend can render an
+    accordion view of master pages and subpages. It is intentionally
+    independent from the in-memory pipeline state so that previously synced
+    pages are available every time the user opens the Pipelines tab.
+    """
+
+    preferred_workspace_id = Config.WORKSPACE_ID or "default-notion-workspace"
+
+    with db_manager.get_session() as session:
+        # Try configured workspace first, but gracefully fall back to any
+        # existing Notion workspace so older data (e.g. created before
+        # WORKSPACE_ID was set) still appears.
+        workspace = (
+            session.query(NotionWorkspace)
+            .filter_by(workspace_id=preferred_workspace_id)
+            .first()
+        )
+
+        if not workspace:
+            workspace = (
+                session.query(NotionWorkspace)
+                .order_by(NotionWorkspace.created_at.desc())
+                .first()
+            )
+
+        if workspace:
+            workspace_id = workspace.workspace_id
+            workspace_name = workspace.name or Config.WORKSPACE_NAME or "Notion Workspace"
+        else:
+            workspace_id = preferred_workspace_id
+            workspace_name = Config.WORKSPACE_NAME or "Notion Workspace"
+
+        db_pages = (
+            session.query(NotionPage)
+            .filter_by(workspace_id=workspace_id)
+            .order_by(NotionPage.last_edited_time.desc())
+            .all()
+        )
+
+        nodes: Dict[str, Dict[str, Any]] = {}
+        for p in db_pages:
+            nodes[p.page_id] = {
+                "id": p.page_id,
+                "title": p.title or "Untitled",
+                "url": p.url,
+                "last_edited_time": p.last_edited_time.isoformat() if p.last_edited_time else None,
+                "object_type": p.object_type,
+                "parent_id": p.parent_id,
+                # Simple properties summary for Gmail-like details panel
+                "properties": _summarize_notion_properties(p.raw_data),
+                "children": [],
+            }
+
+        roots: List[Dict[str, Any]] = []
+        for node in nodes.values():
+            parent_id = node.get("parent_id")
+            if parent_id and parent_id in nodes:
+                nodes[parent_id]["children"].append(node)
+            else:
+                roots.append(node)
+
+    return {
+        "workspace_id": workspace_id,
+        "workspace_name": workspace_name,
+        "pages": roots,
+    }
+
+
+@app.get("/api/notion/page-content")
+async def get_notion_page_content(page_id: str):
+    token = Config.NOTION_TOKEN
+    if not token:
+        raise HTTPException(
+            status_code=500,
+            detail="NOTION_TOKEN is not configured. Please set it in your environment.",
+        )
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+    }
+
+    all_blocks: List[Dict[str, Any]] = []
+    next_cursor: Optional[str] = None
+
+    try:
+        while True:
+            params: Dict[str, Any] = {"page_size": 50}
+            if next_cursor:
+                params["start_cursor"] = next_cursor
+
+            resp = requests.get(
+                f"https://api.notion.com/v1/blocks/{page_id}/children",
+                headers=headers,
+                params=params,
+                timeout=30,
+            )
+
+            if resp.status_code != 200:
+                logger.error(
+                    "Notion blocks API error %s: %s",
+                    resp.status_code,
+                    resp.text[:200],
+                )
+                raise HTTPException(
+                    status_code=resp.status_code,
+                    detail=f"Notion API error {resp.status_code}",
+                )
+
+            data = resp.json()
+            results = data.get("results", []) or []
+            all_blocks.extend(results)
+
+            if not data.get("has_more"):
+                break
+            next_cursor = data.get("next_cursor")
+            if not next_cursor:
+                break
+
+        text_lines, attachments = _summarize_notion_blocks(all_blocks)
+        content = "\n".join(text_lines)
+
+        return {
+            "page_id": page_id,
+            "content": content,
+            "attachments": attachments,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(f"Failed to fetch Notion page content: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to fetch Notion page content")
 
 
 # Startup event

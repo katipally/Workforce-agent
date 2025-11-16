@@ -371,6 +371,36 @@ Open your browser to: **http://localhost:5173**
 
 ---
 
+## 📊 Pipelines View (Slack, Gmail, Notion)
+
+Once the backend and frontend are running, you can explore structured data via the **Pipelines** tab in the UI:
+
+- **Where to find it:**
+  - Open the web app at `http://localhost:5173`.
+  - Switch from the chat view to the **Pipelines** view.
+  - Use the small source switcher in the bottom-left to toggle between **Slack**, **Gmail**, and **Notion** pipelines.
+
+- **Slack Pipeline:**
+  - Click **Run Slack Pipeline** to sync your Slack workspace (users, channels, messages, files) into PostgreSQL.
+  - Left panel shows channels with message counts and basic stats.
+  - Selecting a channel loads recent messages, grouped by thread with root messages and replies.
+
+- **Gmail Pipeline:**
+  - Choose a Gmail **label** from the dropdown (e.g. `INBOX`, `Datasaur`, etc.).
+  - Click **Run Gmail Pipeline** to incrementally sync new emails for that label into the database.
+  - The **Gmail Messages** panel shows an accordion list:
+    - Header: `from -> recipients · subject` with sent date.
+    - Body: full HTML or text content when expanded.
+
+- **Notion Pipeline:**
+  - Click **Run Notion Pipeline** to sync pages and databases visible to your integration using `NOTION_TOKEN`.
+  - The **Notion Pages** view shows your workspace name and a nested accordion of pages and subpages.
+  - Expanding a page shows:
+    - Page properties (Gmail-like info panel).
+    - Actual page content (text blocks) and any file/image/pdf/video attachments.
+
+---
+
 ## 💬 Example Queries
 
 Try these in the chat interface:
