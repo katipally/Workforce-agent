@@ -12,12 +12,14 @@ interface MessageListProps {
   messages: MessageType[]
   streamingMessage?: string
   isStreaming?: boolean
+  onSendMessage?: (content: string) => void
 }
 
 export default function MessageList({
   messages,
   streamingMessage,
   isStreaming,
+  onSendMessage,
 }: MessageListProps) {
   const { currentReasoningSteps } = useChatStore()
   
@@ -43,7 +45,11 @@ export default function MessageList({
     <ChatContainerRoot className="flex-1">
       <ChatContainerContent className="mx-auto w-full max-w-3xl space-y-12 px-4 py-12">
         {messages.map((message) => (
-          <MessageBubble key={message.id} message={message} />
+          <MessageBubble
+            key={message.id}
+            message={message}
+            onSendMessage={onSendMessage}
+          />
         ))}
         
         {streamingMessage && (
@@ -98,7 +104,13 @@ export default function MessageList({
   )
 }
 
-function MessageBubble({ message }: { message: MessageType }) {
+function MessageBubble({
+  message,
+  onSendMessage,
+}: {
+  message: MessageType
+  onSendMessage?: (content: string) => void
+}) {
   const isUser = message.role === 'user'
   const [showDetails, setShowDetails] = useState(false)
   const [feedback, setFeedback] = useState<'up' | 'down' | null>(null)
@@ -107,6 +119,9 @@ function MessageBubble({ message }: { message: MessageType }) {
   const reasoningSteps = message.reasoningSteps || []
   const thinkingSteps = reasoningSteps.filter((s) => !s.startsWith('Reasoning Summary'))
   const reasoningSummary = reasoningSteps.find((s) => s.startsWith('Reasoning Summary'))
+
+  const safetyGuardrailText = 'Safety guardrail: refusing to execute'
+  const hasSafetyGuardrail = !isUser && typeof message.content === 'string' && message.content.includes(safetyGuardrailText)
 
   const handleCopy = () => {
     if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
@@ -227,6 +242,24 @@ function MessageBubble({ message }: { message: MessageType }) {
               <ThumbsDown className={cn('h-3.5 w-3.5', feedback === 'down' && 'fill-current text-red-500')} />
             </MessageAction>
           </MessageActions>
+        )}
+
+        {!isUser && hasSafetyGuardrail && onSendMessage && (
+          <div className="mt-2 inline-flex flex-wrap items-center gap-2 rounded-md border border-yellow-300 bg-yellow-50 px-3 py-2 text-xs text-yellow-900">
+            <span className="font-semibold">Action requires confirmation.</span>
+            <button
+              type="button"
+              className="rounded bg-yellow-600 px-2 py-1 text-[11px] font-medium text-white hover:bg-yellow-700"
+              onClick={() =>
+                onSendMessage(
+                  'You have my explicit confirmation to proceed with the previously described action. '
+                  + 'Please call the same tool again with confirmed=true and then continue.'
+                )
+              }
+            >
+              Confirm action
+            </button>
+          </div>
         )}
       </div>
       

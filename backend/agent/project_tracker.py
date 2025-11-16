@@ -33,6 +33,7 @@ if str(core_path) not in sys.path:
 
 from utils.logger import get_logger
 from database.models import Message, Channel, User, GmailMessage
+from config import Config
 
 logger = get_logger(__name__)
 
@@ -100,7 +101,49 @@ class ProjectTracker:
             tools_handler: WorkforceTools instance with Slack, Gmail, Notion access
         """
         self.tools = tools_handler
+        self.project_registry = self._load_registry()
         logger.info("Project Tracker initialized")
+
+    def _load_registry(self) -> Dict[str, Any]:
+        """Load project registry from JSON file, if present.
+
+        Expected format (example):
+        {
+          "Q4 Dashboard": {
+            "slack_channels": ["engineering", "q4-dashboard"],
+            "gmail_domains": ["@company.com"],
+            "notion_page_id": "<notion-page-id>"
+          }
+        }
+        """
+        path = Config.PROJECT_REGISTRY_FILE
+        try:
+            if path.exists():
+                with path.open("r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    logger.info(f"Loaded project registry from {path}")
+                    return data
+            return {}
+        except Exception as e:
+            logger.warning(f"Failed to load project registry from {path}: {e}")
+            return {}
+
+    def _get_project_config(self, project_name: str) -> Optional[Dict[str, Any]]:
+        """Return configuration for a given project name, if any.
+
+        Matches keys in the registry case-insensitively.
+        """
+        if not self.project_registry:
+            return None
+        name_lower = project_name.lower()
+        for key, cfg in self.project_registry.items():
+            try:
+                if key.lower() == name_lower and isinstance(cfg, dict):
+                    return cfg
+            except Exception:
+                continue
+        return None
     
     def extract_keywords(self, project_name: str) -> List[str]:
         """Extract search keywords from project name.
@@ -183,7 +226,8 @@ class ProjectTracker:
     async def gather_gmail_updates(
         self,
         project_name: str,
-        days_back: int = 7
+        days_back: int = 7,
+        domains: Optional[List[str]] = None
     ) -> List[ProjectUpdate]:
         """Gather project updates from Gmail via structured DB queries."""
         logger.info(f"Gathering Gmail updates for '{project_name}' (last {days_back} days)")
@@ -208,6 +252,14 @@ class ProjectTracker:
 
                 if keyword_filters:
                     message_query = message_query.filter(or_(*keyword_filters))
+
+                # If project-specific domains are provided, scope to those
+                if domains:
+                    domain_filters = [
+                        GmailMessage.from_address.ilike(f"%{dom}%")
+                        for dom in domains
+                    ]
+                    message_query = message_query.filter(or_(*domain_filters))
 
                 for message in message_query.all():
                     updates.append(
@@ -404,11 +456,29 @@ class ProjectTracker:
             Comprehensive project status
         """
         logger.info(f"=== Tracking Project: {project_name} ===")
+
+        # Look up project-specific configuration (channels, domains, notion page)
+        project_cfg = self._get_project_config(project_name)
+        slack_channels: Optional[List[str]] = None
+        gmail_domains: Optional[List[str]] = None
+        effective_page_id: Optional[str] = notion_page_id
+
+        if project_cfg:
+            try:
+                if isinstance(project_cfg.get("slack_channels"), list):
+                    slack_channels = [str(ch) for ch in project_cfg.get("slack_channels", [])]
+                if isinstance(project_cfg.get("gmail_domains"), list):
+                    gmail_domains = [str(d) for d in project_cfg.get("gmail_domains", [])]
+                # notion_page_id argument, if provided, always wins over registry
+                if not effective_page_id and isinstance(project_cfg.get("notion_page_id"), str):
+                    effective_page_id = project_cfg.get("notion_page_id")
+            except Exception as cfg_err:
+                logger.warning(f"Error parsing project registry entry for '{project_name}': {cfg_err}")
         
-        # Gather updates from all sources
-        slack_updates = await self.gather_slack_updates(project_name, days_back)
-        gmail_updates = await self.gather_gmail_updates(project_name, days_back)
-        notion_updates = await self.gather_notion_updates(project_name, notion_page_id)
+        # Gather updates from all sources, scoped by registry if available
+        slack_updates = await self.gather_slack_updates(project_name, days_back, channels=slack_channels)
+        gmail_updates = await self.gather_gmail_updates(project_name, days_back, domains=gmail_domains)
+        notion_updates = await self.gather_notion_updates(project_name, effective_page_id)
         
         # Combine all updates
         all_updates = slack_updates + gmail_updates + notion_updates

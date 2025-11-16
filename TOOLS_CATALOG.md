@@ -198,39 +198,49 @@ AI calls: add_slack_reaction(channel="C01ABC", timestamp="1699123.456", emoji="t
 
 ---
 
-### **Advanced Features (Available in API)**
+### **Advanced Slack Tools (Implemented)**
 
-The following features are available via Slack API but not yet exposed as tools. They can be added:
+The following Slack features are now fully implemented as tools:
 
-#### 11. **upload_file** (Not yet implemented)
-Upload files to Slack channels
+#### 11. **upload_file_to_slack**
+Upload a file or text content to a Slack channel using Slack’s `files_upload_v2` API.
 
-#### 12. **schedule_message** (Not yet implemented)
-Schedule messages to be sent later
+#### 12. **create_slack_channel**
+Create a new public or private Slack channel.
 
-#### 13. **create_channel** (Not yet implemented)
-Create new Slack channels
+#### 13. **archive_slack_channel**
+Archive an existing Slack channel (with safety checks and confirmation guardrails in the AI layer).
 
-#### 14. **archive_channel** (Not yet implemented)
-Archive a channel
+#### 14. **invite_to_slack_channel**
+Invite one or more users (by user IDs) to a Slack channel.
 
-#### 15. **invite_user_to_channel** (Not yet implemented)
-Invite users to channels
+#### 15. **pin_slack_message / unpin_slack_message / get_pinned_messages**
+Pin, unpin, and list pinned messages in a channel.
 
-#### 16. **set_user_presence** (Not yet implemented)
-Set user's presence (away/active)
+#### 16. **update_slack_message**
+Edit an existing Slack message (with confirmation guardrails).
 
-#### 17. **add_bookmark** (Not yet implemented)
-Add bookmarks to channels
+#### 17. **delete_slack_message**
+Delete a Slack message (with confirmation guardrails).
 
-#### 18. **pin_message** (Not yet implemented)
-Pin important messages
+#### 18. **list_all_slack_users**
+List all non-bot users in the workspace with their emails and IDs.
 
-#### 19. **create_reminder** (Not yet implemented)
-Set reminders for users
+### **Planned Slack Features (Not yet implemented)**
 
-#### 20. **update_message** (Not yet implemented)
-Edit existing Slack messages
+These advanced Slack capabilities are still planned and not yet exposed as tools:
+
+#### 19. **schedule_message** (Planned)
+Schedule messages to be sent later.
+
+#### 20. **set_user_presence** (Planned)
+Set a user’s presence (away/active).
+
+#### 21. **add_bookmark** (Planned)
+Add bookmarks to channels.
+
+#### 22. **create_reminder** (Planned)
+Set reminders for users.
 
 ---
 

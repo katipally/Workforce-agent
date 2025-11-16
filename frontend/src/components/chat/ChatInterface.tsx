@@ -145,6 +145,7 @@ export default function ChatInterface() {
               messages={messages}
               streamingMessage={streamingMessage}
               isStreaming={isStreaming}
+              onSendMessage={(content: string) => handleSendMessage(content)}
             />
           )}
         </div>

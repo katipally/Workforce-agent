@@ -41,6 +41,7 @@ class Config:
     FILES_DIR = PROJECT_ROOT / os.getenv("FILES_DIR", "data/files")
     EXPORT_DIR = PROJECT_ROOT / os.getenv("EXPORT_DIR", "data/raw_exports")
     LOGS_DIR = PROJECT_ROOT / "logs"
+    PROJECT_REGISTRY_FILE = PROJECT_ROOT / os.getenv("PROJECT_REGISTRY_FILE", "data/project_registry.json")
     
     # Gmail credentials paths (relative to project root)
     GMAIL_CREDENTIALS_FILE = os.getenv("GMAIL_CREDENTIALS_FILE", "credentials/gmail_credentials.json")
@@ -49,6 +50,18 @@ class Config:
     # Notion credentials
     NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
     NOTION_PARENT_PAGE_ID = os.getenv("NOTION_PARENT_PAGE_ID", "")
+
+    # Safety & permissions configuration
+    SLACK_MODE = os.getenv("SLACK_MODE", "standard").lower()
+    SLACK_READONLY_CHANNELS = os.getenv("SLACK_READONLY_CHANNELS", "")
+    SLACK_BLOCKED_CHANNELS = os.getenv("SLACK_BLOCKED_CHANNELS", "")
+    NOTION_MODE = os.getenv("NOTION_MODE", "standard").lower()
+
+    # Gmail safety & scope
+    GMAIL_SEND_MODE = os.getenv("GMAIL_SEND_MODE", "confirm").lower()
+    GMAIL_ALLOWED_SEND_DOMAINS = os.getenv("GMAIL_ALLOWED_SEND_DOMAINS", "")
+    GMAIL_ALLOWED_READ_DOMAINS = os.getenv("GMAIL_ALLOWED_READ_DOMAINS", "")
+    GMAIL_DEFAULT_LABEL = os.getenv("GMAIL_DEFAULT_LABEL", "")
     
     # OpenAI API (for AI agent)
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")

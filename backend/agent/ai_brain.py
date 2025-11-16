@@ -1687,9 +1687,12 @@ class WorkforceAIBrain:
                     summary_kwargs = {
                         "model": self.model,
                         "messages": messages + [{"role": "user", "content": summary_prompt}],
-                        "max_tokens": 300,
                     }
-                    if not self.model.startswith("gpt-5"):
+                    # gpt-5 models use max_completion_tokens, older models use max_tokens
+                    if self.model.startswith("gpt-5"):
+                        summary_kwargs["max_completion_tokens"] = 300
+                    else:
+                        summary_kwargs["max_tokens"] = 300
                         summary_kwargs["temperature"] = 0.3
                     summary_response = await self.client.chat.completions.create(**summary_kwargs)
                     reasoning_summary = summary_response.choices[0].message.content
