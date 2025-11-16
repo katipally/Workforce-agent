@@ -36,6 +36,14 @@ class GmailExtractor:
         # Ensure authenticated
         if not self.client.service:
             self.client.authenticate()
+
+    def authenticate(self) -> bool:
+        """Authenticate the underlying Gmail client.
+        
+        Returns:
+            True if authentication successful
+        """
+        return self.client.authenticate()
     
     def extract_profile(self) -> Dict[str, Any]:
         """Extract and save Gmail profile/account info.
@@ -50,28 +58,27 @@ class GmailExtractor:
             logger.error("Failed to get profile")
             return {}
         
-        email_address = profile.get('emailAddress')
+        email_address = profile.get('emailAddress') or self.client.user_email
+        if not email_address:
+            logger.error("Profile missing email address")
+            return {}
+
         messages_total = profile.get('messagesTotal', 0)
         threads_total = profile.get('threadsTotal', 0)
         history_id = profile.get('historyId')
         
         # Save to database
         with self.db.get_session() as session:
-            account = session.query(GmailAccount).filter_by(email_address=email_address).first()
-            
+            account = session.query(GmailAccount).filter_by(email=email_address).first()
+
             if not account:
-                account = GmailAccount(
-                    email_address=email_address,
-                    messages_total=messages_total,
-                    threads_total=threads_total,
-                    history_id=history_id
-                )
+                account = GmailAccount(email=email_address)
                 session.add(account)
-            else:
-                account.messages_total = messages_total
-                account.threads_total = threads_total
-                account.history_id = history_id
-                account.updated_at = datetime.utcnow()
+
+            account.messages_total = messages_total
+            account.threads_total = threads_total
+            account.history_id = history_id
+            account.updated_at = datetime.utcnow()
             
             session.commit()
         
@@ -111,9 +118,6 @@ class GmailExtractor:
                 label.type = label_data.get('type')
                 label.message_list_visibility = label_data.get('messageListVisibility')
                 label.label_list_visibility = label_data.get('labelListVisibility')
-                label.messages_total = label_data.get('messagesTotal', 0)
-                label.messages_unread = label_data.get('messagesUnread', 0)
-                label.updated_at = datetime.utcnow()
             
             session.commit()
         
@@ -259,11 +263,11 @@ class GmailExtractor:
             if message_id:
                 attachments = session.query(GmailAttachment).filter_by(
                     message_id=message_id,
-                    is_downloaded=False
+                    downloaded=False
                 ).all()
             else:
                 attachments = session.query(GmailAttachment).filter_by(
-                    is_downloaded=False
+                    downloaded=False
                 ).all()
             
             for attachment in tqdm(attachments, desc="Downloading attachments"):
@@ -288,8 +292,7 @@ class GmailExtractor:
                     
                     # Update database
                     attachment.local_path = filepath
-                    attachment.is_downloaded = True
-                    attachment.updated_at = datetime.utcnow()
+                    attachment.downloaded = True
                     
                     downloaded += 1
             
@@ -320,28 +323,14 @@ class GmailExtractor:
         except:
             date = None
         
-        # Get internal date
-        internal_date_ms = message_data.get('internalDate')
-        internal_date = datetime.fromtimestamp(int(internal_date_ms) / 1000) if internal_date_ms else None
-        
         # Extract body
         body_plain, body_html = self._extract_body(message_data.get('payload', {}))
         
         # Parse labels
         label_ids = message_data.get('labelIds', [])
         
-        # Determine flags from labels
-        is_read = 'UNREAD' not in label_ids
-        is_starred = 'STARRED' in label_ids
-        is_important = 'IMPORTANT' in label_ids
-        is_sent = 'SENT' in label_ids
-        is_draft = 'DRAFT' in label_ids
-        is_trash = 'TRASH' in label_ids
-        is_spam = 'SPAM' in label_ids
-        
         # Get attachments info
         attachments = self._extract_attachments(message_data.get('payload', {}))
-        has_attachments = len(attachments) > 0
         
         with self.db.get_session() as session:
             # Ensure thread exists
@@ -369,28 +358,21 @@ class GmailExtractor:
             
             # Update fields
             msg.history_id = message_data.get('historyId')
-            msg.internal_date = internal_date
-            msg.size_estimate = message_data.get('sizeEstimate', 0)
             msg.subject = headers.get('subject', '')
-            msg.from_email = headers.get('from', '')
-            msg.to_email = headers.get('to', '')
-            msg.cc_email = headers.get('cc')
-            msg.bcc_email = headers.get('bcc')
-            msg.reply_to = headers.get('reply-to')
+            msg.from_address = headers.get('from', '')
+            msg.to_addresses = headers.get('to')
+            msg.cc_addresses = headers.get('cc')
+            msg.bcc_addresses = headers.get('bcc')
             msg.date = date
             msg.snippet = message_data.get('snippet', '')
-            msg.body_plain = body_plain
+            msg.body_text = body_plain
             msg.body_html = body_html
             msg.label_ids = label_ids
-            msg.is_read = is_read
-            msg.is_starred = is_starred
-            msg.is_important = is_important
-            msg.is_sent = is_sent
-            msg.is_draft = is_draft
-            msg.is_trash = is_trash
-            msg.is_spam = is_spam
-            msg.has_attachments = has_attachments
-            msg.attachment_count = len(attachments)
+            msg.is_unread = 'UNREAD' in label_ids
+            msg.is_starred = 'STARRED' in label_ids
+            msg.is_important = 'IMPORTANT' in label_ids
+            msg.is_sent = 'SENT' in label_ids
+            msg.is_draft = 'DRAFT' in label_ids
             msg.updated_at = datetime.utcnow()
             
             session.flush()
@@ -407,7 +389,7 @@ class GmailExtractor:
                         message_id=msg_id,
                         attachment_id=att_data['attachment_id'],
                         filename=att_data['filename'],
-                        mime_type=att_data['mime_type'],
+                        mimetype=att_data['mime_type'],
                         size=att_data['size']
                     )
                     session.add(att)
