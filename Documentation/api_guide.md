@@ -1,0 +1,836 @@
+# 🔧 API Setup Guide - Workforce AI Agent
+
+**Complete step-by-step guide for setting up Slack, Gmail, and Notion APIs.**
+
+This agent calls APIs **directly in real-time** - no database setup required first. Just add your API keys and start using it!
+
+---
+
+## 📋 Table of Contents
+
+1. [OpenAI API Setup](#openai-api-setup) ⚡ **Required**
+2. [Slack API Setup](#slack-api-setup) 🔵 **For Slack features**
+3. [Gmail API Setup](#gmail-api-setup) 📧 **For Gmail features**
+4. [Notion API Setup](#notion-api-setup) 📝 **For Notion features**
+5. [Quick Reference](#quick-reference)
+
+---
+
+## ⚡ OpenAI API Setup
+
+**Required for AI brain to work.**
+
+### Step 1: Get API Key
+
+1. **Create OpenAI Account**
+   - Go to https://platform.openai.com/
+   - Sign up or log in
+
+2. **Create API Key**
+   - Go to https://platform.openai.com/api-keys
+   - Click "Create new secret key"
+   - Name it "Workforce Agent"
+   - Click "Create"
+   - **Copy the key** (starts with `sk-`)
+   - ⚠️ **Save it now** - you won't see it again!
+
+3. **Add to .env**
+   ```bash
+   OPENAI_API_KEY=sk-your-key-here
+   ```
+
+### Pricing (Pay-as-you-go) - November 2025
+
+- **gpt-5-nano** (Recommended): lightweight reasoning model optimized for cost and speed
+- Other gpt-5 family models (if enabled): higher quality at higher cost
+- **Typical query cost**: low fractions of a cent per query; see OpenAI pricing page for latest numbers
+- **Free tier**: OpenAI may offer starter credits for new accounts
+
+**Estimated monthly cost for normal use:** a few dollars/month with gpt-5-nano (depends on your usage and OpenAI pricing)
+
+---
+
+---
+
+## Slack API Setup
+
+### Prerequisites
+- Slack workspace with admin access
+- Ability to install apps in your workspace
+
+### Step 1: Create Slack App
+
+1. **Go to Slack API Portal**
+   - Visit: https://api.slack.com/apps
+   - Sign in with your Slack workspace credentials
+
+2. **Create New App**
+   - Click **"Create New App"**
+   - Select **"From scratch"**
+   - **App Name**: Enter a name (e.g., "Workforce Agent")
+   - **Pick a workspace**: Select your workspace
+   - Click **"Create App"**
+
+### Step 2: Configure OAuth Scopes
+
+OAuth scopes define what your app can do. We need comprehensive access.
+
+1. **Navigate to OAuth & Permissions**
+   - Left sidebar → **"OAuth & Permissions"**
+
+2. **Add Bot Token Scopes**
+   Scroll to **"Scopes"** → **"Bot Token Scopes"** → Click **"Add an OAuth Scope"**
+   
+   Add these scopes:
+   
+   **User & Team Info:**
+   - `users:read` - View users in workspace
+   - `users:read.email` - View email addresses
+   - `team:read` - View workspace name and domain
+   
+   **Channels:**
+   - `channels:read` - View public channels
+   - `channels:history` - View messages in public channels
+   - `channels:manage` - Manage public channels
+   - `groups:read` - View private channels
+   - `groups:history` - View messages in private channels
+   - `im:read` - View direct messages
+   - `im:history` - View DM message history
+   - `mpim:read` - View group DMs
+   - `mpim:history` - View group DM history
+   
+   **Messages:**
+   - `chat:write` - Send messages
+   - `chat:write.public` - Send messages to public channels (without joining)
+   - `chat:write.customize` - Customize message appearance (optional)
+   
+   **Files:**
+   - `files:read` - View files
+   - `files:write` - Upload files
+   
+   **Reactions:**
+   - `reactions:read` - View reactions
+   - `reactions:write` - Add/remove reactions
+   
+   **Pins (NEW - Nov 2025):**
+   - `pins:read` - View pinned messages
+   - `pins:write` - Pin/unpin messages
+   
+   **Channel Management (NEW - Nov 2025):**
+   - `channels:join` - Join public channels
+   - `channels:write` - Create and rename public channels
+   - `groups:write` - Manage private channels
+   
+   **Bookmarks (Optional - Nov 2025):**
+   - `bookmarks:read` - View channel bookmarks
+   - `bookmarks:write` - Create/edit bookmarks
+   
+   **Reminders (Optional - Nov 2025):**
+   - `reminders:read` - View reminders
+   - `reminders:write` - Create reminders
+
+3. **Save Changes**
+
+### Step 3: Enable Socket Mode
+
+Socket Mode allows real-time event streaming.
+
+1. **Navigate to Socket Mode**
+   - Left sidebar → **"Socket Mode"**
+
+2. **Enable Socket Mode**
+   - Toggle **"Enable Socket Mode"** to ON
+   - Click **"Generate"** when prompted for app-level token
+   - **Token Name**: "Socket Mode Token"
+   - Click **"Generate"**
+   - **IMPORTANT**: Copy the token (starts with `xapp-`)
+   - Store it as `SLACK_APP_TOKEN` in your `.env`
+
+### Step 4: Subscribe to Events
+
+1. **Navigate to Event Subscriptions**
+   - Left sidebar → **"Event Subscriptions"**
+
+2. **Enable Events**
+   - Toggle **"Enable Events"** to ON
+
+3. **Subscribe to Bot Events**
+   Scroll to **"Subscribe to bot events"** → Click **"Add Bot User Event"**
+   
+   Add these events:
+   - `message.channels` - Messages in public channels
+   - `message.groups` - Messages in private channels
+   - `message.im` - Direct messages
+   - `message.mpim` - Group DMs
+   - `reaction_added` - Reactions added
+   - `reaction_removed` - Reactions removed
+   - `file_shared` - Files shared
+   - `member_joined_channel` - User joins channel
+   - `member_left_channel` - User leaves channel
+
+4. **Save Changes**
+   - Click **"Save Changes"** at bottom
+
+### Step 5: Install App to Workspace
+
+1. **Navigate to Install App**
+   - Left sidebar → **"Install App"**
+
+2. **Install to Workspace**
+   - Click **"Install to Workspace"**
+   - Review permissions
+   - Click **"Allow"**
+
+3. **Copy Bot Token**
+   - After installation, you'll see **"Bot User OAuth Token"**
+   - Starts with `xoxb-`
+   - **IMPORTANT**: Copy this token
+   - Store it as `SLACK_BOT_TOKEN` in your `.env`
+
+### Step 6: Get Additional App Credentials
+
+1. **Navigate to Basic Information**
+   - Left sidebar → **"Basic Information"**
+
+2. **Copy App Credentials**
+   - **App ID**: Copy and store as `SLACK_APP_ID`
+   - Scroll to **"App Credentials"**
+   - **Client ID**: Store as `SLACK_CLIENT_ID`
+   - **Client Secret**: Click "Show" → Copy → Store as `SLACK_CLIENT_SECRET`
+   - **Signing Secret**: Click "Show" → Copy → Store as `SLACK_SIGNING_SECRET`
+   - **Verification Token**: Copy → Store as `SLACK_VERIFICATION_TOKEN`
+
+### Step 7: Configure Environment Variables
+
+Add to `.env` file in project root:
+```bash
+# Slack API Tokens (Required for Slack features)
+SLACK_BOT_TOKEN=xoxb-your-bot-token-here
+SLACK_APP_TOKEN=xapp-your-app-token-here
+```
+
+**That's it!** You don't need the other credentials unless building advanced features.
+
+### Step 8: Test Connection
+
+**Start the agent** and try this query in the web interface:
+
+```
+"Get all slack channel names"
+```
+
+You should see your actual channels listed!
+
+**Or test via CLI:**
+```bash
+cd backend
+python3 << 'EOF'
+from agent.langchain_tools import WorkforceTools
+tools = WorkforceTools()
+print(tools.get_all_slack_channels())
+EOF
+```
+
+Expected output:
+```
+Found 4 Slack channels:
+  #general - 🌐 Public - 5 members (ID: C123...)
+  #random - 🌐 Public - 3 members (ID: C456...)
+  ...
+```
+
+### Slack API Rate Limits
+
+- **Tier 1** (most methods): 1 request/minute
+- **Tier 2**: 20 requests/minute
+- **Tier 3**: 50 requests/minute
+- **Tier 4** (lists): 100 requests/minute
+
+The agent automatically handles rate limiting with exponential backoff.
+
+---
+
+## Notion API Setup
+
+### Prerequisites
+- Notion account (free or paid)
+- Notion workspace
+
+### Step 1: Create Notion Integration
+
+1. **Go to Notion Integrations**
+   - Visit: https://www.notion.so/my-integrations
+   - Sign in to your Notion account
+
+2. **Create New Integration**
+   - Click **"+ New integration"**
+   - **Name**: "Workspace Agent" (or any name)
+   - **Associated workspace**: Select your workspace
+   - **Type**: Leave as "Internal integration"
+   - Click **"Submit"**
+
+3. **Copy Integration Token**
+   - After creation, you'll see **"Internal Integration Token"**
+   - Starts with `secret_` or `ntn_`
+   - Click **"Show"** → **"Copy"**
+   - Store it as `NOTION_TOKEN` in your `.env`
+
+### Step 2: Get Parent Page ID
+
+The parent page is where exported data will be created as child pages.
+
+1. **Open Notion**
+   - Go to your Notion workspace
+   - Create or open a page where you want exports
+
+2. **Copy Page URL**
+   - Click **"Share"** → **"Copy link"**
+   - URL looks like: `https://www.notion.so/Page-Name-abc123def456...`
+
+3. **Extract Page ID**
+   - The page ID is the part after the last dash
+   - Example: `https://www.notion.so/My-Page-1234567890abcdef1234567890abcdef`
+   - Page ID: `1234567890abcdef1234567890abcdef`
+   
+   **OR if URL has dashes in ID:**
+   - Example: `https://www.notion.so/My-Page-12345678-90ab-cdef-1234-567890abcdef`
+   - Page ID: `1234567890abcdef1234567890abcdef` (without dashes)
+   - Or use the full ID with dashes, the code normalizes it
+
+4. **Store Page ID**
+   - Copy the ID
+   - Store it as `NOTION_PARENT_PAGE_ID` in your `.env`
+
+### Step 3: Share Page with Integration
+
+This step is CRITICAL - without it, the integration cannot access the page.
+
+1. **Open the Parent Page in Notion**
+
+2. **Share with Integration**
+   - Click **"•••"** (three dots) menu at top right
+   - Hover over **"Connections"**
+   - Click **"Add connections"**
+   - Search for your integration name (e.g., "Workspace Agent")
+   - Click on it to add
+
+3. **Verify Connection**
+   - You should see your integration listed under connections
+   - Icon appears at top of page
+
+### Step 4: Configure Environment Variables
+
+Add to `.env`:
+```bash
+# Notion API (Optional - for Notion features)
+NOTION_TOKEN=secret_your-notion-token-here
+NOTION_PARENT_PAGE_ID=your-parent-page-id-here
+```
+
+### Step 5: Test Connection
+
+**Start the agent** and try this query:
+
+```
+"Create a Notion page titled Test Page"
+```
+
+You should see a new page in your Notion workspace!
+
+**Or test via CLI:**
+```bash
+cd backend
+python3 << 'EOF'
+from agent.langchain_tools import WorkforceTools
+tools = WorkforceTools()
+print(tools.create_notion_page("Test Page", "This is a test"))
+EOF
+```
+
+### Notion API Rate Limits
+
+- **Rate limit**: 3 requests per second per integration
+- **Burst allowance**: Short bursts are allowed
+- **Block limit**: Maximum 100 blocks per request
+
+The agent automatically handles these limits.
+
+---
+
+## Gmail API Setup
+
+### Prerequisites
+- Google account with Gmail
+- Access to Google Cloud Console
+
+### Step 1: Create Google Cloud Project
+
+1. **Go to Google Cloud Console**
+   - Visit: https://console.cloud.google.com/
+   - Sign in with your Google account
+
+2. **Create New Project**
+   - Click project dropdown at top (says "Select a project")
+   - Click **"NEW PROJECT"**
+   - **Project name**: "Gmail Extractor" (or any name)
+   - **Organization**: Leave as "No organization" (unless you have one)
+   - Click **"CREATE"**
+   - Wait ~10 seconds for project creation
+
+3. **Select Your Project**
+   - Ensure your new project is selected in the dropdown
+
+### Step 2: Enable Gmail API
+
+1. **Open API Library**
+   - Left sidebar → **"APIs & Services"** → **"Library"**
+
+2. **Search for Gmail API**
+   - In search box, type: "Gmail API"
+   - Click on **"Gmail API"** in results
+
+3. **Enable the API**
+   - Click blue **"ENABLE"** button
+   - Wait for confirmation (few seconds)
+
+### Step 3: Configure OAuth Consent Screen
+
+Before creating credentials, you must configure the consent screen.
+
+1. **Navigate to OAuth Consent Screen**
+   - Left sidebar → **"APIs & Services"** → **"OAuth consent screen"**
+
+2. **Choose User Type**
+   - Select **"External"** (unless you have Google Workspace)
+   - Click **"CREATE"**
+
+3. **Fill App Information (Page 1)**
+   - **App name**: `Gmail Extractor` (or your preferred name)
+   - **User support email**: Select your email from dropdown
+   - **App logo**: Skip (optional)
+   - **App domain**: Skip (optional)
+   - **Authorized domains**: Skip
+   - **Developer contact information**: Enter your email address
+   - Click **"SAVE AND CONTINUE"**
+
+4. **Scopes (Page 2)**
+   - Click **"SAVE AND CONTINUE"** (don't add scopes here, we'll specify in code)
+
+5. **Test Users (Page 3)**
+   - Click **"+ ADD USERS"**
+   - Enter your Gmail address (the one you want to access)
+   - Click **"ADD"**
+   - Click **"SAVE AND CONTINUE"**
+
+6. **Summary (Page 4)**
+   - Review your settings
+   - Click **"BACK TO DASHBOARD"**
+
+### Step 4: Create OAuth 2.0 Credentials
+
+1. **Navigate to Credentials**
+   - Left sidebar → **"APIs & Services"** → **"Credentials"**
+
+2. **Create Credentials**
+   - Click **"+ CREATE CREDENTIALS"** at top
+   - Select **"OAuth client ID"**
+
+3. **Configure OAuth Client**
+   - **Application type**: Select **"Desktop app"**
+   - **Name**: `Gmail Desktop Client` (or any name)
+   - Click **"CREATE"**
+
+4. **Download Credentials**
+   - A popup appears: "OAuth client created"
+   - Click **"DOWNLOAD JSON"** button (or download icon)
+   - Save the file
+
+5. **Rename and Move File**
+   - Rename downloaded file to: `credentials.json`
+   - Move it to your project root directory:
+   ```
+   Workforce-agent/
+   ├── credentials.json  ← Place here
+   ├── gmail/
+   ├── main.py
+   └── ...
+   ```
+
+### Step 5: Configure Environment Variables
+
+Add to `.env`:
+```bash
+# Gmail API (Optional - for Gmail features)
+GMAIL_CREDENTIALS_FILE=credentials/gmail_credentials.json
+GMAIL_TOKEN_FILE=data/gmail_token.pickle
+```
+
+**Note:** Place `credentials.json` in `backend/core/credentials/gmail/` folder (create folders if needed).
+
+### Step 6: First-Time Authentication
+
+This triggers the OAuth flow and saves your token.
+
+```bash
+python test_gmail.py
+```
+
+**What happens:**
+1. A browser window opens automatically
+2. Google asks you to sign in (if not already signed in)
+3. You see a warning: **"Google hasn't verified this app"**
+   - This is NORMAL for apps in testing mode
+   - Click **"Advanced"**
+   - Click **"Go to Gmail Extractor (unsafe)"**
+4. Google shows permissions request:
+   - "Read, compose, send, and permanently delete all your email from Gmail"
+   - Click **"Continue"** or **"Allow"**
+5. Browser shows: "The authentication flow has completed. You may close this window."
+6. Token saved to `data/gmail_token.pickle`
+
+**IMPORTANT**: You only do this OAuth flow ONCE. The token is saved and automatically refreshed.
+
+### Gmail API Capabilities (November 2025 Update)
+
+With the configured Gmail API, the agent can now:
+
+**✅ Full Email Access:**
+- Get complete email bodies (not just snippets)
+- Access all email metadata (from, to, subject, date)
+- Read attachments information
+
+**✅ Advanced Search:**
+- Use ALL Gmail search operators:
+  - `from:email@example.com` - Sender filter
+  - `to:email@example.com` - Recipient filter
+  - `subject:keyword` - Subject search
+  - `has:attachment` - Emails with attachments
+  - `is:unread` / `is:starred` / `is:important` - Status filters
+  - `label:labelname` - Label filter
+  - `after:2024/11/01` / `before:2024/11/30` - Date range
+  - `filename:pdf` - Attachment type
+  - `larger:5M` / `smaller:1M` - Size filters
+
+**✅ Email Management:**
+- Get exact unread count
+- Mark emails as read/unread
+- Archive emails
+- Add/remove labels
+- Access complete threads
+
+### Step 7: Test Connection
+
+**Start the agent** and try these queries:
+
+```
+"Get emails from your-email@gmail.com"
+```
+
+You should see your recent emails!
+
+**Or test via CLI:**
+```bash
+cd backend
+python3 << 'EOF'
+from agent.langchain_tools import WorkforceTools
+tools = WorkforceTools()
+print(tools.get_emails_from_sender("your-email@gmail.com", limit=5))
+EOF
+```
+
+### Gmail API Quota Limits (Free Tier)
+
+**Daily Limits:**
+- **1 billion quota units per day** (project-wide)
+- **250 units per second** (per user)
+
+**Quota Costs per Operation:**
+- `messages.list`: 5 units
+- `messages.get`: 5 units
+- `messages.attachments.get`: 5 units
+- `threads.list`: 5 units
+- `threads.get`: 5 units
+- `labels.list`: 1 unit
+- `users.getProfile`: 1 unit
+
+**Real-World Examples:**
+- Extract 100 emails: 500 units (0.00005% of daily limit)
+- Extract 1,000 emails: 5,000 units
+- Extract 10,000 emails: 50,000 units
+- **Maximum per day**: ~200,000 emails
+
+**Best Practices:**
+- Start with small extractions (50-100 emails)
+- Use Gmail search queries to filter
+- Exclude spam/trash (saves quota)
+- Monitor usage in Google Cloud Console
+
+### Monitoring API Usage
+
+1. **Go to Google Cloud Console**
+   - Visit: https://console.cloud.google.com/
+
+2. **View API Usage**
+   - Left sidebar → **"APIs & Services"** → **"Dashboard"**
+   - Select your project
+   - View quota usage graphs
+
+---
+
+## 📋 Quick Reference
+
+### Required Environment Variables
+
+| Variable | Required | Format | Where to Get |
+|----------|----------|--------|--------------|
+| `OPENAI_API_KEY` | ✅ **YES** | `sk-...` | https://platform.openai.com/api-keys |
+| `SLACK_BOT_TOKEN` | For Slack | `xoxb-...` | Slack App → Install App |
+| `SLACK_APP_TOKEN` | For Slack | `xapp-...` | Slack App → Socket Mode |
+| `GMAIL_CREDENTIALS_FILE` | For Gmail | Path to JSON | Google Cloud Console |
+| `GMAIL_TOKEN_FILE` | For Gmail | Path to pickle | Auto-generated after OAuth |
+| `NOTION_TOKEN` | For Notion | `secret_...` | Notion → My Integrations |
+| `NOTION_PARENT_PAGE_ID` | For Notion | Page ID | Notion page URL |
+| `DATABASE_URL` | Optional | postgres://... | PostgreSQL connection |
+| `SLACK_MODE` | Optional | `read_only` \| `standard` \| `admin` | Safety mode for Slack tools |
+| `SLACK_READONLY_CHANNELS` | Optional | `channel-a,channel-b` | Comma-separated Slack channels/IDs to treat as read-only |
+| `SLACK_BLOCKED_CHANNELS` | Optional | `channel-a,channel-b` | Comma-separated Slack channels/IDs to fully block |
+| `GMAIL_SEND_MODE` | Optional | `draft` \| `confirm` \| `auto_limited` | Safe-send behavior for Gmail tools |
+| `GMAIL_ALLOWED_SEND_DOMAINS` | Optional | `@company.com,@partner.com` | Limit sending to specific domains |
+| `GMAIL_ALLOWED_READ_DOMAINS` | Optional | `@company.com` | Limit Gmail search/reads to specific domains |
+| `GMAIL_DEFAULT_LABEL` | Optional | `Work/Projects` | Default Gmail label for advanced searches |
+| `NOTION_MODE` | Optional | `standard` \| `read_only` | Control whether Notion tools can write |
+
+### Complete .env Template
+
+```bash
+# Required
+OPENAI_API_KEY=sk-your-key-here
+
+# Slack (Optional - for Slack features)
+SLACK_BOT_TOKEN=xoxb-your-bot-token
+SLACK_APP_TOKEN=xapp-your-app-token
+
+# Gmail (Optional - for Gmail features)
+GMAIL_CREDENTIALS_FILE=credentials/gmail_credentials.json
+GMAIL_TOKEN_FILE=data/gmail_token.pickle
+
+# Notion (Optional - for Notion features)
+NOTION_TOKEN=secret_your-token
+NOTION_PARENT_PAGE_ID=your-page-id
+
+# Safety & permissions (Optional)
+# Slack modes: read_only, standard, admin
+SLACK_MODE=standard
+SLACK_READONLY_CHANNELS=
+SLACK_BLOCKED_CHANNELS=
+
+# Gmail safe-send modes: draft, confirm, auto_limited
+GMAIL_SEND_MODE=confirm
+GMAIL_ALLOWED_SEND_DOMAINS=
+GMAIL_ALLOWED_READ_DOMAINS=
+GMAIL_DEFAULT_LABEL=
+
+# Notion safety mode: standard or read_only
+NOTION_MODE=standard
+
+# Database (Optional - auto-caching)
+DATABASE_URL=postgresql://localhost:5432/workforce_agent
+
+### Setup Summary
+
+**OpenAI (Required):**
+1. Go to https://platform.openai.com/api-keys
+2. Create new secret key
+3. Copy key → Add to `.env`
+
+**Slack (Optional):**
+1. Create app at https://api.slack.com/apps
+2. Add OAuth scopes (`channels:read`, `channels:history`, `chat:write`, `users:read`)
+3. Enable Socket Mode → Get `xapp-` token
+4. Install app → Get `xoxb-` token
+5. Add both to `.env`
+
+**Gmail (Optional):**
+1. Create project at https://console.cloud.google.com/
+2. Enable Gmail API
+3. Create OAuth credentials (Desktop app)
+4. Download `credentials.json` → Place in `backend/core/credentials/gmail/`
+5. First query triggers OAuth flow
+
+**Notion (Optional):**
+1. Create integration at https://www.notion.so/my-integrations
+2. Copy token → Add to `.env`
+3. Get page ID from URL → Add to `.env`
+4. Share page with integration
+
+### Testing
+
+**Start the agent:**
+```bash
+./START_SERVERS.sh        # Mac/Linux
+# Or manually start backend + frontend (see README.md)
+```
+
+**Open browser:** http://localhost:5173
+
+**Try queries:**
+```
+"Get all slack channel names"
+"Get emails from john@example.com"
+"Create a Notion page titled Test"
+```
+
+### Common Issues
+
+**Slack:**
+- ❌ `invalid_auth`: Check bot token starts with `xoxb-`
+- ❌ `missing_scope`: Add required OAuth scope in Slack app settings
+- ❌ Socket Mode error: Ensure app token starts with `xapp-`
+
+**Notion:**
+- ❌ `unauthorized`: Page not shared with integration
+- ❌ `validation_error`: Invalid page ID format
+- ❌ `object_not_found`: Page ID doesn't exist or no access
+
+**Gmail:**
+- ❌ `credentials.json not found`: Download from Google Cloud Console
+- ❌ OAuth warning: Normal for testing - click "Advanced" → "Go to app"
+- ❌ `insufficient_permissions`: Re-run OAuth flow
+- ❌ `quota_exceeded`: Check usage in Google Cloud Console
+
+### Security Best Practices
+
+1. **Never commit secrets to git**
+   - Add `.env` to `.gitignore`
+   - Add `credentials.json` to `.gitignore`
+   - Add `*.pickle` to `.gitignore`
+
+2. **Token storage**
+   - Store tokens in `.env` file only
+   - Use environment variables in production
+   - Rotate tokens periodically
+
+3. **Access control**
+   - Use minimum required scopes
+   - Test with personal workspace first
+   - Review app permissions regularly
+
+4. **Monitoring**
+   - Check API usage regularly
+   - Set up quota alerts in Google Cloud
+   - Monitor Slack app activity
+
+---
+
+## Support & Resources
+
+### Official Documentation
+
+**Slack:**
+- API Docs: https://api.slack.com/
+- Scopes: https://api.slack.com/scopes
+- Rate Limits: https://api.slack.com/docs/rate-limits
+
+**Notion:**
+- API Docs: https://developers.notion.com/
+- Integration Guide: https://www.notion.so/help/create-integrations-with-the-notion-api
+
+**Gmail:**
+- API Docs: https://developers.google.com/gmail/api
+- Quotas: https://developers.google.com/gmail/api/reference/quota
+- Python Quickstart: https://developers.google.com/gmail/api/quickstart/python
+
+### Troubleshooting
+
+If you encounter issues:
+
+1. **Check logs**: `logs/slack_agent.log`
+2. **Verify tokens**: Run test commands
+3. **Review documentation**: See links above
+4. **Check API status**: Visit status pages
+5. **Re-run OAuth**: Delete tokens and re-authenticate
+
+---
+
+## 🆕 November 2025 API Updates
+
+### Slack API Changes
+
+**Important Rate Limit Updates (May 29, 2025)**
+- `conversations.history` and `conversations.replies` now limited to **1 request/min** for non-Marketplace apps
+- Apps created before May 29, 2025 maintain existing rate limits
+- Marketplace apps unaffected
+- **Action Required**: If building for distribution, consider Marketplace listing
+
+**File Upload Deprecation (March 11, 2025 deadline)**
+- `files.upload` API method is **deprecated**
+- Must migrate to **new asynchronous upload flow** before March 11, 2025
+- Current implementation uses old method - update recommended
+- See: https://api.slack.com/methods/files.upload
+
+**API Terms of Service Updates (June 30, 2025)**
+- Data usage restrictions strengthened
+- Commercial distribution must use Slack Marketplace
+- Discovery API and Data Access API have specific usage guidelines
+
+**Slack CLI is now Open Source**
+- Available on GitHub for community contributions
+- Enhanced for Bolt framework support
+
+### Gmail API Changes
+
+**New Features (September 2025)**
+- **Deal Cards in Promotions Tab**: Use annotations to create Deal Cards
+- See: https://developers.google.com/workspace/gmail/promotab/overview
+
+**Smart Cards for CSE (May 2025)**
+- Hardware key encryption support for Client-Side Encryption
+- `CseIdentity` and `CseKeyPair` resources for Google Workspace with hardware keys
+- Only applicable for organizations using CSE
+
+**Performance Improvements**
+- `messages.import` method uses faster backend implementation
+- Supports parallel import calls for higher migration throughput
+- Quota cost decreased to reflect improved performance
+
+### Notion API Changes
+
+**Major Update: Multi-Source Databases (September 3, 2025)**
+- **API Version 2025-09-03** separates "databases" (containers) from "data sources" (tables)
+- Existing single-source databases continue working
+- Update to new API version to support multi-source databases
+- **Webhook versioning** introduced
+- See: https://developers.notion.com/docs/upgrade-guide-2025-09-03
+
+**SDK v5.1.0 (September 13, 2025)**
+- `is_locked` parameter support for pages and databases
+- `dataSource.update` can change parent database
+- `request_id` added to client log lines
+- Not compatible with API versions older than 2025-09-03
+
+**Developer Terms Updated (December 2024)**
+- Section 1.1: Refined scope of application
+- Section 3.1: Clarified prohibited uses
+- New Section 3.2 created for formatting
+
+### Required Actions
+
+#### Slack
+1. ✅ **Immediate**: Review rate limiting in code (already configured for 1 req/min)
+2. ⚠️ **Before March 11, 2025**: Migrate to new file upload API
+3. ✅ **Optional**: Apply for Marketplace listing if distributing commercially
+
+#### Gmail  
+1. ✅ **No Action Required**: Current implementation compatible
+2. ℹ️ **Optional**: Explore Deal Cards if using Promotions tab
+3. ℹ️ **Optional**: Utilize parallel `messages.import` for bulk operations
+
+#### Notion
+1. ✅ **No Action Required**: Single-source databases still work
+2. ℹ️ **Optional**: Upgrade to API version 2025-09-03 for multi-source support
+3. ℹ️ **Optional**: Update to SDK v5.1.0 for latest features
+
+---
+
+**Last Updated**: November 9, 2025
+**Version**: 2.0 (PostgreSQL + 2025 API Updates)
