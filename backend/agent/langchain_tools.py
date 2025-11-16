@@ -2187,46 +2187,81 @@ Subject: {subject}
         
         Args:
             query: Search query
-            
+        
         Returns:
             Matching pages and databases
         """
         try:
             import requests
             
+            payload: Dict[str, Any] = {
+                "page_size": 50,
+                # No filter here so we see both pages and databases that are
+                # shared with the integration across the workspace.
+                "sort": {"direction": "descending", "timestamp": "last_edited_time"},
+            }
+
+            if query:
+                payload["query"] = query
+
             response = requests.post(
                 "https://api.notion.com/v1/search",
                 headers={
                     "Authorization": f"Bearer {Config.NOTION_TOKEN}",
                     "Notion-Version": "2022-06-28",
-                    "Content-Type": "application/json"
+                    "Content-Type": "application/json",
                 },
-                json={
-                    "query": query,
-                    "filter": {"property": "object", "value": "page"},
-                    "sort": {"direction": "descending", "timestamp": "last_edited_time"}
-                }
+                json=payload,
             )
-            
+
             if response.status_code != 200:
                 return f"❌ Error {response.status_code}"
             
-            results = response.json().get('results', [])
-            
+            raw_results = response.json().get("results", []) or []
+
+            # Only keep actual pages and databases
+            results = [r for r in raw_results if r.get("object") in ("page", "database")]
+
             if not results:
-                return f"No Notion pages found matching '{query}'"
-            
-            pages = []
-            for page in results[:10]:
-                title = "Untitled"
-                if 'properties' in page:
-                    title_prop = page['properties'].get('title', {}) or page['properties'].get('Name', {})
-                    if 'title' in title_prop and title_prop['title']:
-                        title = title_prop['title'][0]['plain_text']
-                
-                pages.append(f"📄 {title} (ID: {page['id']})")
-            
-            return f"🔍 Found {len(results)} pages:\n" + "\n".join(pages)
+                return f"No Notion pages or databases found matching '{query}'"
+
+            def _title_from_result(obj: Dict[str, Any]) -> str:
+                # Try title property first (works for most pages/databases)
+                properties = obj.get("properties", {}) or {}
+                for prop in properties.values():
+                    if prop.get("type") == "title":
+                        title_parts = prop.get("title", []) or []
+                        texts: List[str] = []
+                        for part in title_parts:
+                            text_obj = part.get("plain_text") or part.get("text", {}).get("content")
+                            if text_obj:
+                                texts.append(text_obj)
+                        if texts:
+                            return "".join(texts)
+
+                # Fallback for database objects which expose their title at the top level
+                top_title = obj.get("title")
+                if isinstance(top_title, list):
+                    texts: List[str] = []
+                    for part in top_title:
+                        if not isinstance(part, dict):
+                            continue
+                        text_obj = part.get("plain_text") or part.get("text", {}).get("content")
+                        if text_obj:
+                            texts.append(text_obj)
+                    if texts:
+                        return "".join(texts)
+
+                return "Untitled"
+
+            lines = []
+            for item in results[:10]:
+                title = _title_from_result(item)
+                obj_type = item.get("object")
+                emoji = "📄" if obj_type == "page" else "📚"  # simple hint for databases
+                lines.append(f"{emoji} {title} (ID: {item.get('id')})")
+
+            return f"🔍 Found {len(results)} items:\n" + "\n".join(lines)
         except Exception as e:
             logger.error(f"Error searching Notion: {e}")
             return f"❌ Error: {str(e)}"

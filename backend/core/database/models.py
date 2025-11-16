@@ -256,6 +256,63 @@ class SyncStatus(Base):
 
 
 # ============================================================================
+# Notion Models
+# ============================================================================
+
+class NotionWorkspace(Base):
+    """Notion workspace."""
+    __tablename__ = "notion_workspaces"
+    
+    workspace_id = Column(String(50), primary_key=True)
+    name = Column(String(255))
+    icon = Column(JSON)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    pages = relationship("NotionPage", back_populates="workspace", cascade="all, delete-orphan")
+    
+    __table_args__ = (
+        Index("idx_notion_workspace_name", "name"),
+    )
+
+
+class NotionPage(Base):
+    """Notion page."""
+    __tablename__ = "notion_pages"
+    
+    page_id = Column(String(50), primary_key=True)
+    workspace_id = Column(String(50), ForeignKey("notion_workspaces.workspace_id"), nullable=False)
+    # Parent page/database/workspace ID; may refer to objects not stored locally,
+    # so we deliberately avoid a foreign key constraint here.
+    parent_id = Column(String(50))
+
+    # Type: 'page' or 'database'
+    object_type = Column(String(20))
+
+    # Display metadata
+    title = Column(String(255))
+    icon = Column(JSON)
+    url = Column(String(500))
+    last_edited_time = Column(DateTime)
+
+    # Raw payload for future enrichment
+    raw_data = Column(JSON)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    workspace = relationship("NotionWorkspace", back_populates="pages")
+    
+    __table_args__ = (
+        Index("idx_notion_page_workspace", "workspace_id"),
+        Index("idx_notion_page_parent", "parent_id"),
+        Index("idx_notion_page_last_edited", "last_edited_time"),
+    )
+
+
+# ============================================================================
 # Gmail Models
 # ============================================================================
 

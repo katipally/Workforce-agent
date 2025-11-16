@@ -38,6 +38,9 @@ interface GmailMessage {
   id: string
   thread_id?: string
   from?: string
+  to?: string | null
+  cc?: string | null
+  bcc?: string | null
   subject?: string
   date?: string | null
   snippet?: string
@@ -49,7 +52,18 @@ interface NotionPage {
   id: string
   title: string
   url?: string
-  last_edited_time?: string
+  last_edited_time?: string | null
+  object_type?: string
+  parent_id?: string | null
+  properties?: { name: string; type: string; value: string }[]
+  children?: NotionPage[]
+}
+
+interface NotionPageContentState {
+  content?: string
+  attachments?: { id?: string; type: string; name?: string; url?: string | null }[]
+  loading?: boolean
+  error?: string | null
 }
 
 type PipelineSource = 'slack' | 'gmail' | 'notion'
@@ -81,6 +95,8 @@ export default function PipelinesInterface() {
   const [notionIsRunning, setNotionIsRunning] = useState(false)
   const [notionPages, setNotionPages] = useState<NotionPage[]>([])
   const [notionSearchQuery, setNotionSearchQuery] = useState('')
+  const [notionWorkspaceName, setNotionWorkspaceName] = useState('')
+  const [notionPageContent, setNotionPageContent] = useState<Record<string, NotionPageContentState>>({})
 
   // Shared error
   const [error, setError] = useState<string | null>(null)
@@ -369,14 +385,9 @@ export default function PipelinesInterface() {
         if (['completed', 'failed', 'cancelled'].includes(data.status)) {
           done = true
           setNotionIsRunning(false)
-
-          const pagesResp = await fetch(
-            `http://localhost:8000/api/pipelines/notion/pages?run_id=${encodeURIComponent(id)}`,
-          )
-          if (pagesResp.ok) {
-            const pagesData = await pagesResp.json()
-            setNotionPages(pagesData.pages || [])
-          }
+          // Refresh hierarchy from the database so the view reflects
+          // persisted pages grouped by parent/child relationships.
+          await fetchNotionHierarchy()
         } else {
           await new Promise((resolve) => setTimeout(resolve, 2000))
         }
@@ -437,6 +448,7 @@ export default function PipelinesInterface() {
   useEffect(() => {
     fetchSlackData()
     fetchGmailLabels()
+    fetchNotionHierarchy()
   }, [])
 
   useEffect(() => {
@@ -458,6 +470,68 @@ export default function PipelinesInterface() {
       gmailMessagesEndRef.current.scrollIntoView({ behavior: 'smooth', block: 'end' })
     }
   }, [gmailMessages.length, gmailRunId])
+
+  const fetchNotionHierarchy = async () => {
+    try {
+      setError(null)
+      const response = await fetch('http://localhost:8000/api/notion/hierarchy')
+      if (!response.ok) {
+        throw new Error(`Failed to load Notion hierarchy: ${response.status}`)
+      }
+      const data = await response.json()
+      setNotionWorkspaceName(data.workspace_name || 'Notion Workspace')
+      setNotionPages(data.pages || [])
+    } catch (err: any) {
+      console.error('Error loading Notion hierarchy:', err)
+      setError(err.message || 'Failed to load Notion hierarchy')
+    }
+  }
+
+  const fetchNotionPageContent = async (pageId: string) => {
+    setNotionPageContent((prev) => {
+      const existing = prev[pageId]
+      if (existing?.loading) {
+        return prev
+      }
+      return {
+        ...prev,
+        [pageId]: {
+          ...existing,
+          loading: true,
+          error: null,
+        },
+      }
+    })
+
+    try {
+      const response = await fetch(
+        `http://localhost:8000/api/notion/page-content?page_id=${encodeURIComponent(pageId)}`,
+      )
+      if (!response.ok) {
+        throw new Error(`Failed to load Notion page content: ${response.status}`)
+      }
+      const data = await response.json()
+      setNotionPageContent((prev) => ({
+        ...prev,
+        [pageId]: {
+          content: data.content || '',
+          attachments: data.attachments || [],
+          loading: false,
+          error: null,
+        },
+      }))
+    } catch (err: any) {
+      console.error('Error loading Notion page content:', err)
+      setNotionPageContent((prev) => ({
+        ...prev,
+        [pageId]: {
+          ...(prev[pageId] || {}),
+          loading: false,
+          error: err.message || 'Failed to load Notion page content',
+        },
+      }))
+    }
+  }
 
   // -----------------------------
   // Render helpers
@@ -556,11 +630,15 @@ export default function PipelinesInterface() {
                     <td className="px-3 py-2 align-top">
                       <div className="font-medium text-foreground text-xs">
                         {ch.name || ch.channel_id}
-                        {ch.is_private && <span className="ml-1 text-[10px] text-yellow-400">(private)</span>}
+                        {ch.is_private && (
+                          <span className="ml-1 text-[10px] text-yellow-400">(private)</span>
+                        )}
                       </div>
                       <div className="text-[11px] text-muted-foreground">
                         {ch.num_members != null ? `${ch.num_members} members` : 'Members unknown'}
-                        {ch.is_archived && <span className="ml-1 text-[10px] text-red-400">archived</span>}
+                        {ch.is_archived && (
+                          <span className="ml-1 text-[10px] text-red-400">archived</span>
+                        )}
                       </div>
                     </td>
                     <td className="px-3 py-2 text-right align-top text-xs">{ch.message_count}</td>
@@ -583,21 +661,30 @@ export default function PipelinesInterface() {
                 <div className="mb-3">
                   <h3 className="text-base font-semibold mb-1">Channel Details</h3>
                   <p className="text-sm mb-1">
-                    <span className="font-mono text-sm">{selectedChannel.name || selectedChannel.channel_id}</span>
-                    {selectedChannel.is_private && <span className="ml-2 text-xs text-yellow-400">Private</span>}
-                    {selectedChannel.is_archived && <span className="ml-2 text-xs text-red-400">Archived</span>}
+                    <span className="font-mono text-sm">
+                      {selectedChannel.name || selectedChannel.channel_id}
+                    </span>
+                    {selectedChannel.is_private && (
+                      <span className="ml-2 text-xs text-yellow-400">Private</span>
+                    )}
+                    {selectedChannel.is_archived && (
+                      <span className="ml-2 text-xs text-red-400">Archived</span>
+                    )}
                   </p>
                   <p className="text-xs text-muted-foreground mb-2">
                     Members:{' '}
-                    {selectedChannel.num_members != null ? selectedChannel.num_members : 'Unknown'} · Messages:{' '}
-                    {selectedChannel.message_count}
+                    {selectedChannel.num_members != null
+                      ? selectedChannel.num_members
+                      : 'Unknown'}{' '}
+                    · Messages: {selectedChannel.message_count}
                   </p>
                 </div>
 
                 <div className="flex-1 overflow-auto border border-border rounded-md bg-background p-2">
                   {slackMessages.length === 0 ? (
                     <p className="text-xs text-muted-foreground">
-                      No messages loaded for this channel yet. Run the Slack pipeline or select the channel again.
+                      No messages loaded for this channel yet. Run the Slack pipeline or select the
+                      channel again.
                     </p>
                   ) : (
                     <>
@@ -609,7 +696,9 @@ export default function PipelinesInterface() {
                           placeholder="Filter messages"
                           className="flex-1 rounded-md border border-border bg-background px-2 py-1 text-xs"
                         />
-                        <span className="text-[11px] text-muted-foreground">{slackMessages.length} loaded</span>
+                        <span className="text-[11px] text-muted-foreground">
+                          {slackMessages.length} loaded
+                        </span>
                       </div>
                       <div className="space-y-3">
                         {Object.entries(groupedSlackThreads).map(([key, thread]) => (
@@ -618,7 +707,9 @@ export default function PipelinesInterface() {
                               <div className="mb-1">
                                 <div className="flex items-center justify-between gap-2">
                                   <div className="text-xs font-semibold text-foreground">
-                                    {thread.root.user_name || thread.root.user_id || 'Unknown user'}
+                                    {thread.root.user_name ||
+                                      thread.root.user_id ||
+                                      'Unknown user'}
                                   </div>
                                   <div className="text-[10px] text-muted-foreground">
                                     {new Date(thread.root.timestamp * 1000).toLocaleString()}
@@ -629,7 +720,8 @@ export default function PipelinesInterface() {
                                 </p>
                                 {thread.root.reply_count ? (
                                   <p className="mt-1 text-[10px] text-muted-foreground">
-                                    {thread.root.reply_count} repl{thread.root.reply_count === 1 ? 'y' : 'ies'}
+                                    {thread.root.reply_count} repl
+                                    {thread.root.reply_count === 1 ? 'y' : 'ies'}
                                   </p>
                                 ) : null}
                               </div>
@@ -640,7 +732,10 @@ export default function PipelinesInterface() {
                                 {[...thread.replies]
                                   .sort((a, b) => a.timestamp - b.timestamp)
                                   .map((reply) => (
-                                    <div key={reply.message_id} className="pl-2 border-l border-border/40">
+                                    <div
+                                      key={reply.message_id}
+                                      className="pl-2 border-l border-border/40"
+                                    >
                                       <div className="flex items-center justify-between gap-2">
                                         <div className="text-[11px] font-medium text-foreground">
                                           {reply.user_name || reply.user_id || 'Unknown user'}
@@ -665,7 +760,9 @@ export default function PipelinesInterface() {
                 </div>
               </div>
             ) : (
-              <p className="text-sm text-muted-foreground">Select a channel on the left to see details.</p>
+              <p className="text-sm text-muted-foreground">
+                Select a channel on the left to see details.
+              </p>
             )}
           </div>
         </div>
@@ -748,7 +845,10 @@ export default function PipelinesInterface() {
                   return aTime - bTime
                 })
                 .map((msg, index, arr) => {
-                  const header = `${msg.from || 'Unknown sender'} · ${msg.subject || 'No subject'}`
+                  const recipients = msg.to || msg.cc || msg.bcc
+                  const header = recipients
+                    ? `${msg.from || 'Unknown sender'} -> ${recipients} · ${msg.subject || 'No subject'}`
+                    : `${msg.from || 'Unknown sender'} · ${msg.subject || 'No subject'}`
                   const dateStr = msg.date ? new Date(msg.date).toLocaleString() : 'Unknown date'
                   const body = msg.body_html || msg.body_text || msg.snippet || '[no content]'
                   const isLatest = index === arr.length - 1
@@ -796,6 +896,125 @@ export default function PipelinesInterface() {
     </>
   )
 
+  const renderNotionTreeNode = (page: NotionPage, depth = 0) => {
+    const lastEdited = page.last_edited_time
+      ? new Date(page.last_edited_time).toLocaleString()
+      : 'Unknown'
+    const children = page.children || []
+    const pageProps = page.properties || []
+    const hasChildren = children.length > 0
+    const hasProps = pageProps.length > 0
+    const contentState = notionPageContent[page.id]
+
+    const handleToggle = (e: any) => {
+      const detailsEl = e.currentTarget as HTMLDetailsElement
+      if (detailsEl.open && !contentState?.content && !contentState?.loading) {
+        fetchNotionPageContent(page.id)
+      }
+    }
+
+    return (
+      <details
+        key={page.id}
+        className={`rounded-md border border-border/60 bg-background open:bg-card ${depth > 0 ? 'ml-3' : ''}`}
+        onToggle={handleToggle}
+      >
+        <summary className="cursor-pointer px-3 py-2 text-xs flex flex-col gap-0.5">
+          <span className="font-medium text-foreground truncate">{page.title}</span>
+          <span className="text-[11px] text-muted-foreground">
+            {lastEdited}
+            {hasChildren && (
+              <>
+                {' · '}
+                {children.length} subpage
+                {children.length === 1 ? '' : 's'}
+              </>
+            )}
+          </span>
+        </summary>
+        <div className="px-3 py-2 border-t border-border/40 text-xs text-foreground space-y-2">
+          {page.url && (
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] text-muted-foreground break-all">ID: {page.id}</span>
+              <button
+                type="button"
+                onClick={() => window.open(page.url as string, '_blank')}
+                className="text-[11px] font-medium text-blue-400 hover:underline"
+              >
+                Open in Notion
+              </button>
+            </div>
+          )}
+          {hasProps && (
+            <div>
+              <div className="text-[11px] font-semibold text-muted-foreground mb-0.5">Properties</div>
+              <dl className="space-y-0.5">
+                {pageProps.slice(0, 8).map((prop: { name: string; type: string; value: string }) => (
+                  <div key={prop.name} className="flex items-center justify-between gap-2">
+                    <dt className="text-[11px] text-muted-foreground truncate max-w-[40%]">{prop.name}</dt>
+                    <dd className="text-[11px] text-foreground text-right truncate max-w-[55%]">
+                      {prop.value || '-'}
+                    </dd>
+                  </div>
+                ))}
+              </dl>
+            </div>
+          )}
+          {contentState?.loading && (
+            <p className="text-[11px] text-muted-foreground">Loading page content…</p>
+          )}
+          {!contentState?.loading && contentState?.error && (
+            <p className="text-[11px] text-red-400">Failed to load content: {contentState.error}</p>
+          )}
+          {!contentState?.loading && contentState?.content && (
+            <div>
+              <div className="text-[11px] font-semibold text-muted-foreground mb-0.5">Page content</div>
+              <pre className="whitespace-pre-wrap text-[11px] text-foreground max-h-48 overflow-auto border border-border/40 rounded-md p-1.5 bg-background/40">
+                {contentState.content}
+              </pre>
+            </div>
+          )}
+          {!contentState?.loading && contentState?.attachments && contentState.attachments.length > 0 && (
+            <div>
+              <div className="text-[11px] font-semibold text-muted-foreground mb-0.5">Attachments</div>
+              <ul className="space-y-0.5">
+                {contentState.attachments.map((att) => (
+                  <li
+                    key={att.id || att.name}
+                    className="flex items-center justify-between gap-2"
+                  >
+                    <span className="text-[11px] text-foreground truncate max-w-[60%]">
+                      {att.name || att.id || 'Attachment'}
+                    </span>
+                    {att.url ? (
+                      <button
+                        type="button"
+                        onClick={() => window.open(att.url as string, '_blank')}
+                        className="text-[11px] font-medium text-blue-400 hover:underline"
+                      >
+                        Open
+                      </button>
+                    ) : (
+                      <span className="text-[10px] text-muted-foreground">No URL</span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {hasChildren && (
+            <div className="mt-1 space-y-1">
+              {children.map((child) => renderNotionTreeNode(child, depth + 1))}
+            </div>
+          )}
+          {!hasProps && !hasChildren && !contentState?.content && !contentState?.loading && (
+            <p className="text-[11px] text-muted-foreground">No additional information.</p>
+          )}
+        </div>
+      </details>
+    )
+  }
+
   const renderNotionView = () => {
     const search = notionSearchQuery.trim().toLowerCase()
     const filteredPages = search
@@ -808,7 +1027,8 @@ export default function PipelinesInterface() {
           <div>
             <h2 className="text-lg font-semibold mb-2">Notion Pipeline</h2>
             <p className="text-sm text-muted-foreground mb-3">
-              Fetch pages under the configured NOTION_PARENT_PAGE_ID and explore them.
+              Sync pages and databases that your integration can access in the Notion
+              workspace and explore them locally.
             </p>
             <div className="flex items-center gap-2">
               <button
@@ -841,7 +1061,11 @@ export default function PipelinesInterface() {
         </div>
 
         <div className="flex-1 p-4 overflow-hidden flex flex-col">
-          <h2 className="text-lg font-semibold mb-3">Notion Pages</h2>
+          <h2 className="text-lg font-semibold mb-1">Notion Pages</h2>
+          <p className="text-xs text-muted-foreground mb-2">
+            Workspace:{' '}
+            <span className="font-medium">{notionWorkspaceName || 'Notion Workspace'}</span>
+          </p>
           <div className="mb-2 flex items-center justify-between gap-2">
             <input
               type="text"
@@ -852,49 +1076,15 @@ export default function PipelinesInterface() {
             />
             <span className="text-[11px] text-muted-foreground">{filteredPages.length} pages</span>
           </div>
-          <div className="flex-1 overflow-auto border border-border rounded-md bg-card">
+          <div className="flex-1 overflow-auto border border-border rounded-md bg-card p-2">
             {filteredPages.length === 0 ? (
               <p className="p-3 text-xs text-muted-foreground">
-                No pages loaded yet. Run the Notion pipeline to fetch pages under the parent.
+                No pages loaded yet. Run the Notion pipeline to fetch workspace pages.
               </p>
             ) : (
-              <table className="min-w-full text-xs">
-                <thead className="bg-muted">
-                  <tr>
-                    <th className="px-3 py-2 text-left font-medium text-muted-foreground">Title</th>
-                    <th className="px-3 py-2 text-left font-medium text-muted-foreground">Last Edited</th>
-                    <th className="px-3 py-2 text-right font-medium text-muted-foreground">Open</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filteredPages.map((page) => (
-                    <tr key={page.id} className="border-b border-border/60">
-                      <td className="px-3 py-2 align-top">
-                        <div className="font-medium text-foreground text-xs truncate">{page.title}</div>
-                        <div className="text-[11px] text-muted-foreground break-all">{page.id}</div>
-                      </td>
-                      <td className="px-3 py-2 align-top text-[11px] text-muted-foreground">
-                        {page.last_edited_time
-                          ? new Date(page.last_edited_time).toLocaleString()
-                          : 'Unknown'}
-                      </td>
-                      <td className="px-3 py-2 align-top text-right">
-                        {page.url ? (
-                          <button
-                            type="button"
-                            onClick={() => window.open(page.url as string, '_blank')}
-                            className="text-[11px] font-medium text-blue-400 hover:underline"
-                          >
-                            Open
-                          </button>
-                        ) : (
-                          <span className="text-[11px] text-muted-foreground">No URL</span>
-                        )}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+              <div className="space-y-2">
+                {filteredPages.map((page) => renderNotionTreeNode(page))}
+              </div>
             )}
           </div>
         </div>
