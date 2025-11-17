@@ -4,6 +4,7 @@ from typing import Optional, List
 from pathlib import Path
 import requests
 from tqdm import tqdm
+from slack_sdk.errors import SlackApiError
 
 from .base_extractor import BaseExtractor
 from utils.logger import get_logger
@@ -45,15 +46,28 @@ class FileExtractor(BaseExtractor):
         if types:
             params["types"] = types
         
-        # Paginate through files
-        for file in self._paginate(
-            "files.list",
-            "files_list",
-            "files",
-            **params
-        ):
-            files_list.append(file)
-        
+        # Paginate through files. The Slack API's files.list endpoint can return
+        # workspace-scoped infrastructure errors like "solr_failed" which are
+        # outside the caller's control. We treat those as non-fatal for the
+        # overall pipeline: log them and proceed with whatever data we have
+        # instead of crashing the entire Slack extraction run.
+        try:
+            for file in self._paginate(
+                "files.list",
+                "files_list",
+                "files",
+                **params
+            ):
+                files_list.append(file)
+        except SlackApiError as e:
+            logger.error(f"Slack API error while listing files: {e}")
+        except Exception as e:  # pragma: no cover - defensive logging
+            logger.error(f"Unexpected error while listing files: {e}")
+
+        if not files_list:
+            logger.warning("No files fetched from Slack; skipping file persistence step.")
+            return 0
+
         logger.info(f"Fetched {len(files_list)} files. Saving to database...")
         
         # Save files with progress bar
