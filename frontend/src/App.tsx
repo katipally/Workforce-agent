@@ -1,9 +1,19 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import ChatInterface from './components/chat/ChatInterface'
 import PipelinesInterface from './components/pipelines/PipelinesInterface'
 
 function App() {
-  const [activeTab, setActiveTab] = useState<'chat' | 'pipelines'>('chat')
+  const [activeTab, setActiveTab] = useState<'chat' | 'pipelines'>(() => {
+    if (typeof window === 'undefined') return 'chat'
+    const stored = window.localStorage.getItem('workforce-active-tab')
+    return stored === 'pipelines' ? 'pipelines' : 'chat'
+  })
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem('workforce-active-tab', activeTab)
+    }
+  }, [activeTab])
 
   return (
     <div className="h-screen w-full flex flex-col bg-background">
@@ -39,7 +49,12 @@ function App() {
       </header>
 
       <main className="flex-1 overflow-hidden">
-        {activeTab === 'chat' ? <ChatInterface /> : <PipelinesInterface />}
+        <div className={activeTab === 'chat' ? 'h-full block' : 'h-full hidden'}>
+          <ChatInterface />
+        </div>
+        <div className={activeTab === 'pipelines' ? 'h-full block' : 'h-full hidden'}>
+          <PipelinesInterface />
+        </div>
       </main>
     </div>
   )
