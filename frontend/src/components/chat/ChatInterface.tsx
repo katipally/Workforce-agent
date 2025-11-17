@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useChatStore } from '../../store/chatStore'
 import { useWebSocket } from '../../hooks/useWebSocket'
 import MessageList from './MessageList'
@@ -10,8 +10,26 @@ import { Bot, History, Sparkles } from 'lucide-react'
 export default function ChatInterface() {
   const { messages, streamingMessage, isStreaming } = useChatStore()
   const { sendMessage, isConnected } = useWebSocket()
-  const [showHistory, setShowHistory] = useState(true)
-  const [showQuickActions, setShowQuickActions] = useState(true)
+  const [showHistory, setShowHistory] = useState(() => {
+    if (typeof window === 'undefined') return true
+    const raw = window.localStorage.getItem('workforce-chat-show-history')
+    return raw === 'false' ? false : true
+  })
+  const [showQuickActions, setShowQuickActions] = useState(() => {
+    if (typeof window === 'undefined') return true
+    const raw = window.localStorage.getItem('workforce-chat-show-quick-actions')
+    return raw === 'false' ? false : true
+  })
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    window.localStorage.setItem('workforce-chat-show-history', String(showHistory))
+  }, [showHistory])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    window.localStorage.setItem('workforce-chat-show-quick-actions', String(showQuickActions))
+  }, [showQuickActions])
   
   const handleSendMessage = async (content: string, files?: File[]) => {
     const currentSessionId = useChatStore.getState().currentSessionId

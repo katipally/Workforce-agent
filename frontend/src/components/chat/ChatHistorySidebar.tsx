@@ -8,16 +8,23 @@ export default function ChatHistorySidebar() {
 
   // Load sessions on mount
   useEffect(() => {
-    loadSessions()
+    loadSessions(true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const loadSessions = async () => {
+  const loadSessions = async (createFreshNewChat: boolean = false) => {
     setLoading(true)
     try {
       const response = await fetch('http://localhost:8000/api/chat/sessions')
       const data = await response.json()
       setSessions(data.sessions || [])
+
+      // After loading existing sessions from the backend, create a fresh
+      // local "New Chat" session so the user always has a brand-new
+      // conversation ready at the top when the app first loads.
+      if (createFreshNewChat) {
+        createNewSession()
+      }
     } catch (error) {
       console.error('Error loading sessions:', error)
     } finally {
@@ -53,7 +60,7 @@ export default function ChatHistorySidebar() {
       // Use store's deleteSession which handles everything
       deleteSession(sessionId)
       // Reload sessions list from backend
-      await loadSessions()
+      await loadSessions(false)
     } catch (error) {
       console.error('Error deleting session:', error)
     }

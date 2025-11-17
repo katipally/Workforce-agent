@@ -80,6 +80,7 @@ export default function PipelinesInterface() {
   const [slackIsRunning, setSlackIsRunning] = useState(false)
   const [slackMessages, setSlackMessages] = useState<SlackMessage[]>([])
   const [slackSearchQuery, setSlackSearchQuery] = useState('')
+  const [slackLastRunAt, setSlackLastRunAt] = useState<string | null>(null)
 
   // Gmail state
   const [gmailLabels, setGmailLabels] = useState<GmailLabel[]>([])
@@ -88,6 +89,7 @@ export default function PipelinesInterface() {
   const [gmailRunStatus, setGmailRunStatus] = useState<string | null>(null)
   const [gmailIsRunning, setGmailIsRunning] = useState(false)
   const [gmailMessages, setGmailMessages] = useState<GmailMessage[]>([])
+  const [gmailLastRunAt, setGmailLastRunAt] = useState<string | null>(null)
 
   // Notion state
   const [notionRunId, setNotionRunId] = useState<string | null>(null)
@@ -97,12 +99,72 @@ export default function PipelinesInterface() {
   const [notionSearchQuery, setNotionSearchQuery] = useState('')
   const [notionWorkspaceName, setNotionWorkspaceName] = useState('')
   const [notionPageContent, setNotionPageContent] = useState<Record<string, NotionPageContentState>>({})
+  const [notionLastRunAt, setNotionLastRunAt] = useState<string | null>(null)
 
   // Shared error
   const [error, setError] = useState<string | null>(null)
 
   const slackMessagesEndRef = useRef<HTMLDivElement | null>(null)
   const gmailMessagesEndRef = useRef<HTMLDivElement | null>(null)
+  const slackMessagesContainerRef = useRef<HTMLDivElement | null>(null)
+  const gmailMessagesContainerRef = useRef<HTMLDivElement | null>(null)
+
+  // Restore persisted Pipelines UI state on mount
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    try {
+      const raw = window.localStorage.getItem('workforce-pipelines-ui')
+      if (!raw) return
+      const stored = JSON.parse(raw)
+
+      if (stored.activeSource === 'slack' || stored.activeSource === 'gmail' || stored.activeSource === 'notion') {
+        setActiveSource(stored.activeSource)
+      }
+      if (typeof stored.selectedChannelId === 'string') {
+        setSelectedChannelId(stored.selectedChannelId)
+      }
+      if (typeof stored.selectedLabelId === 'string') {
+        setSelectedLabelId(stored.selectedLabelId)
+      }
+      if (typeof stored.slackSearchQuery === 'string') {
+        setSlackSearchQuery(stored.slackSearchQuery)
+      }
+      if (typeof stored.notionSearchQuery === 'string') {
+        setNotionSearchQuery(stored.notionSearchQuery)
+      }
+      if (typeof stored.slackLastRunAt === 'string') {
+        setSlackLastRunAt(stored.slackLastRunAt)
+      }
+      if (typeof stored.gmailLastRunAt === 'string') {
+        setGmailLastRunAt(stored.gmailLastRunAt)
+      }
+      if (typeof stored.notionLastRunAt === 'string') {
+        setNotionLastRunAt(stored.notionLastRunAt)
+      }
+    } catch (err) {
+      console.error('Failed to restore pipelines UI state', err)
+    }
+  }, [])
+
+  // Persist Pipelines UI state when key fields change
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    try {
+      const payload = {
+        activeSource,
+        selectedChannelId,
+        selectedLabelId,
+        slackSearchQuery,
+        notionSearchQuery,
+        slackLastRunAt,
+        gmailLastRunAt,
+        notionLastRunAt,
+      }
+      window.localStorage.setItem('workforce-pipelines-ui', JSON.stringify(payload))
+    } catch (err) {
+      console.error('Failed to persist pipelines UI state', err)
+    }
+  }, [activeSource, selectedChannelId, selectedLabelId, slackSearchQuery, notionSearchQuery, slackLastRunAt, gmailLastRunAt, notionLastRunAt])
 
   // -----------------------------
   // Slack helpers
@@ -158,6 +220,11 @@ export default function PipelinesInterface() {
         if (['completed', 'failed', 'cancelled'].includes(data.status)) {
           done = true
           setSlackIsRunning(false)
+          if (data.finished_at || data.started_at) {
+            setSlackLastRunAt(data.finished_at || data.started_at)
+          } else {
+            setSlackLastRunAt(new Date().toISOString())
+          }
           await fetchSlackData()
           if (selectedChannelId) {
             await fetchSlackMessages(selectedChannelId)
@@ -300,6 +367,11 @@ export default function PipelinesInterface() {
         if (['completed', 'failed', 'cancelled'].includes(data.status)) {
           done = true
           setGmailIsRunning(false)
+          if (data.finished_at || data.started_at) {
+            setGmailLastRunAt(data.finished_at || data.started_at)
+          } else {
+            setGmailLastRunAt(new Date().toISOString())
+          }
 
           const messagesResp = await fetch(
             `http://localhost:8000/api/pipelines/gmail/messages?run_id=${encodeURIComponent(id)}`,
@@ -385,6 +457,11 @@ export default function PipelinesInterface() {
         if (['completed', 'failed', 'cancelled'].includes(data.status)) {
           done = true
           setNotionIsRunning(false)
+          if (data.finished_at || data.started_at) {
+            setNotionLastRunAt(data.finished_at || data.started_at)
+          } else {
+            setNotionLastRunAt(new Date().toISOString())
+          }
           // Refresh hierarchy from the database so the view reflects
           // persisted pages grouped by parent/child relationships.
           await fetchNotionHierarchy()
@@ -460,13 +537,23 @@ export default function PipelinesInterface() {
   }, [selectedLabelId])
 
   useEffect(() => {
-    if (slackMessages.length > 0 && slackMessagesEndRef.current) {
+    const container = slackMessagesContainerRef.current
+    if (!container || slackMessages.length === 0 || !slackMessagesEndRef.current) return
+
+    const threshold = 80
+    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight
+    if (distanceFromBottom <= threshold) {
       slackMessagesEndRef.current.scrollIntoView({ behavior: 'smooth', block: 'end' })
     }
   }, [slackMessages.length, selectedChannelId])
 
   useEffect(() => {
-    if (gmailMessages.length > 0 && gmailMessagesEndRef.current) {
+    const container = gmailMessagesContainerRef.current
+    if (!container || gmailMessages.length === 0 || !gmailMessagesEndRef.current) return
+
+    const threshold = 80
+    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight
+    if (distanceFromBottom <= threshold) {
       gmailMessagesEndRef.current.scrollIntoView({ behavior: 'smooth', block: 'end' })
     }
   }, [gmailMessages.length, gmailRunId])
@@ -599,6 +686,11 @@ export default function PipelinesInterface() {
                 <dd className="font-medium">{slackStats.reactions}</dd>
               </div>
             </dl>
+            {slackLastRunAt && (
+              <p className="mt-2 text-[11px] text-muted-foreground">
+                Last run: {new Date(slackLastRunAt).toLocaleString()}
+              </p>
+            )}
           </div>
         )}
       </div>
@@ -655,7 +747,10 @@ export default function PipelinesInterface() {
             </table>
           </div>
 
-          <div className="flex-1 border border-border rounded-md bg-card p-4 overflow-auto">
+          <div
+            className="flex-1 border border-border rounded-md bg-card p-4 overflow-auto"
+            ref={slackMessagesContainerRef}
+          >
             {selectedChannel ? (
               <div className="flex flex-col h-full">
                 <div className="mb-3">
@@ -826,12 +921,20 @@ export default function PipelinesInterface() {
           {gmailRunId && (
             <p className="mt-1 text-[11px] text-muted-foreground break-all">Run ID: {gmailRunId}</p>
           )}
+          {gmailLastRunAt && (
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              Last run: {new Date(gmailLastRunAt).toLocaleString()}
+            </p>
+          )}
         </div>
       </div>
 
       <div className="flex-1 p-4 overflow-hidden flex flex-col">
         <h2 className="text-lg font-semibold mb-3">Gmail Messages</h2>
-        <div className="flex-1 overflow-auto border border-border rounded-md bg-card p-2">
+        <div
+          className="flex-1 overflow-auto border border-border rounded-md bg-card p-2"
+          ref={gmailMessagesContainerRef}
+        >
           {gmailMessages.length === 0 ? (
             <p className="text-xs text-muted-foreground">
               No messages loaded yet. Select a label and run the Gmail pipeline.
@@ -1057,6 +1160,11 @@ export default function PipelinesInterface() {
             {notionRunId && (
               <p className="mt-1 text-[11px] text-muted-foreground break-all">Run ID: {notionRunId}</p>
             )}
+            {notionLastRunAt && (
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                Last run: {new Date(notionLastRunAt).toLocaleString()}
+              </p>
+            )}
           </div>
         </div>
 
@@ -1138,7 +1246,17 @@ export default function PipelinesInterface() {
 
       {error && (
         <div className="fixed bottom-4 right-4 max-w-sm rounded-md border border-red-500/40 bg-red-950/70 p-3 text-xs text-red-100 shadow-lg">
-          {error}
+          <div className="flex items-start justify-between gap-2">
+            <span className="flex-1">{error}</span>
+            <button
+              type="button"
+              onClick={() => setError(null)}
+              className="ml-2 inline-flex h-5 w-5 items-center justify-center rounded-full border border-red-400/60 text-[10px] hover:bg-red-800/80"
+              aria-label="Dismiss error"
+            >
+              ×
+            </button>
+          </div>
         </div>
       )}
     </div>

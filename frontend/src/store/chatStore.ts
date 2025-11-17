@@ -264,9 +264,11 @@ export const useChatStore = create<ChatState>()(
     {
       name: 'chat-storage',
       partialize: (state) => ({
-        currentSessionId: state.currentSessionId,
+        // Persist past sessions and their messages, but not the active session ID.
+        // On a full reload we always start with a brand-new session, so the
+        // "new chat" view truly represents a new conversation.
         sessionMessages: state.sessionMessages,
-        sessions: state.sessions
+        sessions: state.sessions,
       }),
     }
   )
