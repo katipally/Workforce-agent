@@ -6,6 +6,7 @@ Defines all database tables for:
 - PostgreSQL with optional pgvector support for AI/RAG features
 """
 from datetime import datetime
+from uuid import uuid4
 from sqlalchemy import (
     Column, String, Boolean, Integer, Float, DateTime,
     ForeignKey, Text, JSON, Index, UniqueConstraint
@@ -485,4 +486,47 @@ class ChatMessage(Base):
     __table_args__ = (
         Index("idx_chat_message_session", "session_id"),
         Index("idx_chat_message_created", "created_at"),
+    )
+
+
+class Project(Base):
+    """Cross-application project definition for the Projects tab."""
+    __tablename__ = "projects"
+
+    id = Column(String(50), primary_key=True, default=lambda: uuid4().hex)
+    name = Column(String(255), nullable=False)
+    description = Column(Text)
+    status = Column(String(50), default="not_started")
+    summary = Column(Text)
+    main_goal = Column(Text)
+    current_status_summary = Column(Text)
+    important_notes = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    sources = relationship("ProjectSource", back_populates="project", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        Index("idx_project_status", "status"),
+        Index("idx_project_updated", "updated_at"),
+    )
+
+
+class ProjectSource(Base):
+    """Mapping between a project and its underlying data sources."""
+    __tablename__ = "project_sources"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    project_id = Column(String(50), ForeignKey("projects.id"), nullable=False)
+    source_type = Column(String(50), nullable=False)
+    source_id = Column(String(255), nullable=False)
+    display_name = Column(String(255))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    project = relationship("Project", back_populates="sources")
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "source_type", "source_id", name="uq_project_source"),
+        Index("idx_project_source_project", "project_id"),
+        Index("idx_project_source_type", "source_type"),
     )

@@ -12,6 +12,7 @@ Tests core new tools added to the Workforce AI Agent:
 """
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -344,6 +345,67 @@ class ToolTester:
             print(f"❌ FAIL: {e}")
             self.results['failed'].append('notion_database_tools')
             return False
+
+    async def test_notion_page_content_tools(self):
+        """Test Notion page content helpers in a non-destructive way."""
+        print("\n" + "="*60)
+        print("🧪 TEST 11: Notion Page Content Tools")
+        print("="*60)
+
+        page_id = os.getenv("TEST_NOTION_PAGE_ID", "")
+        if not page_id:
+            print("⏭️  SKIP: Set TEST_NOTION_PAGE_ID in env to exercise real page content tools")
+            self.results['skipped'].append('get_notion_page_content')
+            self.results['skipped'].append('update_notion_page_content')
+            return True
+
+        try:
+            content = self.tools.get_notion_page_content(
+                page_id=page_id,
+                include_subpages=False,
+                max_blocks=200,
+            )
+
+            if "NOTION_TOKEN is not configured" in content or "Notion not connected" in content:
+                print("⏭️  SKIP: Notion is not configured or not connected")
+                self.results['skipped'].append('get_notion_page_content')
+                self.results['skipped'].append('update_notion_page_content')
+                return True
+
+            if content:
+                print("✅ PASS: get_notion_page_content responded")
+                print(f"Result preview:\n{content[:300]}...")
+                self.results['passed'].append('get_notion_page_content')
+            else:
+                print("❌ FAIL: Empty response from get_notion_page_content")
+                self.results['failed'].append('get_notion_page_content')
+
+            # For update_notion_page_content we use a unique string that is
+            # extremely unlikely to exist, so no actual content is modified.
+            marker = "WORKFORCE_TEST_MARKER_1234567890"
+            update_result = self.tools.update_notion_page_content(
+                page_id=page_id,
+                find_text=marker,
+                replace_text="SHOULD_NOT_APPEAR",
+                include_subpages=False,
+                max_matches=1,
+            )
+
+            if "No matching text found" in update_result or "Updated" in update_result:
+                print("✅ PASS: update_notion_page_content responds without crashing")
+                print(f"Result: {update_result}")
+                self.results['passed'].append('update_notion_page_content')
+            else:
+                print("❌ FAIL: Unexpected response from update_notion_page_content")
+                print(f"Got: {update_result}")
+                self.results['failed'].append('update_notion_page_content')
+
+            return True
+
+        except Exception as e:
+            print(f"❌ FAIL: {e}")
+            self.results['failed'].append('notion_page_content_tools')
+            return False
     
     def print_summary(self):
         """Print test summary."""
@@ -416,6 +478,7 @@ async def main():
     await tester.test_recent_email_thread_between_people()
     await tester.test_gmail_attachment_tools()
     await tester.test_notion_database_tools()
+    await tester.test_notion_page_content_tools()
     
     # Print summary
     tester.print_summary()

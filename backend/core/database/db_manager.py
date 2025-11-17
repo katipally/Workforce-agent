@@ -19,7 +19,8 @@ from .models import (
     MessageFile, Reaction, SyncStatus,
     NotionWorkspace, NotionPage,
     GmailAccount, GmailLabel, GmailThread, GmailMessage, GmailAttachment,
-    ChatSession, ChatMessage
+    ChatSession, ChatMessage,
+    Project, ProjectSource,
 )
 from utils.logger import get_logger
 
@@ -567,3 +568,126 @@ class DatabaseManager:
             if chat_session:
                 session.delete(chat_session)
                 session.commit()
+
+    # ============================================================================
+    # Project Operations
+    # ============================================================================
+    
+    def create_project(
+        self,
+        name: str,
+        description: Optional[str] = None,
+        status: str = "not_started",
+        summary: Optional[str] = None,
+        main_goal: Optional[str] = None,
+        current_status_summary: Optional[str] = None,
+        important_notes: Optional[str] = None,
+    ) -> Project:
+        """Create a new cross-application project."""
+        with self.get_session() as session:
+            project = Project(
+                name=name,
+                description=description,
+                status=status,
+                summary=summary,
+                main_goal=main_goal,
+                current_status_summary=current_status_summary,
+                important_notes=important_notes,
+            )
+            session.add(project)
+            session.commit()
+            session.refresh(project)
+            return project
+
+    def list_projects(self, limit: int = 100) -> List[Project]:
+        """List projects ordered by most recently updated."""
+        with self.get_session() as session:
+            return (
+                session.query(Project)
+                .order_by(Project.updated_at.desc())
+                .limit(limit)
+                .all()
+            )
+
+    def get_project(self, project_id: str) -> Optional[Project]:
+        """Get a project by ID."""
+        with self.get_session() as session:
+            return session.query(Project).filter_by(id=project_id).first()
+
+    def update_project(self, project_id: str, **fields: Any) -> Optional[Project]:
+        """Update a project's editable fields."""
+        with self.get_session() as session:
+            project = session.query(Project).filter_by(id=project_id).first()
+            if not project:
+                return None
+
+            for key, value in fields.items():
+                if value is not None and hasattr(project, key):
+                    setattr(project, key, value)
+            project.updated_at = datetime.utcnow()
+            session.commit()
+            session.refresh(project)
+            return project
+
+    def delete_project(self, project_id: str) -> None:
+        """Delete a project and all of its source mappings."""
+        with self.get_session() as session:
+            project = session.query(Project).filter_by(id=project_id).first()
+            if project:
+                session.delete(project)
+                session.commit()
+
+    def add_project_source(
+        self,
+        project_id: str,
+        source_type: str,
+        source_id: str,
+        display_name: Optional[str] = None,
+    ) -> ProjectSource:
+        """Add a source mapping to a project (idempotent on unique key)."""
+        with self.get_session() as session:
+            mapping = (
+                session.query(ProjectSource)
+                .filter_by(project_id=project_id, source_type=source_type, source_id=source_id)
+                .first()
+            )
+            if mapping:
+                # Update display name if provided
+                if display_name and mapping.display_name != display_name:
+                    mapping.display_name = display_name
+                    session.commit()
+                    session.refresh(mapping)
+                return mapping
+
+            mapping = ProjectSource(
+                project_id=project_id,
+                source_type=source_type,
+                source_id=source_id,
+                display_name=display_name,
+            )
+            session.add(mapping)
+            session.commit()
+            session.refresh(mapping)
+            return mapping
+
+    def remove_project_source(self, project_id: str, source_type: str, source_id: str) -> None:
+        """Remove a source mapping from a project."""
+        with self.get_session() as session:
+            mapping = (
+                session.query(ProjectSource)
+                .filter_by(project_id=project_id, source_type=source_type, source_id=source_id)
+                .first()
+            )
+            if mapping:
+                session.delete(mapping)
+                session.commit()
+
+    def get_project_sources(self, project_id: str) -> List[ProjectSource]:
+        """List all source mappings for a project."""
+        with self.get_session() as session:
+            return (
+                session.query(ProjectSource)
+                .filter_by(project_id=project_id)
+                .order_by(ProjectSource.created_at.asc())
+                .all()
+            )

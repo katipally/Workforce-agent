@@ -179,17 +179,19 @@ class ProjectTracker:
                     channel_filters = [Channel.name.ilike(f"%{ch.strip('#')}%") for ch in channels]
                     keyword_filters.append(or_(*channel_filters))
 
+                # Build base query and apply all filters BEFORE limit/offset
                 message_query = (
                     session.query(Message, Channel, User)
                     .join(Channel, Message.channel_id == Channel.channel_id)
                     .outerjoin(User, Message.user_id == User.user_id)
                     .filter(Message.timestamp >= cutoff_ts)
-                    .order_by(Message.timestamp.desc())
-                    .limit(200)
                 )
 
                 if keyword_filters:
                     message_query = message_query.filter(or_(*keyword_filters))
+
+                # Only after all filters are set, apply ordering and limit
+                message_query = message_query.order_by(Message.timestamp.desc()).limit(200)
 
                 for message, channel, user in message_query.all():
                     author = (
@@ -243,11 +245,10 @@ class ProjectTracker:
                     for kw in keywords
                 ]
 
+                # Build base query and apply all filters BEFORE limit/offset
                 message_query = (
                     session.query(GmailMessage)
                     .filter(GmailMessage.date >= cutoff_date)
-                    .order_by(GmailMessage.date.desc())
-                    .limit(200)
                 )
 
                 if keyword_filters:
@@ -260,6 +261,9 @@ class ProjectTracker:
                         for dom in domains
                     ]
                     message_query = message_query.filter(or_(*domain_filters))
+
+                # Only after all filters are set, apply ordering and limit
+                message_query = message_query.order_by(GmailMessage.date.desc()).limit(200)
 
                 for message in message_query.all():
                     updates.append(

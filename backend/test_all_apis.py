@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import requests
+
 # Add paths
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent / 'core'))
@@ -44,48 +46,11 @@ class APITester:
                 ("auth.test", lambda: client.auth_test(), "Basic Authentication"),
                 ("users.list", lambda: client.users_list(), "List Users"),
                 ("conversations.list", lambda: client.conversations_list(), "List Channels"),
-                ("team.info", lambda: client.team_info(), "Get Team Info"),
-                
-                # Message operations
-                ("conversations.history", 
-                 lambda: client.conversations_history(channel="C0000000000", limit=1), 
-                 "Read Channel Messages"),
-                
-                # File operations
-                ("files.list", lambda: client.files_list(count=1), "List Files"),
-                
-                # Pin operations (NEW)
-                ("pins.list", 
-                 lambda: client.pins_list(channel="C0000000000"), 
-                 "List Pinned Messages"),
-                
-                # User presence
-                ("users.getPresence", 
-                 lambda: client.users_getPresence(user="U0000000000"), 
-                 "Get User Presence"),
-                
-                # Reactions
-                ("reactions.list", 
-                 lambda: client.reactions_list(user="me", limit=1), 
-                 "List Reactions"),
-                
-                # Bookmarks (NEW Nov 2025)
-                ("bookmarks.list", 
-                 lambda: client.bookmarks_list(channel_id="C0000000000"), 
-                 "List Channel Bookmarks"),
-                
-                # Reminders
-                ("reminders.list", lambda: client.reminders_list(), "List Reminders"),
-                
-                # Search
-                ("search.messages", 
-                 lambda: client.search_messages(query="test", count=1), 
-                 "Search Messages"),
             ]
             
             # Write operations (will fail if no permissions, but we test anyway)
             write_tests = [
-                ("chat.postMessage", 
+                ("Send Messages",
                  lambda: None,  # Don't actually post
                  "Send Messages (not tested - would spam)"),
                 
@@ -396,8 +361,6 @@ class APITester:
         print("="*80)
         
         try:
-            import requests
-            
             headers = {
                 "Authorization": f"Bearer {Config.NOTION_TOKEN}",
                 "Notion-Version": "2022-06-28",

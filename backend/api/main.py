@@ -22,8 +22,11 @@ from datetime import datetime
 from pathlib import Path
 from email.utils import parsedate_to_datetime
 import requests
-from sqlalchemy import cast
+from sqlalchemy import cast, or_
 from sqlalchemy.dialects.postgresql import JSONB
+
+# LLM message types for summary generation
+from langchain.schema import SystemMessage, HumanMessage
 
 # Add core directory to path
 core_path = Path(__file__).parent.parent / 'core'
@@ -48,6 +51,8 @@ from database.models import (
     GmailThread,
     NotionWorkspace,
     NotionPage,
+    Project,
+    ProjectSource,
 )
 from slack.extractor import ExtractionCoordinator
 from gmail import GmailClient
@@ -57,6 +62,57 @@ logger = get_logger(__name__)
 
 # Initialize database manager
 db_manager = DatabaseManager()
+
+
+def _get_last_slack_sync() -> Optional[str]:
+    """Return ISO timestamp of the latest Slack message in the DB, if any."""
+
+    try:
+        with db_manager.get_session() as session:
+            msg = (
+                session.query(Message)
+                .order_by(Message.timestamp.desc())
+                .first()
+            )
+            if msg and msg.timestamp:
+                return datetime.fromtimestamp(msg.timestamp).isoformat()
+    except Exception:  # pragma: no cover - defensive logging
+        logger.exception("Failed to compute last Slack sync time")
+    return None
+
+
+def _get_last_gmail_sync() -> Optional[str]:
+    """Return ISO timestamp of the latest Gmail message in the DB, if any."""
+
+    try:
+        with db_manager.get_session() as session:
+            email = (
+                session.query(GmailMessage)
+                .order_by(GmailMessage.date.desc())
+                .first()
+            )
+            if email and email.date:
+                return email.date.isoformat()
+    except Exception:  # pragma: no cover - defensive logging
+        logger.exception("Failed to compute last Gmail sync time")
+    return None
+
+
+def _get_last_notion_sync() -> Optional[str]:
+    """Return ISO timestamp of the latest Notion page edit in the DB, if any."""
+
+    try:
+        with db_manager.get_session() as session:
+            page = (
+                session.query(NotionPage)
+                .order_by(NotionPage.last_edited_time.desc())
+                .first()
+            )
+            if page and page.last_edited_time:
+                return page.last_edited_time.isoformat()
+    except Exception:  # pragma: no cover - defensive logging
+        logger.exception("Failed to compute last Notion sync time")
+    return None
 
 # Import agent modules after setting up paths
 import sys
@@ -201,6 +257,43 @@ class HealthResponse(BaseModel):
     models_loaded: bool
     ai_brain_loaded: bool
     capabilities: List[str]
+    
+
+class ProjectSourcePayload(BaseModel):
+    source_type: str
+    source_id: str
+    display_name: Optional[str] = None
+
+
+class ProjectCreateRequest(BaseModel):
+    name: str
+    description: Optional[str] = None
+    status: Optional[str] = None
+    summary: Optional[str] = None
+    main_goal: Optional[str] = None
+    current_status_summary: Optional[str] = None
+    important_notes: Optional[str] = None
+
+
+class ProjectUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    status: Optional[str] = None
+    summary: Optional[str] = None
+    main_goal: Optional[str] = None
+    current_status_summary: Optional[str] = None
+    important_notes: Optional[str] = None
+
+
+class ProjectChatRequest(BaseModel):
+    query: str
+    conversation_history: Optional[List[Dict[str, str]]] = None
+
+
+class ProjectSummaryRequest(BaseModel):
+    """Payload for AI-powered project summary generation."""
+
+    max_tokens: int = 256
 
 
 # Routes
@@ -511,10 +604,16 @@ async def get_session(session_id: str):
     """
     try:
         session = db_manager.get_chat_session(session_id)
+
+        # For brand new sessions, auto-create an empty session instead of
+        # returning 404 so the frontend can immediately attach messages.
         if not session:
-            raise HTTPException(status_code=404, detail="Session not found")
+            db_manager.create_chat_session(session_id)
+            session = db_manager.get_chat_session(session_id)
+            if not session:
+                raise HTTPException(status_code=500, detail="Failed to create chat session")
         
-        # Get messages for this session
+        # Get messages for this session (empty list for new sessions)
         messages = db_manager.get_chat_history(session_id)
         
         return {
@@ -522,7 +621,7 @@ async def get_session(session_id: str):
             "title": session.title,
             "created_at": session.created_at.isoformat(),
             "updated_at": session.updated_at.isoformat(),
-            "messages": messages
+            "messages": messages,
         }
     except HTTPException:
         raise
@@ -547,6 +646,797 @@ async def delete_session(session_id: str):
     except Exception as e:
         logger.error(f"Error deleting session: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# Project Endpoints
+# ============================================================================
+
+
+@app.get("/api/projects")
+async def list_projects():
+    """List projects for the Projects tab."""
+    try:
+        projects = db_manager.list_projects(limit=100)
+        return {
+            "projects": [
+                {
+                    "id": p.id,
+                    "name": p.name,
+                    "description": p.description,
+                    "status": p.status,
+                    "summary": p.summary,
+                    "main_goal": p.main_goal,
+                    "current_status_summary": p.current_status_summary,
+                    "important_notes": p.important_notes,
+                    "created_at": p.created_at.isoformat() if p.created_at else None,
+                    "updated_at": p.updated_at.isoformat() if p.updated_at else None,
+                }
+                for p in projects
+            ]
+        }
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(f"Error listing projects: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to list projects")
+
+
+@app.post("/api/projects")
+async def create_project(payload: ProjectCreateRequest):
+    """Create a new project."""
+    try:
+        status = payload.status or "not_started"
+        project = db_manager.create_project(
+            name=payload.name,
+            description=payload.description,
+            status=status,
+            summary=payload.summary,
+            main_goal=payload.main_goal,
+            current_status_summary=payload.current_status_summary,
+            important_notes=payload.important_notes,
+        )
+        return {
+            "id": project.id,
+            "name": project.name,
+            "description": project.description,
+            "status": project.status,
+            "summary": project.summary,
+            "main_goal": project.main_goal,
+            "current_status_summary": project.current_status_summary,
+            "important_notes": project.important_notes,
+            "created_at": project.created_at.isoformat() if project.created_at else None,
+            "updated_at": project.updated_at.isoformat() if project.updated_at else None,
+        }
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(f"Error creating project: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to create project")
+
+
+@app.get("/api/projects/{project_id}")
+async def get_project(project_id: str):
+    """Get a project with its linked sources."""
+    try:
+        project = db_manager.get_project(project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        sources = db_manager.get_project_sources(project_id)
+        slack_channels: List[Dict[str, Any]] = []
+        gmail_labels: List[Dict[str, Any]] = []
+        notion_pages: List[Dict[str, Any]] = []
+
+        for s in sources:
+            item = {
+                "source_type": s.source_type,
+                "source_id": s.source_id,
+                "display_name": s.display_name,
+            }
+            if s.source_type == "slack_channel":
+                slack_channels.append(item)
+            elif s.source_type == "gmail_label":
+                gmail_labels.append(item)
+            elif s.source_type == "notion_page":
+                notion_pages.append(item)
+
+        return {
+            "id": project.id,
+            "name": project.name,
+            "description": project.description,
+            "status": project.status,
+            "summary": project.summary,
+            "main_goal": project.main_goal,
+            "current_status_summary": project.current_status_summary,
+            "important_notes": project.important_notes,
+            "created_at": project.created_at.isoformat() if project.created_at else None,
+            "updated_at": project.updated_at.isoformat() if project.updated_at else None,
+            "sources": {
+                "slack_channels": slack_channels,
+                "gmail_labels": gmail_labels,
+                "notion_pages": notion_pages,
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(f"Error getting project {project_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to get project")
+
+
+@app.put("/api/projects/{project_id}")
+async def update_project(project_id: str, payload: ProjectUpdateRequest):
+    """Update an existing project."""
+    try:
+        fields: Dict[str, Any] = payload.dict(exclude_unset=True)
+        project = db_manager.update_project(project_id, **fields)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        return {
+            "id": project.id,
+            "name": project.name,
+            "description": project.description,
+            "status": project.status,
+            "summary": project.summary,
+            "main_goal": project.main_goal,
+            "current_status_summary": project.current_status_summary,
+            "important_notes": project.important_notes,
+            "created_at": project.created_at.isoformat() if project.created_at else None,
+            "updated_at": project.updated_at.isoformat() if project.updated_at else None,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(f"Error updating project {project_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to update project")
+
+
+@app.delete("/api/projects/{project_id}")
+async def delete_project(project_id: str):
+    """Delete a project and all associated mappings."""
+    try:
+        db_manager.delete_project(project_id)
+        return {"status": "ok"}
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(f"Error deleting project {project_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to delete project")
+
+
+@app.post("/api/projects/{project_id}/sources")
+async def add_project_sources(project_id: str, sources: List[ProjectSourcePayload]):
+    """Add one or more sources to a project."""
+    try:
+        project = db_manager.get_project(project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        created: List[Dict[str, Any]] = []
+        for s in sources:
+            mapping = db_manager.add_project_source(
+                project_id=project_id,
+                source_type=s.source_type,
+                source_id=s.source_id,
+                display_name=s.display_name,
+            )
+            created.append(
+                {
+                    "id": mapping.id,
+                    "source_type": mapping.source_type,
+                    "source_id": mapping.source_id,
+                    "display_name": mapping.display_name,
+                }
+            )
+
+        return {"sources": created}
+    except HTTPException:
+        raise
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(f"Error adding sources to project {project_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to add project sources")
+
+
+@app.delete("/api/projects/{project_id}/sources/{source_type}/{source_id}")
+async def delete_project_source(project_id: str, source_type: str, source_id: str):
+    """Remove a specific source mapping from a project."""
+    try:
+        project = db_manager.get_project(project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        db_manager.remove_project_source(project_id, source_type, source_id)
+        return {"status": "ok"}
+    except HTTPException:
+        raise
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(
+            f"Error removing source {source_type}:{source_id} from project {project_id}: {e}",
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="Failed to remove project source")
+
+
+@app.post("/api/projects/{project_id}/auto-summary")
+async def generate_project_summary(project_id: str, payload: ProjectSummaryRequest):
+    """Use the AI brain to generate a short description and summary for a project.
+
+    This uses the same RAG engine and ChatGPT backend as the main chat, but the
+    retrieval is scoped to Slack/Gmail/Notion data mapped to the project.
+    """
+
+    try:
+        project = db_manager.get_project(project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        sources = db_manager.get_project_sources(project_id)
+        slack_channel_ids = [s.source_id for s in sources if s.source_type == "slack_channel"]
+        gmail_label_ids = [s.source_id for s in sources if s.source_type == "gmail_label"]
+        notion_page_ids = [s.source_id for s in sources if s.source_type == "notion_page"]
+
+        if not (slack_channel_ids or gmail_label_ids or notion_page_ids):
+            raise HTTPException(
+                status_code=400,
+                detail="Project has no linked sources; add Slack/Gmail/Notion sources first.",
+            )
+
+        # ------------------------------------------------------------------
+        # Build a concrete text context directly from the project's sources.
+        # This makes the summary robust even if vector embeddings are missing
+        # or the search query does not match message contents.
+        # ------------------------------------------------------------------
+
+        engine = await get_rag_engine()
+
+        context_lines: List[str] = []
+        slack_limit = 80
+        gmail_limit = 40
+        notion_limit = 5
+
+        with db_manager.get_session() as session:
+            # Slack: recent messages from mapped channels
+            if slack_channel_ids:
+                slack_query = (
+                    session.query(Message, Channel, User)
+                    .join(Channel, Message.channel_id == Channel.channel_id)
+                    .outerjoin(User, Message.user_id == User.user_id)
+                    .filter(Message.channel_id.in_(slack_channel_ids))
+                    .order_by(Message.timestamp.desc())
+                    .limit(slack_limit)
+                )
+
+                for msg, ch, user in slack_query.all():
+                    if not msg.text:
+                        continue
+                    user_name = None
+                    if user is not None:
+                        user_name = (
+                            user.real_name
+                            or user.display_name
+                            or user.username
+                        )
+                    ts = (
+                        datetime.fromtimestamp(msg.timestamp).isoformat()
+                        if msg.timestamp
+                        else ""
+                    )
+                    text = (msg.text or "").replace("\n", " ").strip()
+                    context_lines.append(
+                        f"[SLACK] {ts} #{ch.name or ch.channel_id} "
+                        f"{user_name or 'Someone'}: {text}"
+                    )
+
+            # Gmail: recent messages for mapped labels
+            if gmail_label_ids:
+                gmail_query = session.query(GmailMessage)
+                label_filters = [
+                    cast(GmailMessage.label_ids, JSONB).contains([lbl])
+                    for lbl in gmail_label_ids
+                ]
+                if label_filters:
+                    gmail_query = gmail_query.filter(or_(*label_filters))
+
+                gmail_query = gmail_query.order_by(GmailMessage.date.desc()).limit(
+                    gmail_limit
+                )
+
+                for email in gmail_query.all():
+                    ts = (
+                        email.date.isoformat()
+                        if email.date
+                        else (email.created_at.isoformat() if email.created_at else "")
+                    )
+                    from_addr = email.from_address or "Unknown sender"
+                    subject = (email.subject or "No subject").replace("\n", " ").strip()
+                    snippet = (
+                        email.snippet
+                        or (email.body_text[:200] if email.body_text else "")
+                    )
+                    snippet = (snippet or "").replace("\n", " ").strip()
+                    context_lines.append(
+                        f"[GMAIL] {ts} from {from_addr} – {subject}: {snippet}"
+                    )
+
+            # Notion: a small slice of content from mapped pages (via RAG helper)
+            notion_pages: List[NotionPage] = []
+            if notion_page_ids:
+                notion_pages = (
+                    session.query(NotionPage)
+                    .filter(NotionPage.page_id.in_(notion_page_ids))
+                    .order_by(NotionPage.last_edited_time.desc())
+                    .limit(notion_limit)
+                    .all()
+                )
+
+        # Fetch Notion page text outside the DB session using the RAG helpers
+        for page in notion_pages:
+            try:
+                page_text = engine._get_notion_page_text(page.page_id, max_blocks=40)
+            except Exception:
+                page_text = ""
+
+            if not page_text:
+                continue
+
+            snippet = page_text.replace("\n", " ").strip()[:400]
+            context_lines.append(
+                f"[NOTION] {page.title or 'Untitled page'}: {snippet}"
+            )
+
+        if not context_lines:
+            raw_text = (
+                "I don't see any Slack messages, Gmail threads, or Notion pages "
+                "for this project yet, so I cannot summarize actual activity."
+            )
+        else:
+            # Keep context to a reasonable size for the LLM
+            max_chars = 8000
+            context_text = "\n".join(context_lines)
+            if len(context_text) > max_chars:
+                context_text = context_text[-max_chars:]
+
+            system_prompt = (
+                "You are helping maintain a single source of truth for a cross-tool "
+                "project. Based ONLY on the context from Slack, Gmail, and Notion "
+                "shown below, produce:\n\n"
+                "1) A one-line short description of the project (max 140 characters).\n"
+                "2) A 3-5 sentence high-level summary capturing goals, current state, "
+                "and important updates.\n"
+                "3) A concise main goal for the project (one or two sentences).\n"
+                "4) A brief current status line (one or two sentences).\n"
+                "5) A short list of important notes / risks / decisions (1-4 bullet points).\n\n"
+                "Prefer summarizing what *is* known over saying there is not enough "
+                "information, unless the context is truly empty. Return your answer "
+                "as compact JSON with keys 'short_description', 'summary', 'main_goal', "
+                "'current_status', and 'important_notes'."
+            )
+
+            user_prompt = (
+                f"Project name: {project.name}\n\n"
+                "Context from linked Slack, Gmail, and Notion sources "
+                "(most recent items first):\n"
+                f"{context_text}"
+            )
+
+            response = engine.llm.invoke(
+                [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=user_prompt),
+                ]
+            )
+
+            raw_text = response.content.strip()
+
+        short_desc = None
+        summary = None
+        main_goal_text: Optional[str] = None
+        current_status_text: Optional[str] = None
+        important_notes_text: Optional[str] = None
+
+        # Try to parse JSON; if it fails, fall back to simple heuristics.
+        try:
+            parsed = json.loads(raw_text)
+            if isinstance(parsed, dict):
+                short_desc = parsed.get("short_description")
+                summary = parsed.get("summary")
+                main_goal_text = parsed.get("main_goal")
+                current_status_text = parsed.get("current_status") or parsed.get("status")
+                important_notes_text = parsed.get("important_notes") or parsed.get("notes")
+        except Exception:
+            pass
+
+        if not short_desc or not summary:
+            # Heuristic: treat first line as short description, rest as summary.
+            lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
+            if lines:
+                short_desc = short_desc or lines[0][:140]
+                summary = summary or ("\n".join(lines[1:]) if len(lines) > 1 else lines[0])
+
+        # Coerce all fields to plain strings or None so they can be safely
+        # saved into ProjectUpdateRequest (Optional[str] fields).
+        def _to_str(value: Any) -> Optional[str]:
+            if value is None:
+                return None
+            if isinstance(value, str):
+                return value
+            if isinstance(value, (list, tuple)):
+                return "\n".join(str(v) for v in value)
+            return str(value)
+
+        short_desc = _to_str(short_desc)
+        summary = _to_str(summary)
+        main_goal_text = _to_str(main_goal_text)
+        current_status_text = _to_str(current_status_text)
+        important_notes_text = _to_str(important_notes_text)
+
+        return {
+            "project_id": project_id,
+            "short_description": short_desc,
+            "summary": summary,
+            "main_goal": main_goal_text,
+            "current_status": current_status_text,
+            "important_notes": important_notes_text,
+            "raw": raw_text,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(f"Error generating summary for project {project_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to generate project summary")
+
+
+@app.post("/api/projects/{project_id}/sync")
+async def sync_project_data(project_id: str):
+    """Embed Slack and Gmail data for the project's mapped sources.
+
+    This endpoint generates Qwen embeddings for Slack messages and Gmail
+    messages that belong to the project's linked channels/labels and do not
+    yet have embeddings. It also returns simple last-synced timestamps per
+    source type so the UI can show freshness.
+    """
+
+    try:
+        project = db_manager.get_project(project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        sources = db_manager.get_project_sources(project_id)
+        slack_channel_ids = [s.source_id for s in sources if s.source_type == "slack_channel"]
+        gmail_label_ids = [s.source_id for s in sources if s.source_type == "gmail_label"]
+        notion_page_ids = [s.source_id for s in sources if s.source_type == "notion_page"]
+
+        if not (slack_channel_ids or gmail_label_ids or notion_page_ids):
+            raise HTTPException(
+                status_code=400,
+                detail="Project has no linked sources; add Slack/Gmail/Notion sources first.",
+            )
+
+        engine = await get_rag_engine()
+
+        def _sync() -> Dict[str, Any]:
+            engine._ensure_models_loaded()
+            embedding_model = engine.embedding_model
+
+            indexed_slack = 0
+            indexed_gmail = 0
+
+            last_slack_ts: Optional[datetime] = None
+            last_gmail_ts: Optional[datetime] = None
+            last_notion_ts: Optional[datetime] = None
+
+            # Detect embedding dimension for dynamic backends (e.g. sentence-transformers)
+            embed_dim: Optional[int] = None
+            try:
+                if hasattr(embedding_model, "get_embedding_dim"):
+                    embed_dim = embedding_model.get_embedding_dim()
+            except Exception:
+                embed_dim = None
+
+            with db_manager.get_session() as session:
+                # Always compute last-synced timestamps for UI
+                if slack_channel_ids:
+                    last_msg = (
+                        session.query(Message)
+                        .filter(Message.channel_id.in_(slack_channel_ids))
+                        .order_by(Message.timestamp.desc())
+                        .first()
+                    )
+                    if last_msg and last_msg.timestamp:
+                        last_slack_ts = datetime.fromtimestamp(last_msg.timestamp)
+
+                if gmail_label_ids:
+                    gmail_base = session.query(GmailMessage)
+                    label_filters = [
+                        cast(GmailMessage.label_ids, JSONB).contains([lbl])
+                        for lbl in gmail_label_ids
+                    ]
+                    if label_filters:
+                        gmail_base = gmail_base.filter(or_(*label_filters))
+
+                    last_email = gmail_base.order_by(GmailMessage.date.desc()).first()
+                    if last_email and last_email.date:
+                        last_gmail_ts = last_email.date
+
+                if notion_page_ids:
+                    page = (
+                        session.query(NotionPage)
+                        .filter(NotionPage.page_id.in_(notion_page_ids))
+                        .order_by(NotionPage.last_edited_time.desc())
+                        .first()
+                    )
+                    if page and page.last_edited_time:
+                        last_notion_ts = page.last_edited_time
+
+                # If we are using a non-Qwen backend (e.g. sentence-transformers with 384 dims),
+                # skip writing to the 8192-dim qwen_embedding pgvector column to avoid
+                # dimension mismatch errors. Retrieval will fall back to keyword search.
+                if embed_dim is not None and embed_dim != 8192:
+                    logger.warning(
+                        "Sync called with non-Qwen embedding model (%s dims); "
+                        "skipping vector embedding and only updating timestamps.",
+                        embed_dim,
+                    )
+                    return {
+                        "indexed_slack": 0,
+                        "indexed_gmail": 0,
+                        "indexed_notion": 0,
+                        "last_synced": {
+                            "slack": last_slack_ts.isoformat() if last_slack_ts else None,
+                            "gmail": last_gmail_ts.isoformat() if last_gmail_ts else None,
+                            "notion": last_notion_ts.isoformat() if last_notion_ts else None,
+                        },
+                    }
+
+                # Otherwise, generate Qwen3 embeddings for unmapped rows
+                if slack_channel_ids:
+                    slack_query = (
+                        session.query(Message)
+                        .filter(Message.channel_id.in_(slack_channel_ids))
+                        .filter(Message.text.isnot(None))
+                        .filter(Message.text != "")
+                        .filter(Message.qwen_embedding.is_(None))
+                    )
+
+                    slack_messages = slack_query.all()
+                    batch_size = 64
+                    for i in range(0, len(slack_messages), batch_size):
+                        batch = slack_messages[i : i + batch_size]
+                        texts = [m.text for m in batch]
+                        embeddings = embedding_model.encode(
+                            texts,
+                            batch_size=len(texts),
+                            is_query=False,
+                            show_progress=False,
+                        )
+                        for msg, emb in zip(batch, embeddings):
+                            msg.qwen_embedding = emb.tolist()
+                        indexed_slack += len(batch)
+                        session.commit()
+
+                if gmail_label_ids:
+                    gmail_query = session.query(GmailMessage)
+                    label_filters = [
+                        cast(GmailMessage.label_ids, JSONB).contains([lbl])
+                        for lbl in gmail_label_ids
+                    ]
+                    if label_filters:
+                        gmail_query = gmail_query.filter(or_(*label_filters))
+
+                    gmail_to_embed = gmail_query.filter(GmailMessage.qwen_embedding.is_(None)).all()
+
+                    batch_size = 32
+                    for i in range(0, len(gmail_to_embed), batch_size):
+                        batch = gmail_to_embed[i : i + batch_size]
+                        texts: List[str] = []
+                        for email in batch:
+                            text_parts: List[str] = []
+                            if email.subject:
+                                text_parts.append(email.subject)
+                            if email.body_text:
+                                text_parts.append(email.body_text[:1000])
+                            text = "\n\n".join(text_parts).strip() or "Empty email"
+                            texts.append(text)
+
+                        embeddings = embedding_model.encode(
+                            texts,
+                            batch_size=len(texts),
+                            is_query=False,
+                            show_progress=False,
+                        )
+                        for email, emb in zip(batch, embeddings):
+                            email.qwen_embedding = emb.tolist()
+                        indexed_gmail += len(batch)
+                        session.commit()
+
+            return {
+                "indexed_slack": indexed_slack,
+                "indexed_gmail": indexed_gmail,
+                "indexed_notion": 0,
+                "last_synced": {
+                    "slack": last_slack_ts.isoformat() if last_slack_ts else None,
+                    "gmail": last_gmail_ts.isoformat() if last_gmail_ts else None,
+                    "notion": last_notion_ts.isoformat() if last_notion_ts else None,
+                },
+            }
+
+        sync_result = await _run_in_executor(_sync)
+
+        return {"project_id": project_id, **sync_result}
+
+    except HTTPException:
+        raise
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(f"Error syncing data for project {project_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to sync project data")
+
+
+@app.get("/api/projects/{project_id}/activity")
+async def get_project_activity(project_id: str, limit: int = 50):
+    """Return recent Slack/Gmail/Notion activity for a project.
+
+    This aggregates events from mapped Slack channels, Gmail labels, and
+    Notion pages and returns them as a unified, time-sorted list.
+    """
+
+    try:
+        project = db_manager.get_project(project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        sources = db_manager.get_project_sources(project_id)
+        slack_channel_ids = [s.source_id for s in sources if s.source_type == "slack_channel"]
+        gmail_label_ids = [s.source_id for s in sources if s.source_type == "gmail_label"]
+        notion_page_ids = [s.source_id for s in sources if s.source_type == "notion_page"]
+
+        activities: List[Dict[str, Any]] = []
+
+        with db_manager.get_session() as session:
+            # Slack activity
+            if slack_channel_ids:
+                slack_query = (
+                    session.query(Message, Channel, User)
+                    .join(Channel, Message.channel_id == Channel.channel_id)
+                    .outerjoin(User, Message.user_id == User.user_id)
+                    .filter(Message.channel_id.in_(slack_channel_ids))
+                    .order_by(Message.timestamp.desc())
+                    .limit(limit)
+                )
+
+                for msg, ch, user in slack_query.all():
+                    user_name = None
+                    if user is not None:
+                        user_name = (
+                            user.real_name
+                            or user.display_name
+                            or user.username
+                        )
+
+                    ts = datetime.fromtimestamp(msg.timestamp) if msg.timestamp else datetime.utcnow()
+                    activities.append(
+                        {
+                            "source": "slack",
+                            "timestamp": ts.isoformat(),
+                            "title": f"{user_name or 'Someone'} in #{ch.name or ch.channel_id}",
+                            "snippet": msg.text or "",
+                            "metadata": {
+                                "channel_id": ch.channel_id,
+                                "channel_name": ch.name,
+                                "user_id": msg.user_id,
+                                "user_name": user_name,
+                            },
+                        }
+                    )
+
+            # Gmail activity
+            if gmail_label_ids:
+                gmail_query = session.query(GmailMessage)
+                label_filters = [
+                    cast(GmailMessage.label_ids, JSONB).contains([lbl]) for lbl in gmail_label_ids
+                ]
+                if label_filters:
+                    gmail_query = gmail_query.filter(or_(*label_filters))
+
+                gmail_query = gmail_query.order_by(GmailMessage.date.desc()).limit(limit)
+
+                for email in gmail_query.all():
+                    ts = email.date or email.created_at or datetime.utcnow()
+                    from_addr = email.from_address or "Unknown sender"
+                    subject = email.subject or "No subject"
+                    activities.append(
+                        {
+                            "source": "gmail",
+                            "timestamp": ts.isoformat(),
+                            "title": f"{from_addr} – {subject}",
+                            "snippet": email.snippet or (email.body_text[:200] if email.body_text else ""),
+                            "metadata": {
+                                "message_id": email.message_id,
+                                "from": from_addr,
+                                "subject": subject,
+                            },
+                        }
+                    )
+
+            # Notion activity
+            if notion_page_ids:
+                notion_query = (
+                    session.query(NotionPage)
+                    .filter(NotionPage.page_id.in_(notion_page_ids))
+                    .order_by(NotionPage.last_edited_time.desc())
+                    .limit(limit)
+                )
+
+                for page in notion_query.all():
+                    ts = page.last_edited_time or page.updated_at or datetime.utcnow()
+                    activities.append(
+                        {
+                            "source": "notion",
+                            "timestamp": ts.isoformat(),
+                            "title": page.title or "Untitled page",
+                            "snippet": None,
+                            "metadata": {
+                                "page_id": page.page_id,
+                                "url": page.url,
+                            },
+                        }
+                    )
+
+        # Sort combined list and enforce global limit
+        activities.sort(key=lambda a: a.get("timestamp") or "", reverse=True)
+        if limit > 0:
+            activities = activities[:limit]
+
+        return {"project_id": project_id, "activities": activities}
+
+    except HTTPException:
+        raise
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(f"Error fetching activity for project {project_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to load project activity")
+
+
+@app.post("/api/chat/project/{project_id}", response_model=ChatResponse)
+async def chat_project(project_id: str, payload: ProjectChatRequest):
+    """Project-scoped chat endpoint using the same ChatGPT API as RAG.
+
+    The RAG engine restricts retrieval to Slack/Gmail/Notion data mapped to
+    the given project via ProjectSource rows.
+    """
+
+    query = payload.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Query must not be empty")
+
+    try:
+        project = db_manager.get_project(project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        sources = db_manager.get_project_sources(project_id)
+        slack_channel_ids = [s.source_id for s in sources if s.source_type == "slack_channel"]
+        gmail_label_ids = [s.source_id for s in sources if s.source_type == "gmail_label"]
+        notion_page_ids = [s.source_id for s in sources if s.source_type == "notion_page"]
+
+        engine = await get_rag_engine()
+
+        result = await _run_in_executor(
+            engine.query_project,
+            query,
+            slack_channel_ids,
+            gmail_label_ids,
+            notion_page_ids,
+            project.name,
+            payload.conversation_history or [],
+        )
+
+        return ChatResponse(
+            response=result.get("response", ""),
+            sources=result.get("sources", []),
+            intent=result.get("intent", ""),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(f"Error in project chat for {project_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Project chat failed")
 
 
 # File upload configuration
