@@ -453,6 +453,33 @@ class WorkforceAIBrain:
             {
                 "type": "function",
                 "function": {
+                    "name": "get_notion_page_content",
+                    "description": "Get flattened text content of a Notion page, optionally including subpages.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "page_id": {
+                                "type": "string",
+                                "description": "Notion page ID to read",
+                            },
+                            "include_subpages": {
+                                "type": "boolean",
+                                "description": "Whether to also traverse and include subpages in the content",
+                                "default": False,
+                            },
+                            "max_blocks": {
+                                "type": "integer",
+                                "description": "Maximum number of blocks to read (safety cap, default 500)",
+                                "default": 500,
+                            },
+                        },
+                        "required": ["page_id"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "query_notion_database",
                     "description": "Query a Notion database and list matching rows. Use this when user asks to filter or view items in a Notion project/task database.",
                     "parameters": {
@@ -502,6 +529,41 @@ class WorkforceAIBrain:
                         "required": ["page_id", "properties_json"]
                     }
                 }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "update_notion_page_content",
+                    "description": "Find and replace text inside a Notion page (and optionally subpages). Use for targeted edits like changing dates.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "page_id": {
+                                "type": "string",
+                                "description": "Notion page ID whose content should be updated",
+                            },
+                            "find_text": {
+                                "type": "string",
+                                "description": "Exact text to search for in page blocks",
+                            },
+                            "replace_text": {
+                                "type": "string",
+                                "description": "Replacement text",
+                            },
+                            "include_subpages": {
+                                "type": "boolean",
+                                "description": "Whether to also search and replace inside subpages",
+                                "default": False,
+                            },
+                            "max_matches": {
+                                "type": "integer",
+                                "description": "Maximum number of matches to replace across the page tree (default 50)",
+                                "default": 50,
+                            },
+                        },
+                        "required": ["page_id", "find_text", "replace_text"],
+                    },
+                },
             },
             {
                 "type": "function",
@@ -1187,9 +1249,10 @@ class WorkforceAIBrain:
                 explanation = destructive_tools[tool_name]
                 return (
                     f"Safety guardrail: refusing to execute {tool_name} ({explanation}) "
-                    "without explicit user confirmation. Explain to the user what you plan "
-                    "to do and ask them to confirm, then call this tool again with "
-                    "confirmed=true."
+                    "without explicit user confirmation. If the user has NOT confirmed yet, "
+                    "explain what you plan to do and ask them once. If they ALREADY "
+                    "confirmed in this conversation, call the tool again now with "
+                    "confirmed=true instead of asking again."
                 )
 
         try:
@@ -1251,6 +1314,23 @@ class WorkforceAIBrain:
             elif tool_name == "list_notion_pages":
                 result = self.tools_handler.list_notion_pages(
                     limit=arguments.get("limit", 20)
+                )
+            
+            elif tool_name == "get_notion_page_content":
+                result = self.tools_handler.get_notion_page_content(
+                    page_id=arguments.get("page_id", ""),
+                    include_subpages=arguments.get("include_subpages", False),
+                    max_depth=3,
+                    max_blocks=arguments.get("max_blocks", 500),
+                )
+            
+            elif tool_name == "update_notion_page_content":
+                result = self.tools_handler.update_notion_page_content(
+                    page_id=arguments.get("page_id", ""),
+                    find_text=arguments.get("find_text", ""),
+                    replace_text=arguments.get("replace_text", ""),
+                    include_subpages=arguments.get("include_subpages", False),
+                    max_matches=arguments.get("max_matches", 50),
                 )
             
             elif tool_name == "search_notion_content":

@@ -310,6 +310,17 @@ class HybridRAGEngine:
                     # Calculate cosine similarity
                     doc_emb = np.array(msg.qwen_embedding)
                     score = np.dot(query_emb, doc_emb)
+
+                    user_name = None
+                    try:
+                        if msg.user is not None:
+                            user_name = (
+                                msg.user.real_name
+                                or msg.user.display_name
+                                or msg.user.username
+                            )
+                    except Exception:
+                        user_name = None
                     
                     results.append({
                         'type': 'slack',
@@ -317,8 +328,10 @@ class HybridRAGEngine:
                         'score': float(score),
                         'metadata': {
                             'channel': msg.channel.name,
-                            'user': msg.user.name,
-                            'timestamp': msg.timestamp
+                            'channel_id': msg.channel_id,
+                            'user': user_name,
+                            'user_id': msg.user_id,
+                            'timestamp': msg.timestamp,
                         }
                     })
             
@@ -338,7 +351,8 @@ class HybridRAGEngine:
                         'metadata': {
                             'from': email.from_address,
                             'subject': email.subject,
-                            'date': email.date
+                            'date': email.date,
+                            'label_ids': email.label_ids or [],
                         }
                     })
         
@@ -403,29 +417,50 @@ class HybridRAGEngine:
         
         with self.db.get_session() as session:
             # Search Slack messages
-            slack_messages = session.query(Message).join(Channel).join(User)\
-                .filter(Message.text.ilike(f'%{query}%'))\
-                .limit(limit).all()
+            slack_messages = (
+                session.query(Message)
+                .join(Channel)
+                .join(User)
+                .filter(Message.text.ilike(f'%{query}%'))
+                .limit(limit)
+                .all()
+            )
             
             for msg in slack_messages:
+                user_name = None
+                try:
+                    if msg.user is not None:
+                        user_name = (
+                            msg.user.real_name
+                            or msg.user.display_name
+                            or msg.user.username
+                        )
+                except Exception:
+                    user_name = None
+
                 results.append({
                     'type': 'slack',
                     'text': msg.text,
                     'score': 1.0,  # No score for keyword search
                     'metadata': {
                         'channel': msg.channel.name,
-                        'user': msg.user.name,
-                        'timestamp': msg.timestamp
+                        'channel_id': msg.channel_id,
+                        'user': user_name,
+                        'user_id': msg.user_id,
+                        'timestamp': msg.timestamp,
                     }
                 })
             
             # Search Gmail messages
-            gmail_messages = session.query(GmailMessage)\
+            gmail_messages = (
+                session.query(GmailMessage)
                 .filter(
-                    (GmailMessage.subject.ilike(f'%{query}%')) |
-                    (GmailMessage.body_text.ilike(f'%{query}%'))
-                )\
-                .limit(limit).all()
+                    (GmailMessage.subject.ilike(f'%{query}%'))
+                    | (GmailMessage.body_text.ilike(f'%{query}%'))
+                )
+                .limit(limit)
+                .all()
+            )
             
             for email in gmail_messages:
                 results.append({
@@ -435,7 +470,8 @@ class HybridRAGEngine:
                     'metadata': {
                         'from': email.from_address,
                         'subject': email.subject,
-                        'date': email.date
+                        'date': email.date,
+                        'label_ids': email.label_ids or [],
                     }
                 })
         
@@ -509,6 +545,153 @@ class HybridRAGEngine:
         logger.info(f"RRF fusion produced {len(fused_results)} unique results")
         return fused_results
     
+    def _vector_search_scoped(
+        self,
+        query: str,
+        channel_ids: Optional[List[str]] = None,
+        label_ids: Optional[List[str]] = None,
+        notion_page_ids: Optional[List[str]] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Vector search restricted to specific Slack channels, Gmail labels, and Notion pages.
+
+        This reuses the global vector search and filters results based on
+        metadata derived from the database / Notion APIs.
+        """
+
+        base_results = self._vector_search(query, limit=limit)
+        if not channel_ids and not label_ids and not notion_page_ids:
+            return base_results
+
+        channel_set = set(channel_ids or [])
+        label_set = set(label_ids or [])
+        notion_set = set(notion_page_ids or [])
+
+        scoped: List[Dict[str, Any]] = []
+        for doc in base_results:
+            meta = doc.get('metadata') or {}
+            doc_type = doc.get('type')
+
+            if doc_type == 'slack':
+                ch_id = meta.get('channel_id')
+                if channel_set and ch_id not in channel_set:
+                    continue
+            elif doc_type == 'gmail':
+                doc_labels = set(meta.get('label_ids') or [])
+                if label_set and doc_labels.isdisjoint(label_set):
+                    continue
+            elif doc_type == 'notion':
+                page_id = meta.get('page_id')
+                if notion_set and page_id not in notion_set:
+                    continue
+
+            scoped.append(doc)
+
+        return scoped
+
+    def _keyword_search_scoped(
+        self,
+        query: str,
+        channel_ids: Optional[List[str]] = None,
+        label_ids: Optional[List[str]] = None,
+        notion_page_ids: Optional[List[str]] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Keyword search restricted to specific Slack channels, Gmail labels, and Notion pages."""
+
+        base_results = self._keyword_search(query, limit=limit)
+        if not channel_ids and not label_ids and not notion_page_ids:
+            return base_results
+
+        channel_set = set(channel_ids or [])
+        label_set = set(label_ids or [])
+        notion_set = set(notion_page_ids or [])
+
+        scoped: List[Dict[str, Any]] = []
+        for doc in base_results:
+            meta = doc.get('metadata') or {}
+            doc_type = doc.get('type')
+
+            if doc_type == 'slack':
+                ch_id = meta.get('channel_id')
+                if channel_set and ch_id not in channel_set:
+                    continue
+            elif doc_type == 'gmail':
+                doc_labels = set(meta.get('label_ids') or [])
+                if label_set and doc_labels.isdisjoint(label_set):
+                    continue
+            elif doc_type == 'notion':
+                page_id = meta.get('page_id')
+                if notion_set and page_id not in notion_set:
+                    continue
+
+            scoped.append(doc)
+
+        return scoped
+
+    def _retrieve_context_scoped(
+        self,
+        query: str,
+        channel_ids: Optional[List[str]] = None,
+        label_ids: Optional[List[str]] = None,
+        notion_page_ids: Optional[List[str]] = None,
+        top_k: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Hybrid retrieval with reranking, restricted to specific sources.
+
+        This mirrors _retrieve_context but filters both vector and keyword
+        results using the scoped metadata filters before fusion and rerank.
+        """
+
+        logger.info("Retrieving project-scoped context for: %s", query)
+
+        # Step 1: Vector search (scoped)
+        vector_results = self._vector_search_scoped(
+            query,
+            channel_ids=channel_ids,
+            label_ids=label_ids,
+            notion_page_ids=notion_page_ids,
+            limit=20,
+        )
+
+        # Step 2: Keyword search (scoped)
+        keyword_results = self._keyword_search_scoped(
+            query,
+            channel_ids=channel_ids,
+            label_ids=label_ids,
+            notion_page_ids=notion_page_ids,
+            limit=20,
+        )
+
+        # Step 3: RRF fusion
+        fused_results = self._rrf_fusion(vector_results, keyword_results)
+
+        # Step 4: Rerank top 30 with Qwen3-Reranker
+        if len(fused_results) > 0:
+            self._ensure_models_loaded()
+
+            candidates = fused_results[:30]
+            texts = [doc['text'] for doc in candidates]
+
+            reranked = self.reranker_model.rerank(query, texts, top_k=top_k)
+
+            # Match back to original documents
+            final_results: List[Dict[str, Any]] = []
+            for text, score in reranked:
+                for doc in candidates:
+                    if doc['text'] == text:
+                        doc['rerank_score'] = score
+                        final_results.append(doc)
+                        break
+
+            logger.info(
+                "Project-scoped reranking selected top %s documents",
+                len(final_results),
+            )
+            return final_results
+
+        return []
+
     def _retrieve_context(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """Hybrid retrieval with reranking.
         
@@ -540,7 +723,7 @@ class HybridRAGEngine:
             reranked = self.reranker_model.rerank(query, texts, top_k=top_k)
             
             # Match back to original documents
-            final_results = []
+            final_results: List[Dict[str, Any]] = []
             for text, score in reranked:
                 for doc in candidates:
                     if doc['text'] == text:
@@ -673,6 +856,90 @@ Answer the question based on the context above. Be concise and accurate."""
             "sources": result.get('sources', []),
             "intent": result.get('intent', ''),
             "tool_calls": result.get('tool_calls', [])
+        }
+    
+    def query_project(
+        self,
+        user_query: str,
+        channel_ids: Optional[List[str]] = None,
+        label_ids: Optional[List[str]] = None,
+        notion_page_ids: Optional[List[str]] = None,
+        project_name: Optional[str] = None,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+        force_search: bool = False,
+    ) -> Dict[str, Any]:
+        """Project-scoped query that only uses data from mapped sources.
+
+        This reuses the same ChatGPT (ChatOpenAI) model as the global RAG
+        but restricts retrieval to Slack channels, Gmail labels, and Notion
+        pages associated with a given project.
+        """
+
+        intent = self._classify_intent(user_query)
+        if force_search:
+            # Bypass intent classification when the caller knows this is a
+            # retrieval-style query (e.g. internal summarization tasks).
+            intent = 'search'
+
+        context: List[Dict[str, Any]] = []
+        if intent in ['search', 'hybrid']:
+            context = self._retrieve_context_scoped(
+                user_query,
+                channel_ids=channel_ids or [],
+                label_ids=label_ids or [],
+                notion_page_ids=notion_page_ids or [],
+                top_k=5,
+            )
+
+        # Build context string for the prompt
+        context_str = ''
+        if context:
+            context_str = '\n\n'.join(
+                [f"[{doc['type'].upper()}] {doc['text'][:300]}..." for doc in context]
+            )
+
+        # Optionally incorporate brief conversation history
+        history_str = ''
+        if conversation_history:
+            trimmed = conversation_history[-10:]
+            history_lines = []
+            for msg in trimmed:
+                role = msg.get('role', 'user')
+                content = msg.get('content', '')
+                prefix = 'User' if role == 'user' else 'Assistant'
+                history_lines.append(f"{prefix}: {content}")
+            history_str = '\n'.join(history_lines)
+
+        project_label = project_name or 'this project'
+
+        system_prompt = (
+            "You are a helpful project assistant for a cross-application project. "
+            "You ONLY use the provided context from Slack, Gmail, and Notion that "
+            "belongs to this project. If the context is insufficient, say you "
+            "don't have enough information instead of guessing. Always keep "
+            "answers concise and focused on this project."
+        )
+
+        user_prompt_parts = [
+            f"Project: {project_label}",
+            f"Question: {user_query}",
+        ]
+        if history_str:
+            user_prompt_parts.append("Recent conversation history:\n" + history_str)
+        if context_str:
+            user_prompt_parts.append("Context:\n" + context_str)
+
+        user_prompt = '\n\n'.join(user_prompt_parts) + '\n\nAnswer based on the project context above.'
+
+        response = self.llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt),
+        ])
+
+        return {
+            'response': response.content,
+            'sources': context,
+            'intent': intent,
         }
     
     async def stream_query(self, user_query: str) -> AsyncIterator[Dict[str, Any]]:

@@ -102,6 +102,35 @@ class UpdateNotionPageInput(BaseModel):
     content: str = Field(description="New content to append or update")
 
 
+class GetNotionPageContentInput(BaseModel):
+    """Input for retrieving Notion page content, optionally including subpages."""
+    page_id: str = Field(description="Notion page ID")
+    include_subpages: bool = Field(
+        default=False,
+        description="Whether to also traverse and include subpages in the content",
+    )
+    max_blocks: int = Field(
+        default=500,
+        description="Maximum number of blocks to read for safety/performance",
+    )
+
+
+class UpdateNotionPageContentInput(BaseModel):
+    """Input for find-and-replace inside Notion page content."""
+
+    page_id: str = Field(description="Notion page ID whose content should be updated")
+    find_text: str = Field(description="Exact text to search for in page blocks")
+    replace_text: str = Field(description="Replacement text")
+    include_subpages: bool = Field(
+        default=False,
+        description="Whether to also search and replace inside subpages",
+    )
+    max_matches: int = Field(
+        default=50,
+        description="Safety cap: maximum number of matches to replace across the page tree",
+    )
+
+
 class TrackProjectInput(BaseModel):
     """Input for tracking a project across platforms."""
     project_name: str = Field(description="Name of the project to track")
@@ -417,8 +446,24 @@ class WorkforceTools:
                 for msg in messages:
                     from datetime import datetime
                     timestamp = datetime.fromtimestamp(msg.timestamp).strftime("%Y-%m-%d %H:%M")
+                    user_obj = getattr(msg, "user", None)
+                    if user_obj is not None:
+                        user_name = (
+                            getattr(user_obj, "display_name", None)
+                            or getattr(user_obj, "real_name", None)
+                            or getattr(user_obj, "username", None)
+                            or getattr(user_obj, "user_id", None)
+                            or "Someone"
+                        )
+                    else:
+                        user_name = getattr(msg, "user_id", None) or "Someone"
+
+                    channel_obj = getattr(msg, "channel", None)
+                    channel_name = getattr(channel_obj, "name", None) if channel_obj is not None else None
+                    channel_display = channel_name or getattr(msg, "channel_id", None) or "unknown"
+
                     results.append(
-                        f"[{timestamp}] {msg.user.name} in #{msg.channel.name}: {msg.text[:200]}"
+                        f"[{timestamp}] {user_name} in #{channel_display}: {msg.text[:200]}"
                     )
                 
                 return "\n\n".join(results)
@@ -1140,7 +1185,12 @@ class WorkforceTools:
             return "\n".join(lines)
         
         except Exception as e:
-            logger.error(f"Error listing attachments: {e}", exc_info=True)
+            # Don't log stack trace for expected errors (invalid IDs, etc.)
+            from googleapiclient.errors import HttpError
+            if isinstance(e, HttpError) and e.resp.status in [400, 404]:
+                logger.info(f"Gmail attachment listing failed (expected error): {e}")
+            else:
+                logger.error(f"Error listing attachments: {e}", exc_info=True)
             return f"❌ Error listing attachments: {str(e)}"
     
     def download_gmail_attachment(
@@ -1283,42 +1333,307 @@ class WorkforceTools:
     # ========================================
     # ADVANCED NOTION TOOLS
     # ========================================
-    
-    def get_notion_page_content(self, page_id: str) -> str:
-        """Get content of a Notion page."""
+
+    def get_notion_page_content(
+        self,
+        page_id: str,
+        include_subpages: bool = False,
+        max_depth: int = 3,
+        max_blocks: int = 500,
+    ) -> str:
+        """Get flattened text content of a Notion page.
+
+        Uses the Notion blocks API (GET /v1/blocks/:id/children) with
+        pagination and optional recursion into child pages to build a
+        readable text view of the page suitable for the chat agent.
+        """
+
         try:
             if not self.notion_client or not self.notion_client.test_connection():
                 return "Notion not connected"
-            
-            # Get page blocks
+
             import requests
-            response = requests.get(
-                f"https://api.notion.com/v1/blocks/{page_id}/children",
-                headers={
-                    "Authorization": f"Bearer {Config.NOTION_TOKEN}",
-                    "Notion-Version": "2022-06-28"
-                }
-            )
-            
-            if response.status_code != 200:
-                return f"Error: {response.status_code}"
-            
-            blocks = response.json().get('results', [])
-            content = []
-            
-            for block in blocks:
-                block_type = block['type']
-                if block_type == 'paragraph':
-                    text = ''.join([t.get('plain_text', '') for t in block['paragraph'].get('rich_text', [])])
-                    content.append(text)
-                elif block_type == 'heading_1':
-                    text = ''.join([t.get('plain_text', '') for t in block['heading_1'].get('rich_text', [])])
-                    content.append(f"# {text}")
-            
-            return "\n\n".join(content) if content else "No content"
+
+            if not Config.NOTION_TOKEN:
+                return "❌ NOTION_TOKEN is not configured. Please set it in your environment."
+
+            headers = {
+                "Authorization": f"Bearer {Config.NOTION_TOKEN}",
+                "Notion-Version": "2022-06-28",
+            }
+
+            text_lines: List[str] = []
+            visited_pages = set()
+
+            TEXT_BLOCK_TYPES = {
+                "paragraph",
+                "heading_1",
+                "heading_2",
+                "heading_3",
+                "bulleted_list_item",
+                "numbered_list_item",
+                "to_do",
+                "toggle",
+                "quote",
+            }
+
+            def render_rich_text(rt_list: List[Dict[str, Any]]) -> str:
+                return "".join(rt.get("plain_text", "") for rt in (rt_list or [])).strip()
+
+            def walk(parent_id: str, depth: int) -> None:
+                """Depth-first traversal of block children with pagination."""
+
+                if depth > max_depth or len(text_lines) >= max_blocks:
+                    return
+
+                cursor: Optional[str] = None
+                while True:
+                    params: Dict[str, Any] = {"page_size": 100}
+                    if cursor:
+                        params["start_cursor"] = cursor
+
+                    resp = requests.get(
+                        f"https://api.notion.com/v1/blocks/{parent_id}/children",
+                        headers=headers,
+                        params=params,
+                    )
+                    if resp.status_code != 200:
+                        logger.error(
+                            "Notion API error %s while reading children for %s: %s",
+                            resp.status_code,
+                            parent_id,
+                            resp.text[:200],
+                        )
+                        return
+
+                    data = resp.json()
+                    blocks = data.get("results", []) or []
+
+                    for block in blocks:
+                        if len(text_lines) >= max_blocks:
+                            return
+
+                        btype = block.get("type")
+
+                        # Render text-like blocks
+                        if btype in TEXT_BLOCK_TYPES:
+                            block_data = block.get(btype, {}) or {}
+                            text = render_rich_text(block_data.get("rich_text") or [])
+                            if not text:
+                                continue
+
+                            indent = "  " * depth
+                            if btype.startswith("heading_"):
+                                try:
+                                    level = int(btype.split("_")[1])
+                                except Exception:
+                                    level = 1
+                                prefix = "#" * max(1, min(level, 6))
+                                text_lines.append(f"{indent}{prefix} {text}")
+                            elif btype in {"bulleted_list_item", "numbered_list_item", "to_do"}:
+                                text_lines.append(f"{indent}- {text}")
+                            else:
+                                text_lines.append(f"{indent}{text}")
+
+                        # Recurse into children (including optional subpages)
+                        has_children = bool(block.get("has_children"))
+                        if has_children:
+                            if btype == "child_page":
+                                if not include_subpages:
+                                    continue
+                                child_id = block.get("id")
+                                if child_id and child_id not in visited_pages:
+                                    visited_pages.add(child_id)
+                                    title = (
+                                        block.get("child_page", {}).get("title")
+                                        or "Untitled page"
+                                    )
+                                    text_lines.append("")
+                                    text_lines.append(
+                                        "==== Subpage: " + title + " ===="
+                                    )
+                                    walk(child_id, depth + 1)
+                            else:
+                                child_id = block.get("id")
+                                if child_id:
+                                    walk(child_id, depth + 1)
+
+                    if not data.get("has_more"):
+                        break
+                    cursor = data.get("next_cursor")
+
+            # Start traversal from the page itself (page_id is also the root block_id)
+            walk(page_id, depth=0)
+
+            return "\n".join(text_lines) if text_lines else "No content"
+
         except Exception as e:
-            logger.error(f"Error getting page content: {e}")
+            logger.error(f"Error getting page content: {e}", exc_info=True)
             return f"Error: {str(e)}"
+
+    def update_notion_page_content(
+        self,
+        page_id: str,
+        find_text: str,
+        replace_text: str,
+        include_subpages: bool = False,
+        max_matches: int = 50,
+    ) -> str:
+        """Find and replace text inside a Notion page (and optionally subpages).
+
+        This uses the Notion blocks API (GET /v1/blocks/:id/children and
+        PATCH /v1/blocks/:id) to update paragraph/heading/list/to_do/toggle
+        blocks that contain the target text. Formatting inside those blocks
+        may be simplified, since we replace the full rich_text with a single
+        plain-text segment.
+        """
+
+        try:
+            if not find_text:
+                return "❌ find_text must not be empty."
+            if find_text == replace_text:
+                return "Nothing to update: find_text and replace_text are identical."
+
+            if not self.notion_client or not self.notion_client.test_connection():
+                return "Notion not connected"
+
+            import requests
+
+            if not Config.NOTION_TOKEN:
+                return "❌ NOTION_TOKEN is not configured. Please set it in your environment."
+
+            headers = {
+                "Authorization": f"Bearer {Config.NOTION_TOKEN}",
+                "Notion-Version": "2022-06-28",
+                "Content-Type": "application/json",
+            }
+
+            TEXT_BLOCK_TYPES = {
+                "paragraph",
+                "heading_1",
+                "heading_2",
+                "heading_3",
+                "bulleted_list_item",
+                "numbered_list_item",
+                "to_do",
+                "toggle",
+                "quote",
+            }
+
+            total_matches = 0
+            updated_blocks = 0
+            visited_pages = set()
+
+            def render_rich_text(rt_list: List[Dict[str, Any]]) -> str:
+                return "".join(rt.get("plain_text", "") for rt in (rt_list or [])).strip()
+
+            def patch_block(block: Dict[str, Any], new_text: str) -> bool:
+                btype = block.get("type")
+                if btype not in TEXT_BLOCK_TYPES:
+                    return False
+
+                payload = {
+                    btype: {
+                        "rich_text": [
+                            {
+                                "type": "text",
+                                "text": {"content": new_text},
+                            }
+                        ]
+                    }
+                }
+
+                resp = requests.patch(
+                    f"https://api.notion.com/v1/blocks/{block.get('id')}",
+                    headers=headers,
+                    json=payload,
+                )
+                if resp.status_code == 200:
+                    return True
+
+                logger.error(
+                    "Failed to patch Notion block %s (%s): %s",
+                    block.get("id"),
+                    btype,
+                    resp.text[:200],
+                )
+                return False
+
+            def walk(parent_id: str, depth: int) -> None:
+                nonlocal total_matches, updated_blocks
+                if depth > 5 or total_matches >= max_matches:
+                    return
+
+                cursor: Optional[str] = None
+                while True:
+                    params: Dict[str, Any] = {"page_size": 100}
+                    if cursor:
+                        params["start_cursor"] = cursor
+
+                    resp = requests.get(
+                        f"https://api.notion.com/v1/blocks/{parent_id}/children",
+                        headers=headers,
+                        params=params,
+                    )
+                    if resp.status_code != 200:
+                        logger.error(
+                            "Notion API error %s while reading children for %s: %s",
+                            resp.status_code,
+                            parent_id,
+                            resp.text[:200],
+                        )
+                        return
+
+                    data = resp.json()
+                    blocks = data.get("results", []) or []
+
+                    for block in blocks:
+                        if total_matches >= max_matches:
+                            return
+
+                        btype = block.get("type")
+                        block_data = block.get(btype, {}) or {}
+
+                        if btype in TEXT_BLOCK_TYPES:
+                            text = render_rich_text(block_data.get("rich_text") or [])
+                            if find_text in text:
+                                new_text = text.replace(find_text, replace_text)
+                                if new_text != text and patch_block(block, new_text):
+                                    total_matches += text.count(find_text)
+                                    updated_blocks += 1
+
+                        # Recurse into child structures / subpages
+                        has_children = bool(block.get("has_children"))
+                        if has_children:
+                            if btype == "child_page":
+                                if not include_subpages:
+                                    continue
+                                child_id = block.get("id")
+                                if child_id and child_id not in visited_pages:
+                                    visited_pages.add(child_id)
+                                    walk(child_id, depth + 1)
+                            else:
+                                child_id = block.get("id")
+                                if child_id:
+                                    walk(child_id, depth + 1)
+
+                    if not data.get("has_more"):
+                        break
+                    cursor = data.get("next_cursor")
+
+            walk(page_id, depth=0)
+
+            if updated_blocks == 0:
+                return "No matching text found on the specified page or subpages."
+
+            return (
+                f"✅ Updated {updated_blocks} block(s) in Notion. "
+                f"Approximate matches replaced: {total_matches}."
+            )
+
+        except Exception as e:
+            logger.error(f"Error updating Notion page content: {e}", exc_info=True)
+            return f"❌ Error updating Notion page content: {str(e)}"
     
     def update_notion_page(self, page_id: str, title: str) -> str:
         """Update a Notion page title."""
