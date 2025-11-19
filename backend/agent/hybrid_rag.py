@@ -16,6 +16,8 @@ import os
 import sys
 from pathlib import Path
 import requests
+from sqlalchemy import or_, cast
+from sqlalchemy.dialects.postgresql import JSONB
 
 # Add core directory to path
 core_path = Path(__file__).parent.parent / 'core'
@@ -25,7 +27,7 @@ if str(core_path) not in sys.path:
 from .qwen_engine import QwenEmbedding, QwenReranker
 from .langchain_tools import WorkforceTools
 from database.db_manager import DatabaseManager
-from database.models import Message, GmailMessage, Channel, User
+from database.models import Message, GmailMessage, Channel, User, NotionPage
 from config import Config
 from utils.logger import get_logger
 
@@ -890,6 +892,126 @@ Answer the question based on the context above. Be concise and accurate."""
                 notion_page_ids=notion_page_ids or [],
                 top_k=5,
             )
+
+            # ------------------------------------------------------------------
+            # Fallback: if hybrid RAG returns no context (e.g., embeddings missing
+            # or project not yet fully synced), build a lightweight context
+            # directly from the database, mirroring the auto-summary endpoint.
+            # ------------------------------------------------------------------
+            if not context and (channel_ids or label_ids or notion_page_ids):
+                db_context: List[Dict[str, Any]] = []
+                notion_pages: List[NotionPage] = []
+
+                with self.db.get_session() as session:
+                    # Slack: recent messages from mapped channels
+                    if channel_ids:
+                        slack_query = (
+                            session.query(Message, Channel, User)
+                            .join(Channel, Message.channel_id == Channel.channel_id)
+                            .outerjoin(User, Message.user_id == User.user_id)
+                            .filter(Message.channel_id.in_(channel_ids))
+                            .order_by(Message.timestamp.desc())
+                            .limit(80)
+                        )
+
+                        for msg, ch, user in slack_query.all():
+                            if not msg.text:
+                                continue
+                            user_name = None
+                            if user is not None:
+                                user_name = (
+                                    user.real_name
+                                    or user.display_name
+                                    or user.username
+                                )
+                            ts = msg.timestamp
+                            text = (msg.text or "").replace("\n", " ").strip()
+                            db_context.append(
+                                {
+                                    "type": "slack",
+                                    "text": text,
+                                    "metadata": {
+                                        "channel": ch.name or ch.channel_id,
+                                        "channel_id": msg.channel_id,
+                                        "user": user_name,
+                                        "user_id": msg.user_id,
+                                        "timestamp": ts,
+                                    },
+                                }
+                            )
+
+                    # Gmail: recent messages for mapped labels
+                    if label_ids:
+                        gmail_query = session.query(GmailMessage)
+                        label_filters = [
+                            cast(GmailMessage.label_ids, JSONB).contains([lbl])
+                            for lbl in label_ids
+                        ]
+                        if label_filters:
+                            gmail_query = gmail_query.filter(or_(*label_filters))
+
+                        gmail_query = gmail_query.order_by(GmailMessage.date.desc()).limit(40)
+
+                        for email in gmail_query.all():
+                            from_addr = email.from_address or "Unknown sender"
+                            subject = (email.subject or "No subject").replace("\n", " ").strip()
+                            snippet = (
+                                email.snippet
+                                or (email.body_text[:200] if email.body_text else "")
+                            )
+                            snippet = (snippet or "").replace("\n", " ").strip()
+                            db_context.append(
+                                {
+                                    "type": "gmail",
+                                    "text": f"{subject}: {snippet}",
+                                    "metadata": {
+                                        "from": from_addr,
+                                        "subject": email.subject,
+                                        "date": email.date,
+                                        "label_ids": email.label_ids or [],
+                                    },
+                                }
+                            )
+
+                    # Notion: a small slice of content from mapped pages
+                    if notion_page_ids:
+                        notion_pages = (
+                            session.query(NotionPage)
+                            .filter(NotionPage.page_id.in_(notion_page_ids))
+                            .order_by(NotionPage.last_edited_time.desc())
+                            .limit(5)
+                            .all()
+                        )
+
+                # Fetch Notion page text outside the DB session
+                for page in notion_pages:
+                    try:
+                        page_text = self._get_notion_page_text(page.page_id, max_blocks=40)
+                    except Exception:
+                        page_text = ""
+
+                    if not page_text:
+                        continue
+
+                    snippet = page_text.replace("\n", " ").strip()[:400]
+                    db_context.append(
+                        {
+                            "type": "notion",
+                            "text": f"{page.title or 'Untitled page'}: {snippet}",
+                            "metadata": {
+                                "page_id": page.page_id,
+                                "title": page.title,
+                                "last_edited_time": page.last_edited_time,
+                            },
+                        }
+                    )
+
+                if db_context:
+                    logger.info(
+                        "Using DB-based project context fallback with %s items",
+                        len(db_context),
+                    )
+                    context = db_context
 
         # Build context string for the prompt
         context_str = ''

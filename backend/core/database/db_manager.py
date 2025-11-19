@@ -112,6 +112,27 @@ class DatabaseManager:
                                 )
                             )
 
+            # Project table: add tracking columns for sync and summary freshness
+            if "projects" in table_names:
+                columns = {col["name"] for col in inspector.get_columns("projects")}
+                needs_last_sync = "last_project_sync_at" not in columns
+                needs_last_summary = "last_summary_generated_at" not in columns
+
+                if needs_last_sync or needs_last_summary:
+                    with self.engine.begin() as conn:
+                        if needs_last_sync:
+                            conn.execute(
+                                text(
+                                    "ALTER TABLE projects ADD COLUMN last_project_sync_at TIMESTAMP"
+                                )
+                            )
+                        if needs_last_summary:
+                            conn.execute(
+                                text(
+                                    "ALTER TABLE projects ADD COLUMN last_summary_generated_at TIMESTAMP"
+                                )
+                            )
+
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error(f"Schema upgrade error: {e}", exc_info=True)
     
@@ -621,9 +642,21 @@ class DatabaseManager:
             if not project:
                 return None
 
+            summary_related_changed = False
             for key, value in fields.items():
                 if value is not None and hasattr(project, key):
                     setattr(project, key, value)
+                    if key in {
+                        "description",
+                        "summary",
+                        "main_goal",
+                        "current_status_summary",
+                        "important_notes",
+                    }:
+                        summary_related_changed = True
+
+            if summary_related_changed:
+                project.last_summary_generated_at = datetime.utcnow()
             project.updated_at = datetime.utcnow()
             session.commit()
             session.refresh(project)

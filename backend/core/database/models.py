@@ -501,6 +501,8 @@ class Project(Base):
     main_goal = Column(Text)
     current_status_summary = Column(Text)
     important_notes = Column(Text)
+    last_project_sync_at = Column(DateTime)
+    last_summary_generated_at = Column(DateTime)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

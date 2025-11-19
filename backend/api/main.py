@@ -63,57 +63,6 @@ logger = get_logger(__name__)
 # Initialize database manager
 db_manager = DatabaseManager()
 
-
-def _get_last_slack_sync() -> Optional[str]:
-    """Return ISO timestamp of the latest Slack message in the DB, if any."""
-
-    try:
-        with db_manager.get_session() as session:
-            msg = (
-                session.query(Message)
-                .order_by(Message.timestamp.desc())
-                .first()
-            )
-            if msg and msg.timestamp:
-                return datetime.fromtimestamp(msg.timestamp).isoformat()
-    except Exception:  # pragma: no cover - defensive logging
-        logger.exception("Failed to compute last Slack sync time")
-    return None
-
-
-def _get_last_gmail_sync() -> Optional[str]:
-    """Return ISO timestamp of the latest Gmail message in the DB, if any."""
-
-    try:
-        with db_manager.get_session() as session:
-            email = (
-                session.query(GmailMessage)
-                .order_by(GmailMessage.date.desc())
-                .first()
-            )
-            if email and email.date:
-                return email.date.isoformat()
-    except Exception:  # pragma: no cover - defensive logging
-        logger.exception("Failed to compute last Gmail sync time")
-    return None
-
-
-def _get_last_notion_sync() -> Optional[str]:
-    """Return ISO timestamp of the latest Notion page edit in the DB, if any."""
-
-    try:
-        with db_manager.get_session() as session:
-            page = (
-                session.query(NotionPage)
-                .order_by(NotionPage.last_edited_time.desc())
-                .first()
-            )
-            if page and page.last_edited_time:
-                return page.last_edited_time.isoformat()
-    except Exception:  # pragma: no cover - defensive logging
-        logger.exception("Failed to compute last Notion sync time")
-    return None
-
 # Import agent modules after setting up paths
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -669,6 +618,8 @@ async def list_projects():
                     "main_goal": p.main_goal,
                     "current_status_summary": p.current_status_summary,
                     "important_notes": p.important_notes,
+                    "last_project_sync_at": p.last_project_sync_at.isoformat() if p.last_project_sync_at else None,
+                    "last_summary_generated_at": p.last_summary_generated_at.isoformat() if p.last_summary_generated_at else None,
                     "created_at": p.created_at.isoformat() if p.created_at else None,
                     "updated_at": p.updated_at.isoformat() if p.updated_at else None,
                 }
@@ -703,6 +654,8 @@ async def create_project(payload: ProjectCreateRequest):
             "main_goal": project.main_goal,
             "current_status_summary": project.current_status_summary,
             "important_notes": project.important_notes,
+            "last_project_sync_at": project.last_project_sync_at.isoformat() if project.last_project_sync_at else None,
+            "last_summary_generated_at": project.last_summary_generated_at.isoformat() if project.last_summary_generated_at else None,
             "created_at": project.created_at.isoformat() if project.created_at else None,
             "updated_at": project.updated_at.isoformat() if project.updated_at else None,
         }
@@ -746,6 +699,8 @@ async def get_project(project_id: str):
             "main_goal": project.main_goal,
             "current_status_summary": project.current_status_summary,
             "important_notes": project.important_notes,
+            "last_project_sync_at": project.last_project_sync_at.isoformat() if project.last_project_sync_at else None,
+            "last_summary_generated_at": project.last_summary_generated_at.isoformat() if project.last_summary_generated_at else None,
             "created_at": project.created_at.isoformat() if project.created_at else None,
             "updated_at": project.updated_at.isoformat() if project.updated_at else None,
             "sources": {
@@ -779,6 +734,8 @@ async def update_project(project_id: str, payload: ProjectUpdateRequest):
             "main_goal": project.main_goal,
             "current_status_summary": project.current_status_summary,
             "important_notes": project.important_notes,
+            "last_project_sync_at": project.last_project_sync_at.isoformat() if project.last_project_sync_at else None,
+            "last_summary_generated_at": project.last_summary_generated_at.isoformat() if project.last_summary_generated_at else None,
             "created_at": project.created_at.isoformat() if project.created_at else None,
             "updated_at": project.updated_at.isoformat() if project.updated_at else None,
         }
@@ -1258,6 +1215,10 @@ async def sync_project_data(project_id: str):
             }
 
         sync_result = await _run_in_executor(_sync)
+        try:
+            db_manager.update_project(project_id, last_project_sync_at=datetime.utcnow())
+        except Exception:
+            logger.warning("Failed to update last_project_sync_at for project %s", project_id)
 
         return {"project_id": project_id, **sync_result}
 
@@ -2211,8 +2172,19 @@ async def list_gmail_labels():
     """List available Gmail labels using the Gmail API."""
 
     client = GmailClient()
-    if not client.authenticate():
-        raise HTTPException(status_code=500, detail="Gmail authentication failed")
+
+    try:
+        authed = client.authenticate()
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error("Gmail authenticate() raised an exception when listing labels: %s", e, exc_info=True)
+        authed = False
+
+    if not authed:
+        # Do not crash the pipelines or projects UI if Gmail tokens are invalid.
+        # Instead, return an empty label list so the frontend can continue working
+        # with Slack/Notion pipelines while the user fixes Gmail credentials.
+        logger.warning("Gmail authentication failed; returning empty label list")
+        return {"labels": []}
 
     labels = client.list_labels() or []
     return {

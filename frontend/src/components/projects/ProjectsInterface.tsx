@@ -92,9 +92,9 @@ export default function ProjectsInterface() {
   const [gmailToAdd, setGmailToAdd] = useState<string>('')
   const [notionToAdd, setNotionToAdd] = useState<string>('')
 
-  const [lastSlackSync, setLastSlackSync] = useState<string | null>(null)
-  const [lastGmailSync, setLastGmailSync] = useState<string | null>(null)
-  const [lastNotionSync, setLastNotionSync] = useState<string | null>(null)
+  const [syncState, setSyncState] = useState<
+    Record<string, { slack: string | null; gmail: string | null; notion: string | null }>
+  >({})
 
   const [syncing, setSyncing] = useState(false)
 
@@ -105,9 +105,15 @@ export default function ProjectsInterface() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  const currentSync = selectedProject ? syncState[selectedProject.id] : undefined
+  const lastSlackSync = currentSync?.slack ?? null
+  const lastGmailSync = currentSync?.gmail ?? null
+  const lastNotionSync = currentSync?.notion ?? null
+
   const slackSynced = lastSlackSync ? new Date(lastSlackSync).toLocaleString() : null
   const gmailSynced = lastGmailSync ? new Date(lastGmailSync).toLocaleString() : null
   const notionSynced = lastNotionSync ? new Date(lastNotionSync).toLocaleString() : null
+  const hasSyncedAtLeastOnce = Boolean(lastSlackSync || lastGmailSync || lastNotionSync)
 
   const loadProjects = async () => {
     try {
@@ -157,9 +163,14 @@ export default function ProjectsInterface() {
       })
 
       const ls = data.last_synced || ({} as any)
-      setLastSlackSync(ls.slack || null)
-      setLastGmailSync(ls.gmail || null)
-      setLastNotionSync(ls.notion || null)
+      setSyncState((prev) => ({
+        ...prev,
+        [selectedProject.id]: {
+          slack: ls.slack || null,
+          gmail: ls.gmail || null,
+          notion: ls.notion || null,
+        },
+      }))
 
       await handleGenerateOverview()
     } catch (e: any) {
@@ -343,7 +354,8 @@ export default function ProjectsInterface() {
   }
 
   const handleSendChat = async () => {
-    if (!selectedProject || !chatInput.trim()) return
+    // Require at least one successful sync before allowing project chat.
+    if (!selectedProject || !chatInput.trim() || !hasSyncedAtLeastOnce || syncing) return
     const query = chatInput.trim()
     const newUserMessage: ChatMessage = {
       id: Date.now().toString(),
@@ -770,7 +782,18 @@ export default function ProjectsInterface() {
                   </span>
                 </div>
                 <div className="flex-1 overflow-auto border border-border rounded-md bg-background/40 p-2 mb-2">
-                  {chatMessages.length === 0 ? (
+                  {syncing ? (
+                    <p className="text-[11px] text-muted-foreground">
+                      Processing project data from linked Slack, Gmail, and Notion sources…
+                      Chat will be available once sync completes.
+                    </p>
+                  ) : !hasSyncedAtLeastOnce ? (
+                    <p className="text-[11px] text-muted-foreground">
+                      Run <span className="font-semibold">Sync data</span> in the Linked sources
+                      panel to prepare this project's workspace. Once sync is complete, you can
+                      chat with the project-specific data here.
+                    </p>
+                  ) : chatMessages.length === 0 ? (
                     <p className="text-[11px] text-muted-foreground">
                       Start a conversation about this project. For example: "Summarize the latest
                       updates".
@@ -806,12 +829,17 @@ export default function ProjectsInterface() {
                         handleSendChat()
                       }
                     }}
-                    disabled={chatLoading}
+                    disabled={chatLoading || syncing || !hasSyncedAtLeastOnce}
                   />
                   <button
                     type="button"
                     onClick={handleSendChat}
-                    disabled={chatLoading || !chatInput.trim()}
+                    disabled={
+                      chatLoading ||
+                      syncing ||
+                      !hasSyncedAtLeastOnce ||
+                      !chatInput.trim()
+                    }
                     className="text-[11px] px-2 py-1 rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-60"
                   >
                     {chatLoading ? 'Sending…' : 'Send'}
