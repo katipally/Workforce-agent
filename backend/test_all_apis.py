@@ -28,7 +28,8 @@ class APITester:
         self.results = {
             'slack': {'passed': [], 'failed': []},
             'gmail': {'passed': [], 'failed': []},
-            'notion': {'passed': [], 'failed': []}
+            'notion': {'passed': [], 'failed': []},
+            'projects': {'passed': [], 'failed': []}
         }
         
     def test_slack_api(self) -> Dict:
@@ -472,6 +473,114 @@ class APITester:
             })
         
         return self.results['notion']
+
+    def test_projects_api(self) -> Dict:
+        """Test FastAPI Projects API endpoints."""
+        print("\n" + "="*80)
+        print("📁 TESTING PROJECTS API (FastAPI backend)")
+        print("="*80)
+
+        base_url = f"http://{Config.API_HOST}:{Config.API_PORT}"
+        results = self.results['projects']
+
+        def record(status: str, test_name: str, description: str, error: str = ""):
+            if status == 'passed':
+                results['passed'].append({
+                    'test': test_name,
+                    'description': description,
+                    'status': '✅ PASS'
+                })
+                print(f"✅ {description}: PASS")
+            else:
+                results['failed'].append({
+                    'test': test_name,
+                    'description': description,
+                    'error': error,
+                    'status': '❌ FAIL'
+                })
+                print(f"❌ {description}: FAIL - {error}")
+
+        # List projects
+        try:
+            resp = requests.get(f"{base_url}/api/projects")
+            if resp.status_code == 200:
+                record('passed', 'projects.list', 'List Projects')
+            else:
+                record('failed', 'projects.list', 'List Projects', f"HTTP {resp.status_code}")
+        except Exception as e:
+            record('failed', 'projects.list', 'List Projects', str(e))
+            return results
+
+        project_id = None
+
+        # Create a project
+        try:
+            resp = requests.post(
+                f"{base_url}/api/projects",
+                json={"name": "Test Project from APITester", "status": "not_started"},
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                project_id = data.get("id")
+                record('passed', 'projects.create', 'Create Project')
+            else:
+                record('failed', 'projects.create', 'Create Project', f"HTTP {resp.status_code}")
+        except Exception as e:
+            record('failed', 'projects.create', 'Create Project', str(e))
+
+        if project_id:
+            # Get project detail
+            try:
+                resp = requests.get(f"{base_url}/api/projects/{project_id}")
+                if resp.status_code == 200:
+                    record('passed', 'projects.get', 'Get Project Detail')
+                else:
+                    record('failed', 'projects.get', 'Get Project Detail', f"HTTP {resp.status_code}")
+            except Exception as e:
+                record('failed', 'projects.get', 'Get Project Detail', str(e))
+
+            # Generate project summary (uses AI backend)
+            try:
+                resp = requests.post(
+                    f"{base_url}/api/projects/{project_id}/auto-summary",
+                    json={"max_tokens": 128},
+                )
+                if resp.status_code == 200:
+                    record('passed', 'projects.auto_summary', 'Generate Project Summary')
+                else:
+                    record(
+                        'failed',
+                        'projects.auto_summary',
+                        'Generate Project Summary',
+                        f"HTTP {resp.status_code}",
+                    )
+            except Exception as e:
+                record('failed', 'projects.auto_summary', 'Generate Project Summary', str(e))
+
+            # Project-scoped chat (should respond even if no sources are linked)
+            try:
+                resp = requests.post(
+                    f"{base_url}/api/chat/project/{project_id}",
+                    json={"query": "Hello from test", "conversation_history": []},
+                )
+                if resp.status_code == 200:
+                    record('passed', 'projects.chat', 'Project Chat')
+                else:
+                    record('failed', 'projects.chat', 'Project Chat', f"HTTP {resp.status_code}")
+            except Exception as e:
+                record('failed', 'projects.chat', 'Project Chat', str(e))
+
+            # Delete project
+            try:
+                resp = requests.delete(f"{base_url}/api/projects/{project_id}")
+                if resp.status_code == 200:
+                    record('passed', 'projects.delete', 'Delete Project')
+                else:
+                    record('failed', 'projects.delete', 'Delete Project', f"HTTP {resp.status_code}")
+            except Exception as e:
+                record('failed', 'projects.delete', 'Delete Project', str(e))
+
+        return results
     
     def _test_notion_database_query(self, headers):
         """Test database query."""
@@ -704,6 +813,7 @@ def main():
     tester.test_slack_api()
     tester.test_gmail_api()
     tester.test_notion_api()
+    tester.test_projects_api()
     
     # Generate report
     tester.generate_report()

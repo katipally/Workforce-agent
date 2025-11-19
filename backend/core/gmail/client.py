@@ -6,6 +6,7 @@ import base64
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from google.auth.transport.requests import Request
+from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
@@ -56,8 +57,22 @@ class GmailClient:
         # Refresh or get new credentials
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
-                logger.info("Refreshing expired credentials...")
-                creds.refresh(Request())
+                logger.info("Refreshing expired Gmail credentials...")
+                try:
+                    creds.refresh(Request())
+                except RefreshError as e:
+                    logger.error(
+                        "Failed to refresh Gmail credentials (token may be expired or revoked): %s",
+                        e,
+                    )
+                    # Best-effort cleanup so a future interactive auth flow can succeed
+                    try:
+                        token_path.unlink()
+                        logger.warning("Deleted invalid Gmail token file at %s", token_path)
+                    except Exception:
+                        # Non-fatal; we can still continue without removing the token
+                        logger.debug("Could not delete Gmail token file", exc_info=True)
+                    return False
             else:
                 if not Path(self.credentials_file).exists():
                     logger.error(f"Credentials file not found: {self.credentials_file}")
