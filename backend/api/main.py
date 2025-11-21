@@ -83,6 +83,10 @@ ai_brain = None
 rag_lock: asyncio.Lock | None = None
 ai_brain_lock: asyncio.Lock | None = None
 
+# Background workflow worker (Slack → Notion) state
+workflow_worker_thread: threading.Thread | None = None
+workflow_worker_stop_event: threading.Event | None = None
+
 
 async def get_rag_engine() -> HybridRAGEngine:
     """Lazy load and return the RAG engine with concurrency guard."""
@@ -174,6 +178,50 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.on_event("startup")
+async def start_workflow_worker() -> None:
+    """Start the Slack → Notion workflow scheduler in a background thread.
+
+    This avoids requiring a separate `python workflows/slack_to_notion_worker.py`
+    process. The thread is stopped cleanly on application shutdown.
+    """
+    global workflow_worker_thread, workflow_worker_stop_event
+
+    # Already running
+    if workflow_worker_thread is not None and workflow_worker_thread.is_alive():
+        return
+
+    # Import here to avoid circular imports at module load time
+    from workflows.slack_to_notion_worker import run_scheduler
+
+    workflow_worker_stop_event = threading.Event()
+
+    def _runner() -> None:
+        run_scheduler(stop_event=workflow_worker_stop_event)
+
+    workflow_worker_thread = threading.Thread(
+        target=_runner,
+        name="slack_to_notion_worker",
+        daemon=True,
+    )
+    workflow_worker_thread.start()
+    logger.info("Started Slack → Notion workflow scheduler background thread")
+
+
+@app.on_event("shutdown")
+async def stop_workflow_worker() -> None:
+    """Stop the background Slack → Notion workflow scheduler thread."""
+    global workflow_worker_thread, workflow_worker_stop_event
+
+    if workflow_worker_stop_event is not None:
+        workflow_worker_stop_event.set()
+
+    if workflow_worker_thread is not None and workflow_worker_thread.is_alive():
+        workflow_worker_thread.join(timeout=10)
+
+    workflow_worker_thread = None
+    workflow_worker_stop_event = None
+
 # Request/Response models
 class ChatRequest(BaseModel):
     """Chat request model."""
@@ -231,6 +279,35 @@ class ProjectSummaryRequest(BaseModel):
     """Payload for AI-powered project summary generation."""
 
     max_tokens: int = 256
+
+
+class WorkflowCreateRequest(BaseModel):
+    """Create a new workflow (e.g., Slack → Notion)."""
+
+    name: str
+    type: str = "slack_to_notion"
+    status: Optional[str] = None
+    notion_master_page_id: Optional[str] = None
+    poll_interval_seconds: Optional[int] = None
+
+
+class WorkflowUpdateRequest(BaseModel):
+    """Update an existing workflow."""
+
+    name: Optional[str] = None
+    status: Optional[str] = None
+    notion_master_page_id: Optional[str] = None
+    poll_interval_seconds: Optional[int] = None
+
+
+class WorkflowChannelPayload(BaseModel):
+    """Payload for adding Slack channels to a workflow."""
+
+    slack_channel_id: str
+    slack_channel_name: Optional[str] = None
+
+
+WORKFLOW_ALLOWED_INTERVALS = {30, 60, 300, 600, 3600}
 
 
 # Routes
@@ -1377,6 +1454,271 @@ async def chat_project(project_id: str, payload: ProjectChatRequest):
     except Exception as e:  # pragma: no cover - defensive logging
         logger.error(f"Error in project chat for {project_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Project chat failed")
+
+
+@app.get("/api/workflows")
+async def list_workflows():
+    """List workflows for the Workflows tab."""
+    try:
+        workflows = db_manager.list_workflows(limit=100)
+        result: List[Dict[str, Any]] = []
+        for wf in workflows:
+            channels = db_manager.get_workflow_channels(wf.id)
+            result.append(
+                {
+                    "id": wf.id,
+                    "name": wf.name,
+                    "type": wf.type,
+                    "status": wf.status,
+                    "notion_master_page_id": wf.notion_master_page_id,
+                    "poll_interval_seconds": wf.poll_interval_seconds,
+                    "last_run_at": wf.last_run_at.isoformat() if wf.last_run_at else None,
+                    "created_at": wf.created_at.isoformat() if wf.created_at else None,
+                    "updated_at": wf.updated_at.isoformat() if wf.updated_at else None,
+                    "channels": [
+                        {
+                            "slack_channel_id": c.slack_channel_id,
+                            "slack_channel_name": c.slack_channel_name,
+                            "notion_subpage_id": c.notion_subpage_id,
+                            "last_slack_ts_synced": c.last_slack_ts_synced,
+                            "created_at": c.created_at.isoformat() if c.created_at else None,
+                            "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+                        }
+                        for c in channels
+                    ],
+                }
+            )
+        return {"workflows": result}
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(f"Error listing workflows: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to list workflows")
+
+
+@app.post("/api/workflows")
+async def create_workflow(payload: WorkflowCreateRequest):
+    """Create a new workflow definition."""
+    try:
+        if payload.type != "slack_to_notion":
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported workflow type; only 'slack_to_notion' is supported",
+            )
+
+        interval = payload.poll_interval_seconds or 30
+        if interval not in WORKFLOW_ALLOWED_INTERVALS:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid poll_interval_seconds; allowed values are 30, 60, 300, 600, 3600",
+            )
+
+        status = payload.status or "active"
+
+        workflow = db_manager.create_workflow(
+            name=payload.name,
+            type=payload.type,
+            status=status,
+            notion_master_page_id=payload.notion_master_page_id,
+            poll_interval_seconds=interval,
+        )
+
+        return {
+            "id": workflow.id,
+            "name": workflow.name,
+            "type": workflow.type,
+            "status": workflow.status,
+            "notion_master_page_id": workflow.notion_master_page_id,
+            "poll_interval_seconds": workflow.poll_interval_seconds,
+            "last_run_at": workflow.last_run_at.isoformat() if workflow.last_run_at else None,
+            "created_at": workflow.created_at.isoformat() if workflow.created_at else None,
+            "updated_at": workflow.updated_at.isoformat() if workflow.updated_at else None,
+            "channels": [],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(f"Error creating workflow: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to create workflow")
+
+
+@app.get("/api/workflows/{workflow_id}")
+async def get_workflow(workflow_id: str):
+    """Get a workflow with its channel mappings."""
+    try:
+        workflow = db_manager.get_workflow(workflow_id)
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+
+        channels = db_manager.get_workflow_channels(workflow_id)
+        return {
+            "id": workflow.id,
+            "name": workflow.name,
+            "type": workflow.type,
+            "status": workflow.status,
+            "notion_master_page_id": workflow.notion_master_page_id,
+            "poll_interval_seconds": workflow.poll_interval_seconds,
+            "last_run_at": workflow.last_run_at.isoformat() if workflow.last_run_at else None,
+            "created_at": workflow.created_at.isoformat() if workflow.created_at else None,
+            "updated_at": workflow.updated_at.isoformat() if workflow.updated_at else None,
+            "channels": [
+                {
+                    "slack_channel_id": c.slack_channel_id,
+                    "slack_channel_name": c.slack_channel_name,
+                    "notion_subpage_id": c.notion_subpage_id,
+                    "last_slack_ts_synced": c.last_slack_ts_synced,
+                    "created_at": c.created_at.isoformat() if c.created_at else None,
+                    "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+                }
+                for c in channels
+            ],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(f"Error getting workflow {workflow_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to get workflow")
+
+
+@app.put("/api/workflows/{workflow_id}")
+async def update_workflow_endpoint(workflow_id: str, payload: WorkflowUpdateRequest):
+    """Update an existing workflow."""
+    try:
+        fields: Dict[str, Any] = payload.dict(exclude_unset=True)
+        if "poll_interval_seconds" in fields and fields["poll_interval_seconds"] is not None:
+            interval = int(fields["poll_interval_seconds"])
+            if interval not in WORKFLOW_ALLOWED_INTERVALS:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid poll_interval_seconds; allowed values are 30, 60, 300, 600, 3600",
+                )
+
+        workflow = db_manager.update_workflow(workflow_id, **fields)
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+
+        channels = db_manager.get_workflow_channels(workflow_id)
+        return {
+            "id": workflow.id,
+            "name": workflow.name,
+            "type": workflow.type,
+            "status": workflow.status,
+            "notion_master_page_id": workflow.notion_master_page_id,
+            "poll_interval_seconds": workflow.poll_interval_seconds,
+            "last_run_at": workflow.last_run_at.isoformat() if workflow.last_run_at else None,
+            "created_at": workflow.created_at.isoformat() if workflow.created_at else None,
+            "updated_at": workflow.updated_at.isoformat() if workflow.updated_at else None,
+            "channels": [
+                {
+                    "slack_channel_id": c.slack_channel_id,
+                    "slack_channel_name": c.slack_channel_name,
+                    "notion_subpage_id": c.notion_subpage_id,
+                    "last_slack_ts_synced": c.last_slack_ts_synced,
+                    "created_at": c.created_at.isoformat() if c.created_at else None,
+                    "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+                }
+                for c in channels
+            ],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(f"Error updating workflow {workflow_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to update workflow")
+
+
+@app.delete("/api/workflows/{workflow_id}")
+async def delete_workflow_endpoint(workflow_id: str):
+    """Delete a workflow and its mappings."""
+    try:
+        db_manager.delete_workflow(workflow_id)
+        return {"status": "ok"}
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(f"Error deleting workflow {workflow_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to delete workflow")
+
+
+@app.post("/api/workflows/{workflow_id}/channels")
+async def add_workflow_channels(workflow_id: str, channels: List[WorkflowChannelPayload]):
+    """Add one or more Slack channels to a workflow."""
+    try:
+        workflow = db_manager.get_workflow(workflow_id)
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+
+        created: List[Dict[str, Any]] = []
+        for ch in channels:
+            mapping = db_manager.add_workflow_channel(
+                workflow_id=workflow_id,
+                slack_channel_id=ch.slack_channel_id,
+                slack_channel_name=ch.slack_channel_name,
+            )
+            created.append(
+                {
+                    "slack_channel_id": mapping.slack_channel_id,
+                    "slack_channel_name": mapping.slack_channel_name,
+                    "notion_subpage_id": mapping.notion_subpage_id,
+                    "last_slack_ts_synced": mapping.last_slack_ts_synced,
+                    "created_at": mapping.created_at.isoformat() if mapping.created_at else None,
+                    "updated_at": mapping.updated_at.isoformat() if mapping.updated_at else None,
+                }
+            )
+
+        return {"channels": created}
+    except HTTPException:
+        raise
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(f"Error adding channels to workflow {workflow_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to add workflow channels")
+
+
+@app.delete("/api/workflows/{workflow_id}/channels/{slack_channel_id}")
+async def delete_workflow_channel(workflow_id: str, slack_channel_id: str):
+    """Remove a Slack channel mapping from a workflow."""
+    try:
+        workflow = db_manager.get_workflow(workflow_id)
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+
+        db_manager.remove_workflow_channel(workflow_id, slack_channel_id)
+        return {"status": "ok"}
+    except HTTPException:
+        raise
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(
+            f"Error removing channel {slack_channel_id} from workflow {workflow_id}: {e}",
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="Failed to remove workflow channel")
+
+
+@app.post("/api/workflows/{workflow_id}/run-once")
+async def run_workflow_once(workflow_id: str):
+    """Run a workflow once synchronously.
+
+    In v1 this endpoint only updates last_run_at and returns placeholder
+    statistics. The Slack → Notion worker implementation will plug into
+    this later.
+    """
+    try:
+        workflow = db_manager.get_workflow(workflow_id)
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+
+        # Import here so the API can run even if the workflows package is not used
+        # elsewhere, and to avoid circular import issues at module load time.
+        try:
+            from workflows.slack_to_notion_core import process_workflow_once
+        except Exception as e:  # pragma: no cover - defensive
+            logger.error(f"Failed to import workflow core: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail="Workflow core not available")
+
+        stats = await _run_in_executor(process_workflow_once, workflow_id)
+
+        return stats
+    except HTTPException:
+        raise
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(f"Error running workflow {workflow_id} once: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to run workflow once")
 
 
 # File upload configuration

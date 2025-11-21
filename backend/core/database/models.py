@@ -534,3 +534,88 @@ class ProjectSource(Base):
         Index("idx_project_source_project", "project_id"),
         Index("idx_project_source_type", "source_type"),
     )
+
+
+class Workflow(Base):
+    """Definition of a live workflow (e.g., Slack → Notion)."""
+    __tablename__ = "workflows"
+
+    id = Column(String(50), primary_key=True, default=lambda: uuid4().hex)
+    name = Column(String(255), nullable=False)
+    type = Column(String(50), nullable=False)
+    status = Column(String(20), default="active")
+    notion_master_page_id = Column(String(255))
+    poll_interval_seconds = Column(Integer, default=30)
+    last_run_at = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    channel_mappings = relationship(
+        "WorkflowChannelMapping",
+        back_populates="workflow",
+        cascade="all, delete-orphan",
+    )
+    message_mappings = relationship(
+        "SlackNotionMessageMapping",
+        back_populates="workflow",
+        cascade="all, delete-orphan",
+    )
+
+    __table_args__ = (
+        Index("idx_workflow_type", "type"),
+        Index("idx_workflow_status", "status"),
+        Index("idx_workflow_updated", "updated_at"),
+    )
+
+
+class WorkflowChannelMapping(Base):
+    """Mapping between a workflow and its Slack channels / Notion subpages."""
+    __tablename__ = "workflow_channel_mappings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    workflow_id = Column(String(50), ForeignKey("workflows.id"), nullable=False)
+    slack_channel_id = Column(String(20), nullable=False)
+    slack_channel_name = Column(String(255))
+    notion_subpage_id = Column(String(50))
+    last_slack_ts_synced = Column(Float)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    workflow = relationship("Workflow", back_populates="channel_mappings")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workflow_id",
+            "slack_channel_id",
+            name="uq_workflow_channel",
+        ),
+        Index("idx_workflow_channel_workflow", "workflow_id"),
+        Index("idx_workflow_channel_slack", "slack_channel_id"),
+    )
+
+
+class SlackNotionMessageMapping(Base):
+    """Mapping between individual Slack messages and Notion blocks per workflow."""
+    __tablename__ = "slack_notion_message_mappings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    workflow_id = Column(String(50), ForeignKey("workflows.id"), nullable=False)
+    slack_channel_id = Column(String(20), nullable=False)
+    slack_ts = Column(Float, nullable=False)
+    parent_slack_ts = Column(Float)
+    notion_block_id = Column(String(100), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    workflow = relationship("Workflow", back_populates="message_mappings")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workflow_id",
+            "slack_channel_id",
+            "slack_ts",
+            name="uq_workflow_slack_message",
+        ),
+        Index("idx_slack_notion_workflow", "workflow_id"),
+        Index("idx_slack_notion_channel", "slack_channel_id"),
+        Index("idx_slack_notion_parent_ts", "parent_slack_ts"),
+    )
