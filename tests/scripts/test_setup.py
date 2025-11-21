@@ -9,9 +9,13 @@ This script tests:
 
 import sys
 import os
+from pathlib import Path
 
-# Add parent directory to path
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'core'))
+# Add backend/core directory to path (for config, database, utils)
+ROOT = Path(__file__).resolve().parents[2]
+BACKEND_CORE = ROOT / "backend" / "core"
+if str(BACKEND_CORE) not in sys.path:
+    sys.path.insert(0, str(BACKEND_CORE))
 
 from config import Config
 from database.db_manager import DatabaseManager

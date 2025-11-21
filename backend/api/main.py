@@ -68,32 +68,20 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from agent.hybrid_rag import HybridRAGEngine
 from agent.ai_brain import WorkforceAIBrain
+from agent.sentence_transformer_engine import (
+    SentenceTransformerEmbedding,
+    SentenceTransformerReranker,
+)
+
+# Import embedding synchronizer for pipeline integration
+sys.path.insert(0, str(Path(__file__).parent.parent / 'core'))
+from embeddings_sync import sync_embeddings_after_pipeline
 
 # Global variables
 rag_engine = None
 ai_brain = None
 rag_lock: asyncio.Lock | None = None
 ai_brain_lock: asyncio.Lock | None = None
-
-# Import appropriate embedding engine based on model name
-def _get_embedding_classes():
-    """Dynamically select embedding engine based on config."""
-    model_name = Config.EMBEDDING_MODEL
-    
-    # Use lightweight sentence-transformers for non-Qwen models
-    if not model_name.startswith('Qwen/'):
-        logger.info("Using lightweight sentence-transformers engine")
-        from agent.sentence_transformer_engine import (
-            SentenceTransformerEmbedding as QwenEmbedding,
-            SentenceTransformerReranker as QwenReranker
-        )
-    else:
-        logger.info("Using Qwen engine (requires GPU for best performance)")
-        from agent.qwen_engine import QwenEmbedding, QwenReranker
-    
-    return QwenEmbedding, QwenReranker
-
-QwenEmbedding, QwenReranker = _get_embedding_classes()
 
 
 async def get_rag_engine() -> HybridRAGEngine:
@@ -116,21 +104,21 @@ async def get_rag_engine() -> HybridRAGEngine:
         embedding, reranker = await loop.run_in_executor(
             None,
             lambda: (
-                QwenEmbedding(
+                SentenceTransformerEmbedding(
                     model_name=Config.EMBEDDING_MODEL,
-                    use_gpu=Config.USE_GPU
+                    use_gpu=Config.USE_GPU,
                 ),
-                QwenReranker(
+                SentenceTransformerReranker(
                     model_name=Config.RERANKER_MODEL,
-                    use_gpu=Config.USE_GPU
+                    use_gpu=Config.USE_GPU,
                 ),
             ),
         )
 
         rag_engine = HybridRAGEngine(
             openai_api_key=Config.OPENAI_API_KEY,
-            qwen_embedding=embedding,
-            qwen_reranker=reranker
+            embedding_model=embedding,
+            reranker_model=reranker,
         )
 
         logger.info("✓ RAG engine initialized")
@@ -270,7 +258,10 @@ async def health():
 
 @app.post("/api/chat/message", response_model=ChatResponse)
 async def chat_message(request: ChatRequest):
-    """Non-streaming chat endpoint.
+    """Non-streaming chat endpoint with AI Brain and tool calling.
+    
+    Routes through AI Brain for consistent behavior with WebSocket endpoint.
+    The AI Brain has access to all tools (Slack, Gmail, Notion) and RAG.
     
     Args:
         request: Chat request with query and optional history
@@ -279,16 +270,25 @@ async def chat_message(request: ChatRequest):
         Chat response with answer and sources
     """
     try:
-        engine = await get_rag_engine()
-        result = await engine.query(
+        brain = await get_ai_brain()
+        
+        # Collect streaming response into single output
+        full_response = ""
+        sources = []
+        
+        async for event in brain.stream_query(
             request.query,
-            conversation_history=request.conversation_history
-        )
+            request.conversation_history or []
+        ):
+            if event.get('type') == 'token':
+                full_response += event.get('content', '')
+            elif event.get('type') == 'sources':
+                sources = event.get('content', [])
         
         return ChatResponse(
-            response=result['response'],
-            sources=result['sources'],
-            intent=result['intent']
+            response=full_response,
+            sources=sources,
+            intent="general"  # AI Brain doesn't expose intent separately
         )
     
     except Exception as e:
@@ -1044,10 +1044,10 @@ async def generate_project_summary(project_id: str, payload: ProjectSummaryReque
 async def sync_project_data(project_id: str):
     """Embed Slack and Gmail data for the project's mapped sources.
 
-    This endpoint generates Qwen embeddings for Slack messages and Gmail
+    This endpoint generates vector embeddings for Slack messages and Gmail
     messages that belong to the project's linked channels/labels and do not
-    yet have embeddings. It also returns simple last-synced timestamps per
-    source type so the UI can show freshness.
+    yet have embeddings in the generic embedding column. It also returns
+    simple last-synced timestamps per source type so the UI can show freshness.
     """
 
     try:
@@ -1078,14 +1078,6 @@ async def sync_project_data(project_id: str):
             last_slack_ts: Optional[datetime] = None
             last_gmail_ts: Optional[datetime] = None
             last_notion_ts: Optional[datetime] = None
-
-            # Detect embedding dimension for dynamic backends (e.g. sentence-transformers)
-            embed_dim: Optional[int] = None
-            try:
-                if hasattr(embedding_model, "get_embedding_dim"):
-                    embed_dim = embedding_model.get_embedding_dim()
-            except Exception:
-                embed_dim = None
 
             with db_manager.get_session() as session:
                 # Always compute last-synced timestamps for UI
@@ -1122,34 +1114,15 @@ async def sync_project_data(project_id: str):
                     if page and page.last_edited_time:
                         last_notion_ts = page.last_edited_time
 
-                # If we are using a non-Qwen backend (e.g. sentence-transformers with 384 dims),
-                # skip writing to the 8192-dim qwen_embedding pgvector column to avoid
-                # dimension mismatch errors. Retrieval will fall back to keyword search.
-                if embed_dim is not None and embed_dim != 8192:
-                    logger.warning(
-                        "Sync called with non-Qwen embedding model (%s dims); "
-                        "skipping vector embedding and only updating timestamps.",
-                        embed_dim,
-                    )
-                    return {
-                        "indexed_slack": 0,
-                        "indexed_gmail": 0,
-                        "indexed_notion": 0,
-                        "last_synced": {
-                            "slack": last_slack_ts.isoformat() if last_slack_ts else None,
-                            "gmail": last_gmail_ts.isoformat() if last_gmail_ts else None,
-                            "notion": last_notion_ts.isoformat() if last_notion_ts else None,
-                        },
-                    }
-
-                # Otherwise, generate Qwen3 embeddings for unmapped rows
+                # Generate embeddings for unmapped rows using the configured
+                # sentence-transformers model and the generic embedding column.
                 if slack_channel_ids:
                     slack_query = (
                         session.query(Message)
                         .filter(Message.channel_id.in_(slack_channel_ids))
                         .filter(Message.text.isnot(None))
                         .filter(Message.text != "")
-                        .filter(Message.qwen_embedding.is_(None))
+                        .filter(Message.embedding.is_(None))
                     )
 
                     slack_messages = slack_query.all()
@@ -1164,7 +1137,7 @@ async def sync_project_data(project_id: str):
                             show_progress=False,
                         )
                         for msg, emb in zip(batch, embeddings):
-                            msg.qwen_embedding = emb.tolist()
+                            msg.embedding = emb.tolist()
                         indexed_slack += len(batch)
                         session.commit()
 
@@ -1177,7 +1150,7 @@ async def sync_project_data(project_id: str):
                     if label_filters:
                         gmail_query = gmail_query.filter(or_(*label_filters))
 
-                    gmail_to_embed = gmail_query.filter(GmailMessage.qwen_embedding.is_(None)).all()
+                    gmail_to_embed = gmail_query.filter(GmailMessage.embedding.is_(None)).all()
 
                     batch_size = 32
                     for i in range(0, len(gmail_to_embed), batch_size):
@@ -1199,7 +1172,7 @@ async def sync_project_data(project_id: str):
                             show_progress=False,
                         )
                         for email, emb in zip(batch, embeddings):
-                            email.qwen_embedding = emb.tolist()
+                            email.embedding = emb.tolist()
                         indexed_gmail += len(batch)
                         session.commit()
 
@@ -1355,10 +1328,10 @@ async def get_project_activity(project_id: str, limit: int = 50):
 
 @app.post("/api/chat/project/{project_id}", response_model=ChatResponse)
 async def chat_project(project_id: str, payload: ProjectChatRequest):
-    """Project-scoped chat endpoint using the same ChatGPT API as RAG.
+    """Project-scoped chat using AI Brain with project context.
 
-    The RAG engine restricts retrieval to Slack/Gmail/Notion data mapped to
-    the given project via ProjectSource rows.
+    The AI Brain will have access to project-specific data and can use
+    all tools with awareness of the project scope.
     """
 
     query = payload.query.strip()
@@ -1375,22 +1348,28 @@ async def chat_project(project_id: str, payload: ProjectChatRequest):
         gmail_label_ids = [s.source_id for s in sources if s.source_type == "gmail_label"]
         notion_page_ids = [s.source_id for s in sources if s.source_type == "notion_page"]
 
+        # Use the hybrid RAG engine's project-scoped query instead of the generic
+        # AI Brain tool-calling loop. This keeps project chat fast and strictly
+        # limited to the project's linked Slack channels, Gmail labels, and
+        # Notion pages, and it reuses the same retrieval logic as the project
+        # summary/description pipeline.
         engine = await get_rag_engine()
 
         result = await _run_in_executor(
             engine.query_project,
-            query,
-            slack_channel_ids,
-            gmail_label_ids,
-            notion_page_ids,
-            project.name,
-            payload.conversation_history or [],
+            user_query=query,
+            channel_ids=slack_channel_ids,
+            label_ids=gmail_label_ids,
+            notion_page_ids=notion_page_ids,
+            project_name=project.name,
+            conversation_history=payload.conversation_history or [],
+            force_search=True,
         )
 
         return ChatResponse(
             response=result.get("response", ""),
             sources=result.get("sources", []),
-            intent=result.get("intent", ""),
+            intent=result.get("intent", "project_query"),
         )
 
     except HTTPException:
@@ -1602,6 +1581,19 @@ def _run_slack_pipeline(run_id: str, include_archived: bool = False, download_fi
         else:
             run_info["status"] = "completed"
             logger.info("Slack pipeline run %s completed: %s", run_id, run_info["stats"])
+            
+            # Automatically sync embeddings after successful extraction
+            try:
+                logger.info("Auto-syncing Slack embeddings...")
+                embed_stats = sync_embeddings_after_pipeline(
+                    data_source="slack",
+                    db_manager=db_manager
+                )
+                run_info["embedding_stats"] = embed_stats
+                logger.info("✓ Slack embeddings synced: %s", embed_stats)
+            except Exception as embed_error:
+                logger.error(f"Embedding sync failed (non-fatal): {embed_error}")
+                run_info["embedding_error"] = str(embed_error)
 
     except Exception as e:  # pragma: no cover - defensive logging
         logger.error(f"Slack pipeline run {run_id} failed: {e}", exc_info=True)
@@ -1953,7 +1945,7 @@ def _persist_gmail_message_from_full(
 def _run_gmail_pipeline(run_id: str, label_id: str) -> None:
     """Background worker to fetch new Gmail messages for a specific label.
 
-    Uses GmailClient directly and stores messages in memory keyed by run_id.
+    Uses GmailClient directly, stores messages in PostgreSQL, and syncs embeddings.
     Incremental behavior is controlled by internalDate stored per label in a
     small JSON state file.
     """
@@ -2159,6 +2151,20 @@ def _run_gmail_pipeline(run_id: str, label_id: str) -> None:
             label_id,
             len(messages),
         )
+        
+        # Automatically sync embeddings after successful ingestion
+        try:
+            logger.info("Auto-syncing Gmail embeddings for label %s...", label_id)
+            embed_stats = sync_embeddings_after_pipeline(
+                data_source="gmail",
+                source_ids=[label_id],
+                db_manager=db_manager
+            )
+            run_info["embedding_stats"] = embed_stats
+            logger.info("✓ Gmail embeddings synced: %s", embed_stats)
+        except Exception as embed_error:
+            logger.error(f"Embedding sync failed (non-fatal): {embed_error}")
+            run_info["embedding_error"] = str(embed_error)
 
     except Exception as e:  # pragma: no cover - defensive logging
         logger.error(f"Gmail pipeline run {run_id} failed: {e}", exc_info=True)
@@ -2734,6 +2740,20 @@ def _run_notion_pipeline(run_id: str) -> None:
         run_info["page_count"] = len(pages)
 
         logger.info("Notion pipeline run %s completed with %s pages", run_id, len(pages))
+        
+        # Automatically sync embeddings after successful ingestion
+        try:
+            logger.info("Auto-syncing Notion embeddings for workspace %s...", workspace_id)
+            embed_stats = sync_embeddings_after_pipeline(
+                data_source="notion",
+                source_ids=[workspace_id],
+                db_manager=db_manager
+            )
+            run_info["embedding_stats"] = embed_stats
+            logger.info("✓ Notion embeddings synced: %s", embed_stats)
+        except Exception as embed_error:
+            logger.error(f"Embedding sync failed (non-fatal): {embed_error}")
+            run_info["embedding_error"] = str(embed_error)
 
     except Exception as e:  # pragma: no cover - defensive logging
         logger.error(f"Notion pipeline run {run_id} failed: {e}", exc_info=True)

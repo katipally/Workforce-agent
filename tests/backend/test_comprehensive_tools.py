@@ -10,9 +10,14 @@ import asyncio
 from pathlib import Path
 from typing import Dict, List
 
-# Add paths
-sys.path.insert(0, str(Path(__file__).parent))
-sys.path.insert(0, str(Path(__file__).parent / 'core'))
+# Add paths (backend + core under project root)
+ROOT = Path(__file__).resolve().parents[2]
+BACKEND_ROOT = ROOT / "backend"
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
+BACKEND_CORE = BACKEND_ROOT / "core"
+if str(BACKEND_CORE) not in sys.path:
+    sys.path.insert(0, str(BACKEND_CORE))
 
 from core.config import Config
 from core.utils.logger import get_logger

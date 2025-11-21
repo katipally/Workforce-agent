@@ -9,8 +9,9 @@ lightrag-hku==0.1.0
 langchain==0.1.20
 langgraph==0.0.40
 langchain-openai==0.0.8
+sentence-transformers==2.2.2
 
-# Qwen3 Models
+# Transformer stack (used by sentence-transformers and related models)
 transformers==4.38.2
 torch==2.2.1
 accelerate==0.27.2

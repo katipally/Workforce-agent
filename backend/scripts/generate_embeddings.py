@@ -1,20 +1,26 @@
-"""Generate Qwen3 embeddings for all existing data.
+"""Generate semantic embeddings for all existing data.
 
 This script:
-1. Loads Qwen3-Embedding-8B model
+1. Loads the configured sentence-transformers embedding model
 2. Generates embeddings for Slack messages
 3. Generates embeddings for Gmail messages
-4. Stores embeddings in database (qwen_embedding column)
+4. Stores embeddings in database (generic embedding column)
 """
 
 import sys
 import os
+from pathlib import Path
 from tqdm import tqdm
 
-# Add parent directory to path
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'core'))
+# Add parent directory to path (backend/core for config + database)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+BACKEND_ROOT = PROJECT_ROOT / "backend"
+CORE_ROOT = BACKEND_ROOT / "core"
+for p in (BACKEND_ROOT, CORE_ROOT):
+    if str(p) not in sys.path:
+        sys.path.insert(0, str(p))
 
-from agent.qwen_engine import QwenEmbedding
+from agent.sentence_transformer_engine import SentenceTransformerEmbedding
 from database.db_manager import DatabaseManager
 from database.models import Message, GmailMessage
 from utils.logger import get_logger
@@ -23,7 +29,7 @@ from config import Config
 logger = get_logger(__name__)
 
 
-def generate_slack_embeddings(embedding_model: QwenEmbedding, db: DatabaseManager, batch_size: int = 32):
+def generate_slack_embeddings(embedding_model: SentenceTransformerEmbedding, db: DatabaseManager, batch_size: int = 32):
     """Generate embeddings for Slack messages.
     
     Args:
@@ -61,17 +67,17 @@ def generate_slack_embeddings(embedding_model: QwenEmbedding, db: DatabaseManage
                 show_progress=False
             )
             
-            # Update database
+            # Update database (generic embedding column)
             for msg, embedding in zip(batch, embeddings):
                 # Store as list for PostgreSQL vector type
-                msg.qwen_embedding = embedding.tolist()
+                msg.embedding = embedding.tolist()
             
             session.commit()
         
         logger.info(f"✓ Generated embeddings for {len(messages)} Slack messages")
 
 
-def generate_gmail_embeddings(embedding_model: QwenEmbedding, db: DatabaseManager, batch_size: int = 32):
+def generate_gmail_embeddings(embedding_model: SentenceTransformerEmbedding, db: DatabaseManager, batch_size: int = 32):
     """Generate embeddings for Gmail messages.
     
     Args:
@@ -117,9 +123,9 @@ def generate_gmail_embeddings(embedding_model: QwenEmbedding, db: DatabaseManage
                 show_progress=False
             )
             
-            # Update database
+            # Update database (generic embedding column)
             for email, embedding in zip(batch, embeddings):
-                email.qwen_embedding = embedding.tolist()
+                email.embedding = embedding.tolist()
             
             session.commit()
         
@@ -128,14 +134,14 @@ def generate_gmail_embeddings(embedding_model: QwenEmbedding, db: DatabaseManage
 
 def main():
     """Main function to generate all embeddings."""
-    logger.info("=== Qwen3 Embedding Generation ===")
+    logger.info("=== Embedding Generation ===")
     logger.info("")
     
     # Initialize models
     logger.info(f"Loading {Config.EMBEDDING_MODEL} (GPU: {Config.USE_GPU})...")
-    embedding_model = QwenEmbedding(
+    embedding_model = SentenceTransformerEmbedding(
         model_name=Config.EMBEDDING_MODEL,
-        use_gpu=Config.USE_GPU
+        use_gpu=Config.USE_GPU,
     )
     
     # Initialize database

@@ -2,11 +2,23 @@
 import asyncio
 import time
 from collections import defaultdict
-from typing import Dict, Optional
+from typing import Dict, Optional, Callable, Any
 from threading import Lock
+from datetime import datetime, timedelta
+from functools import wraps
 
-from config import get_rate_limit_for_method
 from .logger import get_logger
+
+# Default rate limits if not configured
+def get_rate_limit_for_method(method: str) -> tuple:
+    """Get rate limit for a method. Returns (calls, period_seconds)."""
+    defaults = {
+        "default": (100, 60),  # 100 calls per minute
+        "slack_api": (50, 60),  # 50 calls per minute for Slack
+        "gmail_api": (250, 60),  # 250 calls per minute for Gmail
+        "notion_api": (3, 1),  # 3 calls per second for Notion
+    }
+    return defaults.get(method, defaults["default"])
 
 logger = get_logger(__name__)
 

@@ -33,6 +33,31 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+def _normalize_notion_id(page_id: str) -> Optional[str]:
+    page_id = (page_id or "").strip()
+    if not page_id:
+        return None
+
+    # Handle full Notion URLs by extracting the last 32-character ID
+    if "notion.so" in page_id:
+        without_query = page_id.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+        last_segment = without_query.rsplit("/", 1)[-1]
+        candidate = last_segment.rsplit("-", 1)[-1]
+        cleaned = "".join(ch for ch in candidate if ch.isalnum())
+        if len(cleaned) >= 32:
+            return cleaned[-32:]
+
+        return None
+
+    # Basic validation for plain IDs (with or without hyphens)
+    simple = page_id.split("?", 1)[0].split("#", 1)[0]
+    hex_chars = "0123456789abcdefABCDEF-"
+    if all(ch in hex_chars for ch in simple) and len(simple.replace("-", "")) >= 32:
+        return simple
+
+    return None
+
+
 # Pydantic models for tool inputs
 class SearchSlackInput(BaseModel):
     """Input for searching Slack messages."""
@@ -1357,6 +1382,10 @@ class WorkforceTools:
             if not Config.NOTION_TOKEN:
                 return "❌ NOTION_TOKEN is not configured. Please set it in your environment."
 
+            normalized_id = _normalize_notion_id(page_id)
+            if not normalized_id:
+                return "❌ Invalid Notion page_id. Please pass a Notion page ID or full Notion URL."
+
             headers = {
                 "Authorization": f"Bearer {Config.NOTION_TOKEN}",
                 "Notion-Version": "2022-06-28",
@@ -1463,7 +1492,7 @@ class WorkforceTools:
                     cursor = data.get("next_cursor")
 
             # Start traversal from the page itself (page_id is also the root block_id)
-            walk(page_id, depth=0)
+            walk(normalized_id, depth=0)
 
             return "\n".join(text_lines) if text_lines else "No content"
 
@@ -1501,6 +1530,10 @@ class WorkforceTools:
 
             if not Config.NOTION_TOKEN:
                 return "❌ NOTION_TOKEN is not configured. Please set it in your environment."
+
+            normalized_id = _normalize_notion_id(page_id)
+            if not normalized_id:
+                return "❌ Invalid Notion page_id. Please pass a Notion page ID or full Notion URL."
 
             headers = {
                 "Authorization": f"Bearer {Config.NOTION_TOKEN}",
@@ -1621,7 +1654,7 @@ class WorkforceTools:
                         break
                     cursor = data.get("next_cursor")
 
-            walk(page_id, depth=0)
+            walk(normalized_id, depth=0)
 
             if updated_blocks == 0:
                 return "No matching text found on the specified page or subpages."

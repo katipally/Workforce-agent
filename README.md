@@ -1,11 +1,22 @@
 # 🤖 Workforce AI Agent
+
+## 🔄 Complete Integration (Nov 2025)
+
+**Pipeline → PostgreSQL → Embeddings → RAG → Chat flow is now fully automated:**
+- ✅ All pipeline runs (Slack, Gmail, Notion) **automatically generate embeddings**
+- ✅ Data synced to RAG in real-time (no manual steps)
+- ✅ Idempotent updates (no duplicates, smart upserts)
+- ✅ Works **with or without pgvector** (JSON fallback)
+- ✅ All chat endpoints unified through AI Brain
+- ✅ Projects tab connected to RAG for intelligent queries
+
 ---
 
 ## ✨ What Can It Do?
 
-### 🚀 **60+ Powerful Tools Across 3 Platforms** (November 2025 Update)
+### 🚀 **50+ Powerful Tools Across 3 Platforms** (November 2025 Update)
 
-The AI agent has access to **60+ comprehensive tools** with all major API features including **cross-platform project tracking**:
+The AI agent has access to **dozens of comprehensive tools** with all major API features including **cross-platform project tracking**:
 
 ### 📱 **Slack (30+ Tools)** ✨ EXPANDED
 
@@ -98,7 +109,7 @@ The AI agent has access to **60+ comprehensive tools** with all major API featur
 - Organize with databases
 
 ### 🔍 **Workspace Search (1 Tool)**
-- **Semantic Search**: AI-powered search across ALL platforms simultaneously using vector embeddings
+- **Semantic Search**: AI-powered search across ALL platforms simultaneously using sentence-transformers vector embeddings
 
 ### 🎯 **Project Tracking & Utilities (6 Tools)** ✨ NEW - Nov 2025
 
@@ -162,17 +173,17 @@ The AI agent has access to **60+ comprehensive tools** with all major API featur
   - Team activity summaries
   - Channel analytics
   - Cross-platform search
-- 🛠️ **26+ NEW TOOLS**: Comprehensive API coverage (**60+ total tools**)
+- 🛠️ **26+ NEW TOOLS**: Comprehensive API coverage (**50+ total tools active**)
   - **Slack**: File uploads, pins, channel management, user management
   - **Gmail**: Full email bodies, advanced search, unread count, all operators
   - **Notion**: Update pages, append content, workspace search
 - 🎨 **Fixed Chat History**: Sessions now persist properly, switch without losing messages
 - 📎 **File Upload**: Drag & drop interface with image previews (client-side validation)
 - 🗑️ **Removed Right Sidebar**: Cleaner, more focused UI
-- 🔧 **Fixed RAG Bug**: Vector search now uses correct 8192-dim embeddings
-- ✅ **100% Test Coverage**: All new tools tested and verified
+- 🔧 **Improved RAG Reliability**: Vector search now uses sentence-transformers embeddings with correct dimensions
+- ✅ **Extensive Test Coverage**: Core tools and integrations covered by Slack, Gmail, Notion, and project test suites
 
-**📖 [View Complete Tool Catalog](./TOOLS_CATALOG.md)** - Detailed documentation of all 60+ tools
+**📖 [View Complete Tool Catalog](./TOOLS_CATALOG.md)** - Detailed documentation of all 50+ tools
 
 ---
 
@@ -479,24 +490,34 @@ lsof -ti:5173 | xargs kill -9
 ```
 Workforce-agent/
 ├── backend/
-│   ├── agent/              # AI brain & tools
-│   │   ├── ai_brain.py     # gpt-5-nano + multi-tool logic
-│   │   └── langchain_tools.py  # 26 API tools
-│   ├── api/                # FastAPI server
-│   │   └── main.py         # WebSocket endpoints
-│   ├── core/               # API integrations
-│   │   ├── slack/          # Slack API
-│   │   ├── gmail/          # Gmail API
-│   │   └── notion_export/  # Notion API
-│   └── database/           # PostgreSQL models
-├── frontend/               # React UI
+│   ├── agent/                      # AI brain, RAG engine & tools
+│   │   ├── ai_brain.py             # gpt-5-nano + multi-tool logic
+│   │   ├── hybrid_rag.py           # Hybrid RAG over Slack, Gmail, Notion
+│   │   ├── sentence_transformer_engine.py  # sentence-transformers embedding & reranker
+│   │   └── langchain_tools.py      # Slack/Gmail/Notion/project tools
+│   ├── api/                        # FastAPI server
+│   │   └── main.py                 # REST & WebSocket endpoints
+│   ├── core/                       # Config, DB models, and API integrations
+│   │   ├── config.py               # Config & env loading
+│   │   ├── database/               # PostgreSQL models
+│   │   ├── slack/                  # Slack API
+│   │   ├── gmail/                  # Gmail API
+│   │   ├── notion_export/          # Notion API
+│   │   └── cli/                    # CLI used by top-level main.py
+│   ├── scripts/                    # Helper & maintenance scripts
+│   ├── test_all_apis.py            # API permission test script
+│   ├── test_comprehensive_tools.py # All tools test suite
+│   └── test_new_tools.py           # New tools test suite
+├── test-files/                     # Legacy end-to-end Slack/Gmail/Notion tests
+├── frontend/                       # React UI
 │   └── src/
-│       └── components/     # Chat interface
-├── Documentation/          # Full API setup guides
-├── .env                    # Your API keys (create this)
-├── .env.example            # Template
-├── START_SERVERS.sh        # Mac/Linux startup
-└── STOP_SERVERS.sh         # Shutdown script
+│       └── components/             # Chat interface & pipelines views
+├── data/                           # Local data (Gmail token, exports, files)
+├── Documentation/                  # Full API setup guides
+├── .env                            # Your API keys (create this)
+├── .env.example                    # Template
+├── START_SERVERS.sh                # Mac/Linux startup
+└── STOP_SERVERS.sh                 # Shutdown script
 ```
 
 ---
@@ -532,7 +553,7 @@ Workforce-agent/
 - **Single Source of Truth**: PostgreSQL with pgvector stores all cross-platform data
 - **Hybrid Interface**: Chatbot UX + AI agent automation in one
 - **Smart AI**: Automatically selects and chains tools
-- **RAG-Powered**: Semantic search across all platforms with 8192-dim embeddings
+- **RAG-Powered**: Semantic search across all platforms using sentence-transformers embeddings (dimension depends on configured model)
 - **Multi-Tool Workflows**: Complex automations handled automatically
 - **Natural Language**: No commands to memorize
 - **Production Ready**: Robust error handling, auto-reconnection, streaming responses
