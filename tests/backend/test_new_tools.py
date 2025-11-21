@@ -16,10 +16,14 @@ import os
 import sys
 from pathlib import Path
 
-# Add paths
-backend_path = Path(__file__).parent
-if str(backend_path) not in sys.path:
-    sys.path.insert(0, str(backend_path))
+# Add paths (backend + core under project root)
+ROOT = Path(__file__).resolve().parents[2]
+BACKEND_ROOT = ROOT / "backend"
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
+BACKEND_CORE = BACKEND_ROOT / "core"
+if str(BACKEND_CORE) not in sys.path:
+    sys.path.insert(0, str(BACKEND_CORE))
 
 from agent.langchain_tools import WorkforceTools
 from core.utils.logger import get_logger

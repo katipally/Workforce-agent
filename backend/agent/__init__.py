@@ -1,7 +1,7 @@
 """AI Agent components."""
 
-from .qwen_engine import QwenEmbedding, QwenReranker
+from .sentence_transformer_engine import SentenceTransformerEmbedding, SentenceTransformerReranker
 from .hybrid_rag import HybridRAGEngine
 from .langchain_tools import WorkforceTools
 
-__all__ = ['QwenEmbedding', 'QwenReranker', 'HybridRAGEngine', 'WorkforceTools']
+__all__ = ['SentenceTransformerEmbedding', 'SentenceTransformerReranker', 'HybridRAGEngine', 'WorkforceTools']

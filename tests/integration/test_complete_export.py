@@ -1,5 +1,7 @@
 """Test complete database to Notion export."""
 
+import sys
+from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
@@ -12,6 +14,13 @@ def test_export():
     
     # Check 1: Verify database has data
     console.print("[cyan]1. Checking database...[/cyan]")
+
+    # Ensure backend core modules are importable when running from repo root
+    ROOT = Path(__file__).resolve().parents[2]
+    BACKEND_CORE = ROOT / "backend" / "core"
+    if str(BACKEND_CORE) not in sys.path:
+        sys.path.insert(0, str(BACKEND_CORE))
+
     from database.db_manager import DatabaseManager
     from database.models import (
         Workspace, User, Channel, Message, File, Reaction,

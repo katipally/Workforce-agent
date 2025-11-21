@@ -10,9 +10,17 @@ Tests all Notion functionality:
 
 import sys
 from datetime import datetime
+from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
+
+# Ensure backend core modules are importable when running from repo root
+ROOT = Path(__file__).resolve().parents[2]
+BACKEND_CORE = ROOT / "backend" / "core"
+if str(BACKEND_CORE) not in sys.path:
+    sys.path.insert(0, str(BACKEND_CORE))
+
 from config import Config
 from database.db_manager import DatabaseManager
 from notion_export import NotionClient, NotionExporter

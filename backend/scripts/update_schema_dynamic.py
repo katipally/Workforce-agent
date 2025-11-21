@@ -57,10 +57,22 @@ def update_schema():
     # Connect to database
     engine = create_engine(Config.DATABASE_URL)
     
-    with engine.connect() as conn:
-        # Start transaction
-        trans = conn.begin()
-        
+    # Check if pgvector is available (separate transaction to avoid abort)
+    has_pgvector = False
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            has_pgvector = True
+            logger.info("✓ pgvector extension available")
+    except Exception as e:
+        logger.warning(
+            "pgvector extension not available - will use JSON storage for embeddings. "
+            "For better performance, install pgvector: brew install pgvector"
+        )
+        has_pgvector = False
+    
+    # Now run schema updates in separate transaction
+    with engine.begin() as conn:
         try:
             # =================================================================
             # UPDATE MESSAGES TABLE
@@ -90,25 +102,38 @@ def update_schema():
                 conn.execute(text("ALTER TABLE messages DROP COLUMN IF EXISTS embedding"))
             
             # Add new embedding column
-            logger.info(f"  Adding embedding column ({embedding_dim} dimensions)...")
-            conn.execute(text(f"""
-                ALTER TABLE messages 
-                ADD COLUMN IF NOT EXISTS embedding vector({embedding_dim})
-            """))
+            if has_pgvector:
+                logger.info(f"  Adding embedding column as vector({embedding_dim})...")
+                conn.execute(text(f"""
+                    ALTER TABLE messages 
+                    ADD COLUMN IF NOT EXISTS embedding vector({embedding_dim})
+                """))
+            else:
+                logger.info(f"  Adding embedding column as JSON (pgvector unavailable)...")
+                conn.execute(text("""
+                    ALTER TABLE messages 
+                    ADD COLUMN IF NOT EXISTS embedding JSON
+                """))
             
             # Drop old indexes
             logger.info("  Dropping old indexes...")
             conn.execute(text("DROP INDEX IF EXISTS messages_qwen_embedding_idx"))
             conn.execute(text("DROP INDEX IF EXISTS messages_embedding_idx"))
             
-            # Create HNSW index
-            logger.info("  Creating HNSW index...")
-            conn.execute(text(f"""
-                CREATE INDEX messages_embedding_idx 
-                ON messages 
-                USING hnsw (embedding vector_cosine_ops)
-                WITH (m = 16, ef_construction = 64)
-            """))
+            # Create index (HNSW if pgvector, GIN if JSON)
+            if has_pgvector:
+                logger.info("  Creating HNSW vector index...")
+                try:
+                    conn.execute(text(f"""
+                        CREATE INDEX IF NOT EXISTS messages_embedding_idx 
+                        ON messages 
+                        USING hnsw (embedding vector_cosine_ops)
+                        WITH (m = 16, ef_construction = 64)
+                    """))
+                except Exception as e:
+                    logger.warning(f"  Could not create HNSW index (may already exist): {e}")
+            else:
+                logger.info("  Skipping vector index (JSON storage doesn't support HNSW)")
             
             logger.info("  ✓ Messages table updated")
             
@@ -141,31 +166,42 @@ def update_schema():
                 conn.execute(text("ALTER TABLE gmail_messages DROP COLUMN IF EXISTS embedding"))
             
             # Add new embedding column
-            logger.info(f"  Adding embedding column ({embedding_dim} dimensions)...")
-            conn.execute(text(f"""
-                ALTER TABLE gmail_messages 
-                ADD COLUMN IF NOT EXISTS embedding vector({embedding_dim})
-            """))
+            if has_pgvector:
+                logger.info(f"  Adding embedding column as vector({embedding_dim})...")
+                conn.execute(text(f"""
+                    ALTER TABLE gmail_messages 
+                    ADD COLUMN IF NOT EXISTS embedding vector({embedding_dim})
+                """))
+            else:
+                logger.info(f"  Adding embedding column as JSON (pgvector unavailable)...")
+                conn.execute(text("""
+                    ALTER TABLE gmail_messages 
+                    ADD COLUMN IF NOT EXISTS embedding JSON
+                """))
             
             # Drop old indexes
             logger.info("  Dropping old indexes...")
             conn.execute(text("DROP INDEX IF EXISTS gmail_messages_qwen_embedding_idx"))
             conn.execute(text("DROP INDEX IF EXISTS gmail_messages_embedding_idx"))
             
-            # Create HNSW index
-            logger.info("  Creating HNSW index...")
-            conn.execute(text(f"""
-                CREATE INDEX gmail_messages_embedding_idx 
-                ON gmail_messages 
-                USING hnsw (embedding vector_cosine_ops)
-                WITH (m = 16, ef_construction = 64)
-            """))
+            # Create index (HNSW if pgvector, GIN if JSON)
+            if has_pgvector:
+                logger.info("  Creating HNSW vector index...")
+                try:
+                    conn.execute(text(f"""
+                        CREATE INDEX IF NOT EXISTS gmail_messages_embedding_idx 
+                        ON gmail_messages 
+                        USING hnsw (embedding vector_cosine_ops)
+                        WITH (m = 16, ef_construction = 64)
+                    """))
+                except Exception as e:
+                    logger.warning(f"  Could not create HNSW index (may already exist): {e}")
+            else:
+                logger.info("  Skipping vector index (JSON storage doesn't support HNSW)")
             
             logger.info("  ✓ Gmail messages table updated")
             
-            # Commit transaction
-            trans.commit()
-            
+            # Transaction will auto-commit on context exit
             logger.info("")
             logger.info("=" * 80)
             logger.info("✓ DATABASE SCHEMA UPDATE COMPLETE")
@@ -176,7 +212,6 @@ def update_schema():
             logger.info("2. Start the API server")
             
         except Exception as e:
-            trans.rollback()
             logger.error(f"✗ Schema update failed: {e}")
             raise
 

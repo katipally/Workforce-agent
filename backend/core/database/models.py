@@ -139,9 +139,10 @@ class Message(Base):
     attachments = Column(JSON)
     raw_data = Column(JSON)
     
-    # AI/RAG: Vector embeddings for semantic search (8192 dimensions for Qwen3)
-    embedding = Column(Vector(768) if VECTOR_SUPPORT else JSON)  # Legacy 768-dim
-    qwen_embedding = Column(Vector(8192) if VECTOR_SUPPORT else JSON)  # Qwen3 8192-dim
+    # AI/RAG: Vector embeddings for semantic search
+    # Dimension is managed dynamically via migration scripts (update_schema_dynamic.py).
+    # If pgvector is not available, embeddings are stored as JSON arrays.
+    embedding = Column(JSON)
     
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -404,9 +405,10 @@ class GmailMessage(Base):
     is_draft = Column(Boolean, default=False)
     is_sent = Column(Boolean, default=False)
     
-    # AI/RAG: Vector embeddings for semantic search (8192 dimensions for Qwen3)
-    embedding = Column(Vector(768) if VECTOR_SUPPORT else JSON)  # Legacy 768-dim
-    qwen_embedding = Column(Vector(8192) if VECTOR_SUPPORT else JSON)  # Qwen3 8192-dim
+    # AI/RAG: Vector embeddings for semantic search
+    # Dimension is managed dynamically via migration scripts (update_schema_dynamic.py).
+    # If pgvector is not available, embeddings are stored as JSON arrays.
+    embedding = Column(JSON)
     
     # Raw data
     raw_data = Column(JSON)

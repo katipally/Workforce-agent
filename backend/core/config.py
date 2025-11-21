@@ -67,8 +67,8 @@ class Config:
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
     
     # AI Agent Configuration
-    EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-8B")
-    RERANKER_MODEL = os.getenv("RERANKER_MODEL", "Qwen/Qwen3-Reranker-4B")
+    EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+    RERANKER_MODEL = os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
     # LLM Model - default to gpt-5-nano (Nov 2025)
     # gpt-5-nano: Latest lightweight reasoning model, optimized for speed & cost with tool calling + streaming
     # Other options (if enabled for your account): gpt-5-mini, gpt-5

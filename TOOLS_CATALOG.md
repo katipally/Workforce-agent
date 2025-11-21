@@ -2,7 +2,7 @@
 
 This document lists the core tools available in the Workforce AI Agent, organized by platform.
 
-> 💡 **November 2025 Update**: The agent now has **60+ tools** including advanced Gmail thread tools, Notion workspace tools, cross-platform project tracking, and utilities. This catalog focuses on the core set; see the README for a high-level overview of all capabilities.
+> 💡 **November 2025 Update**: The agent now has **50+ tools** including advanced Gmail thread tools, Notion workspace tools, cross-platform project tracking, and utilities. This catalog focuses on the core set; see the README for a high-level overview of all capabilities.
 
 ---
 
@@ -526,7 +526,7 @@ AI calls: search_notion_content(query="budget")
 ## 🔍 WORKSPACE & PROJECT TOOLS (4+ Tools)
 
 #### 46. **search_workspace**
-**What it does:** Semantic search across ALL platforms (Slack, Gmail, Notion) using AI embeddings.
+**What it does:** Semantic search across ALL platforms (Slack, Gmail, Notion) using sentence-transformers embeddings.
 
 **Use when:** User asks broad questions that may span multiple tools
 
@@ -578,7 +578,7 @@ Analyzes a Slack channel for activity level, most active users, and basic sentim
 | **Gmail** | 15+ tools | Send, read, search, labels, threads, advanced search |
 | **Notion** | 10+ tools | Create, read, update, search pages & databases |
 | **Workspace & Projects** | 6+ tools | Semantic search, project tracking, analytics |
-| **TOTAL** | **60+ tools** | Comprehensive workspace automation |
+| **TOTAL** | **50+ tools** | Comprehensive workspace automation |
 
 ---
 
@@ -648,4 +648,4 @@ AI Workflow:
 ---
 
 **Last Updated:** November 2025  
-**Total Tools:** 60+ (majority active; some advanced tools planned)
+**Total Tools:** 50+ (majority active; some advanced tools planned)

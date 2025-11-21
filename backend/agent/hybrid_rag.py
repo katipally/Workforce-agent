@@ -4,7 +4,7 @@ Combines:
 - LightRAG for fast retrieval
 - LangChain for tool orchestration
 - LangGraph for stateful workflows
-- Qwen3 for embeddings and reranking
+- sentence-transformers for embeddings and reranking
 """
 
 from typing import TypedDict, List, Dict, Any, Optional, AsyncIterator
@@ -24,7 +24,10 @@ core_path = Path(__file__).parent.parent / 'core'
 if str(core_path) not in sys.path:
     sys.path.insert(0, str(core_path))
 
-from .qwen_engine import QwenEmbedding, QwenReranker
+from .sentence_transformer_engine import (
+    SentenceTransformerEmbedding,
+    SentenceTransformerReranker,
+)
 from .langchain_tools import WorkforceTools
 from database.db_manager import DatabaseManager
 from database.models import Message, GmailMessage, Channel, User, NotionPage
@@ -52,8 +55,8 @@ class HybridRAGEngine:
     def __init__(
         self,
         openai_api_key: str,
-        qwen_embedding: Optional[QwenEmbedding] = None,
-        qwen_reranker: Optional[QwenReranker] = None
+        embedding_model: Optional[SentenceTransformerEmbedding] = None,
+        reranker_model: Optional[SentenceTransformerReranker] = None
     ):
         """Initialize hybrid RAG engine.
         
@@ -64,9 +67,9 @@ class HybridRAGEngine:
         """
         logger.info("Initializing Hybrid RAG Engine...")
         
-        # Initialize Qwen models (lazy loading if not provided)
-        self.embedding_model = qwen_embedding
-        self.reranker_model = qwen_reranker
+        # Initialize embedding / reranker models (lazy loading if not provided)
+        self.embedding_model = embedding_model
+        self.reranker_model = reranker_model
         
         # Initialize OpenAI (for LLM calls)
         # Using Config.LLM_MODEL (default: gpt-5-nano) for hybrid RAG and intent classification
@@ -96,12 +99,18 @@ class HybridRAGEngine:
     def _ensure_models_loaded(self):
         """Lazy load Qwen models if not already loaded."""
         if self.embedding_model is None:
-            logger.info("Loading Qwen3-Embedding-8B...")
-            self.embedding_model = QwenEmbedding()
+            logger.info("Loading embedding model...")
+            self.embedding_model = SentenceTransformerEmbedding(
+                model_name=Config.EMBEDDING_MODEL,
+                use_gpu=Config.USE_GPU,
+            )
         
         if self.reranker_model is None:
-            logger.info("Loading Qwen3-Reranker-4B...")
-            self.reranker_model = QwenReranker()
+            logger.info("Loading reranker model...")
+            self.reranker_model = SentenceTransformerReranker(
+                model_name=Config.RERANKER_MODEL,
+                use_gpu=Config.USE_GPU,
+            )
     
     def _search_notion_pages(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Search Notion workspace for pages matching the query.
@@ -307,11 +316,12 @@ class HybridRAGEngine:
             slack_messages = session.query(Message).join(Channel).join(User).limit(1000).all()
             
             for msg in slack_messages:
-                # Use qwen_embedding (8192-dim) for Qwen3 model
-                if msg.qwen_embedding is not None and len(msg.qwen_embedding) == 8192:
-                    # Calculate cosine similarity
-                    doc_emb = np.array(msg.qwen_embedding)
-                    score = np.dot(query_emb, doc_emb)
+                # Use generic embedding column for semantic search
+                if msg.embedding is not None:
+                    doc_emb = np.array(msg.embedding)
+                    if doc_emb.shape[0] != query_emb.shape[0]:
+                        continue
+                    score = float(np.dot(query_emb, doc_emb))
 
                     user_name = None
                     try:
@@ -341,10 +351,12 @@ class HybridRAGEngine:
             gmail_messages = session.query(GmailMessage).limit(1000).all()
             
             for email in gmail_messages:
-                # Use qwen_embedding (8192-dim) for Qwen3 model
-                if email.qwen_embedding is not None and len(email.qwen_embedding) == 8192:
-                    doc_emb = np.array(email.qwen_embedding)
-                    score = np.dot(query_emb, doc_emb)
+                # Use generic embedding column for semantic search
+                if email.embedding is not None:
+                    doc_emb = np.array(email.embedding)
+                    if doc_emb.shape[0] != query_emb.shape[0]:
+                        continue
+                    score = float(np.dot(query_emb, doc_emb))
                     
                     results.append({
                         'type': 'gmail',
@@ -557,39 +569,137 @@ class HybridRAGEngine:
     ) -> List[Dict[str, Any]]:
         """Vector search restricted to specific Slack channels, Gmail labels, and Notion pages.
 
-        This reuses the global vector search and filters results based on
-        metadata derived from the database / Notion APIs.
+        TRUE SCOPING: Queries database with filters applied FIRST to ensure we only
+        retrieve data from the project's linked sources.
         """
-
-        base_results = self._vector_search(query, limit=limit)
+        
+        # If no filters provided, fall back to global search
         if not channel_ids and not label_ids and not notion_page_ids:
-            return base_results
+            return self._vector_search(query, limit=limit)
+        
+        self._ensure_models_loaded()
+        
+        # Generate query embedding
+        query_emb = self.embedding_model.encode_single(query, is_query=True)
+        
+        results = []
+        
+        with self.db.get_session() as session:
+            # Search ONLY Slack messages from specified channels
+            if channel_ids:
+                slack_messages = (
+                    session.query(Message)
+                    .join(Channel)
+                    .join(User)
+                    .filter(Message.channel_id.in_(channel_ids))
+                    .limit(500)
+                    .all()
+                )
+                
+                for msg in slack_messages:
+                    if msg.embedding is not None:
+                        doc_emb = np.array(msg.embedding)
+                        if doc_emb.shape[0] != query_emb.shape[0]:
+                            continue
+                        score = float(np.dot(query_emb, doc_emb))
 
-        channel_set = set(channel_ids or [])
-        label_set = set(label_ids or [])
-        notion_set = set(notion_page_ids or [])
-
-        scoped: List[Dict[str, Any]] = []
-        for doc in base_results:
-            meta = doc.get('metadata') or {}
-            doc_type = doc.get('type')
-
-            if doc_type == 'slack':
-                ch_id = meta.get('channel_id')
-                if channel_set and ch_id not in channel_set:
-                    continue
-            elif doc_type == 'gmail':
-                doc_labels = set(meta.get('label_ids') or [])
-                if label_set and doc_labels.isdisjoint(label_set):
-                    continue
-            elif doc_type == 'notion':
-                page_id = meta.get('page_id')
-                if notion_set and page_id not in notion_set:
-                    continue
-
-            scoped.append(doc)
-
-        return scoped
+                        user_name = None
+                        try:
+                            if msg.user is not None:
+                                user_name = (
+                                    msg.user.real_name
+                                    or msg.user.display_name
+                                    or msg.user.username
+                                )
+                        except Exception:
+                            user_name = None
+                        
+                        results.append({
+                            'type': 'slack',
+                            'text': msg.text,
+                            'score': float(score),
+                            'metadata': {
+                                'channel': msg.channel.name,
+                                'channel_id': msg.channel_id,
+                                'user': user_name,
+                                'user_id': msg.user_id,
+                                'timestamp': msg.timestamp,
+                            }
+                        })
+            
+            # Search ONLY Gmail messages with specified labels
+            if label_ids:
+                # Use JSONB containment to filter by label_ids
+                label_filters = [
+                    cast(GmailMessage.label_ids, JSONB).contains([lbl])
+                    for lbl in label_ids
+                ]
+                gmail_messages = (
+                    session.query(GmailMessage)
+                    .filter(or_(*label_filters))
+                    .limit(500)
+                    .all()
+                )
+                
+                for email in gmail_messages:
+                    if email.embedding is not None:
+                        doc_emb = np.array(email.embedding)
+                        if doc_emb.shape[0] != query_emb.shape[0]:
+                            continue
+                        score = float(np.dot(query_emb, doc_emb))
+                        
+                        results.append({
+                            'type': 'gmail',
+                            'text': email.subject + "\n" + (email.body_text[:500] if email.body_text else ""),
+                            'score': float(score),
+                            'metadata': {
+                                'from': email.from_address,
+                                'subject': email.subject,
+                                'date': email.date,
+                                'label_ids': email.label_ids or [],
+                            }
+                        })
+            
+            # Search ONLY specified Notion pages
+            if notion_page_ids:
+                notion_pages = (
+                    session.query(NotionPage)
+                    .filter(NotionPage.page_id.in_(notion_page_ids))
+                    .order_by(NotionPage.last_edited_time.desc())
+                    .limit(20)
+                    .all()
+                )
+                
+                # Generate embeddings for Notion pages on-the-fly if needed
+                for page in notion_pages:
+                    try:
+                        page_text = self._get_notion_page_text(page.page_id, max_blocks=50)
+                        if not page_text:
+                            continue
+                        
+                        full_text = f"{page.title or 'Untitled'}\n{page_text}"
+                        doc_emb = self.embedding_model.encode_single(full_text, is_query=False)
+                        score = float(np.dot(query_emb, doc_emb))
+                        
+                        results.append({
+                            'type': 'notion',
+                            'text': full_text,
+                            'score': score,
+                            'metadata': {
+                                'page_id': page.page_id,
+                                'title': page.title,
+                                'last_edited_time': page.last_edited_time
+                            }
+                        })
+                    except Exception as e:
+                        logger.error(f"Error processing Notion page {page.page_id}: {e}")
+                        continue
+        
+        # Sort by score descending
+        results.sort(key=lambda x: x['score'], reverse=True)
+        
+        logger.info(f"Project-scoped vector search found {len(results[:limit])} results from {len(channel_ids or [])} channels, {len(label_ids or [])} labels, {len(notion_page_ids or [])} pages")
+        return results[:limit]
 
     def _keyword_search_scoped(
         self,
@@ -599,37 +709,121 @@ class HybridRAGEngine:
         notion_page_ids: Optional[List[str]] = None,
         limit: int = 20,
     ) -> List[Dict[str, Any]]:
-        """Keyword search restricted to specific Slack channels, Gmail labels, and Notion pages."""
-
-        base_results = self._keyword_search(query, limit=limit)
+        """Keyword search restricted to specific Slack channels, Gmail labels, and Notion pages.
+        
+        TRUE SCOPING: Queries database with filters applied FIRST to ensure we only
+        retrieve data from the project's linked sources.
+        """
+        
+        # If no filters provided, fall back to global search
         if not channel_ids and not label_ids and not notion_page_ids:
-            return base_results
-
-        channel_set = set(channel_ids or [])
-        label_set = set(label_ids or [])
-        notion_set = set(notion_page_ids or [])
-
-        scoped: List[Dict[str, Any]] = []
-        for doc in base_results:
-            meta = doc.get('metadata') or {}
-            doc_type = doc.get('type')
-
-            if doc_type == 'slack':
-                ch_id = meta.get('channel_id')
-                if channel_set and ch_id not in channel_set:
-                    continue
-            elif doc_type == 'gmail':
-                doc_labels = set(meta.get('label_ids') or [])
-                if label_set and doc_labels.isdisjoint(label_set):
-                    continue
-            elif doc_type == 'notion':
-                page_id = meta.get('page_id')
-                if notion_set and page_id not in notion_set:
-                    continue
-
-            scoped.append(doc)
-
-        return scoped
+            return self._keyword_search(query, limit=limit)
+        
+        results = []
+        
+        with self.db.get_session() as session:
+            # Search ONLY Slack messages from specified channels
+            if channel_ids:
+                slack_messages = (
+                    session.query(Message)
+                    .join(Channel)
+                    .join(User)
+                    .filter(Message.channel_id.in_(channel_ids))
+                    .filter(Message.text.ilike(f'%{query}%'))
+                    .limit(limit)
+                    .all()
+                )
+                
+                for msg in slack_messages:
+                    user_name = None
+                    try:
+                        if msg.user is not None:
+                            user_name = (
+                                msg.user.real_name
+                                or msg.user.display_name
+                                or msg.user.username
+                            )
+                    except Exception:
+                        user_name = None
+                    
+                    results.append({
+                        'type': 'slack',
+                        'text': msg.text,
+                        'score': 1.0,
+                        'metadata': {
+                            'channel': msg.channel.name,
+                            'channel_id': msg.channel_id,
+                            'user': user_name,
+                            'user_id': msg.user_id,
+                            'timestamp': msg.timestamp,
+                        }
+                    })
+            
+            # Search ONLY Gmail messages with specified labels
+            if label_ids:
+                label_filters = [
+                    cast(GmailMessage.label_ids, JSONB).contains([lbl])
+                    for lbl in label_ids
+                ]
+                gmail_messages = (
+                    session.query(GmailMessage)
+                    .filter(or_(*label_filters))
+                    .filter(
+                        or_(
+                            GmailMessage.subject.ilike(f'%{query}%'),
+                            GmailMessage.body_text.ilike(f'%{query}%')
+                        )
+                    )
+                    .limit(limit)
+                    .all()
+                )
+                
+                for email in gmail_messages:
+                    results.append({
+                        'type': 'gmail',
+                        'text': email.subject + "\n" + (email.body_text[:500] if email.body_text else ""),
+                        'score': 1.0,
+                        'metadata': {
+                            'from': email.from_address,
+                            'subject': email.subject,
+                            'date': email.date,
+                            'label_ids': email.label_ids or [],
+                        }
+                    })
+            
+            # Search ONLY specified Notion pages (via Notion API if query is relevant)
+            if notion_page_ids:
+                # For keyword search, we fetch the specified pages and check if query appears
+                notion_pages = (
+                    session.query(NotionPage)
+                    .filter(NotionPage.page_id.in_(notion_page_ids))
+                    .filter(NotionPage.title.ilike(f'%{query}%'))
+                    .order_by(NotionPage.last_edited_time.desc())
+                    .limit(min(limit, 10))
+                    .all()
+                )
+                
+                for page in notion_pages:
+                    try:
+                        page_text = self._get_notion_page_text(page.page_id, max_blocks=20)
+                        preview = page_text[:500] if page_text else ""
+                        
+                        results.append({
+                            'type': 'notion',
+                            'text': f"{page.title or 'Untitled'}\n{preview}",
+                            'score': 1.0,
+                            'metadata': {
+                                'page_id': page.page_id,
+                                'title': page.title,
+                                'last_edited_time': page.last_edited_time
+                            }
+                        })
+                    except Exception as e:
+                        logger.error(f"Error processing Notion page {page.page_id}: {e}")
+                        continue
+        
+        logger.info(f"Project-scoped keyword search found {len(results)} results from {len(channel_ids or [])} channels, {len(label_ids or [])} labels, {len(notion_page_ids or [])} pages")
+        return results
 
     def _retrieve_context_scoped(
         self,
@@ -668,7 +862,7 @@ class HybridRAGEngine:
         # Step 3: RRF fusion
         fused_results = self._rrf_fusion(vector_results, keyword_results)
 
-        # Step 4: Rerank top 30 with Qwen3-Reranker
+        # Step 4: Rerank top 30 with cross-encoder reranker
         if len(fused_results) > 0:
             self._ensure_models_loaded()
 
@@ -677,14 +871,13 @@ class HybridRAGEngine:
 
             reranked = self.reranker_model.rerank(query, texts, top_k=top_k)
 
-            # Match back to original documents
+            # Match back to original documents using indices
             final_results: List[Dict[str, Any]] = []
-            for text, score in reranked:
-                for doc in candidates:
-                    if doc['text'] == text:
-                        doc['rerank_score'] = score
-                        final_results.append(doc)
-                        break
+            for idx, score in reranked:
+                if 0 <= idx < len(candidates):
+                    doc = candidates[idx]
+                    doc['rerank_score'] = float(score)
+                    final_results.append(doc)
 
             logger.info(
                 "Project-scoped reranking selected top %s documents",
@@ -715,7 +908,7 @@ class HybridRAGEngine:
         # Step 3: RRF fusion
         fused_results = self._rrf_fusion(vector_results, keyword_results)
         
-        # Step 4: Rerank top 30 with Qwen3-Reranker
+        # Step 4: Rerank top 30 with cross-encoder reranker
         if len(fused_results) > 0:
             self._ensure_models_loaded()
             
@@ -724,14 +917,13 @@ class HybridRAGEngine:
             
             reranked = self.reranker_model.rerank(query, texts, top_k=top_k)
             
-            # Match back to original documents
+            # Match back to original documents using indices
             final_results: List[Dict[str, Any]] = []
-            for text, score in reranked:
-                for doc in candidates:
-                    if doc['text'] == text:
-                        doc['rerank_score'] = score
-                        final_results.append(doc)
-                        break
+            for idx, score in reranked:
+                if 0 <= idx < len(candidates):
+                    doc = candidates[idx]
+                    doc['rerank_score'] = float(score)
+                    final_results.append(doc)
             
             logger.info(f"Reranking selected top {len(final_results)} documents")
             return final_results
@@ -1013,12 +1205,32 @@ Answer the question based on the context above. Be concise and accurate."""
                     )
                     context = db_context
 
-        # Build context string for the prompt
+        # Build context string for the prompt, including human-friendly names
         context_str = ''
         if context:
-            context_str = '\n\n'.join(
-                [f"[{doc['type'].upper()}] {doc['text'][:300]}..." for doc in context]
-            )
+            lines: List[str] = []
+            for doc in context:
+                doc_type = (doc.get('type') or '').lower()
+                text = (doc.get('text') or '')[:300]
+                meta = doc.get('metadata') or {}
+
+                if doc_type == 'slack':
+                    channel = meta.get('channel') or meta.get('channel_id') or 'unknown-channel'
+                    user = meta.get('user') or meta.get('user_id') or 'someone'
+                    prefix = f"[SLACK #{channel} | {user}]"
+                elif doc_type == 'gmail':
+                    sender = meta.get('from') or 'Unknown sender'
+                    subject = meta.get('subject') or 'No subject'
+                    prefix = f"[GMAIL {sender} – {subject}]"
+                elif doc_type == 'notion':
+                    title = meta.get('title') or 'Untitled page'
+                    prefix = f"[NOTION {title}]"
+                else:
+                    prefix = f"[{(doc.get('type') or '').upper()}]"
+
+                lines.append(f"{prefix} {text}...")
+
+            context_str = '\n\n'.join(lines)
 
         # Optionally incorporate brief conversation history
         history_str = ''
