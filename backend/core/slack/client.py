@@ -75,6 +75,10 @@ class SlackClient:
         """Get conversation history. See Slack SDK docs for parameters."""
         return self.client.conversations_history(**kwargs)
     
+    def conversations_replies(self, **kwargs) -> Dict[str, Any]:
+        """Get thread messages (replies) for a conversation. See Slack SDK docs."""
+        return self.client.conversations_replies(**kwargs)
+    
     def conversations_members(self, **kwargs) -> Dict[str, Any]:
         """Get conversation members. See Slack SDK docs for parameters."""
         return self.client.conversations_members(**kwargs)

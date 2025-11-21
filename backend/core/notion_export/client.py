@@ -130,6 +130,62 @@ class NotionClient:
             logger.error(f"Error appending blocks: {error}")
             return False
     
+    def append_blocks_and_get_ids(
+        self,
+        block_id: str,
+        blocks: List[Dict[str, Any]],
+    ) -> List[str]:
+        """Append blocks and return their Notion IDs.
+
+        This is similar to append_blocks but collects the IDs of the newly
+        created child blocks so callers can keep precise mappings.
+        """
+        if not self.client:
+            logger.error("Notion client not initialized")
+            return []
+
+        created_ids: List[str] = []
+        try:
+            for i in range(0, len(blocks), 100):
+                batch = blocks[i : i + 100]
+                resp = self.client.blocks.children.append(
+                    block_id=block_id,
+                    children=batch,
+                )
+                for child in resp.get("results", []):
+                    child_id = child.get("id")
+                    if child_id:
+                        created_ids.append(child_id)
+
+            logger.info(f"Appended {len(blocks)} blocks to {block_id} (ids={len(created_ids)})")
+            return created_ids
+        except APIResponseError as error:
+            logger.error(f"Error appending blocks with ids: {error}")
+            return []
+    
+    def update_bulleted_list_item(self, block_id: str, text: str) -> bool:
+        """Update the text content of an existing bulleted list item block."""
+        if not self.client:
+            logger.error("Notion client not initialized")
+            return False
+
+        try:
+            self.client.blocks.update(
+                block_id=block_id,
+                bulleted_list_item={
+                    "rich_text": [
+                        {
+                            "type": "text",
+                            "text": {"content": text},
+                        }
+                    ]
+                },
+            )
+            return True
+        except APIResponseError as error:
+            logger.error(f"Error updating bulleted list item: {error}")
+            return False
+    
     def create_heading(self, text: str, level: int = 2) -> Dict[str, Any]:
         """Create heading block.
         

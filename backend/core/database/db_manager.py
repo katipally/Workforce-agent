@@ -15,12 +15,13 @@ from sqlalchemy.exc import IntegrityError
 
 from config import Config
 from .models import (
-    Base, Workspace, User, Channel, Message, File, 
+    Base, Workspace, User, Channel, Message, File,
     MessageFile, Reaction, SyncStatus,
     NotionWorkspace, NotionPage,
     GmailAccount, GmailLabel, GmailThread, GmailMessage, GmailAttachment,
     ChatSession, ChatMessage,
     Project, ProjectSource,
+    Workflow, WorkflowChannelMapping, SlackNotionMessageMapping,
 )
 from utils.logger import get_logger
 
@@ -722,5 +723,213 @@ class DatabaseManager:
                 session.query(ProjectSource)
                 .filter_by(project_id=project_id)
                 .order_by(ProjectSource.created_at.asc())
+                .all()
+            )
+
+    # ========================================================================
+    # Workflow Operations
+    # ========================================================================
+
+    def create_workflow(
+        self,
+        name: str,
+        type: str,
+        status: str = "active",
+        notion_master_page_id: Optional[str] = None,
+        poll_interval_seconds: int = 30,
+    ) -> Workflow:
+        """Create a new workflow definition."""
+        with self.get_session() as session:
+            workflow = Workflow(
+                name=name,
+                type=type,
+                status=status,
+                notion_master_page_id=notion_master_page_id,
+                poll_interval_seconds=poll_interval_seconds,
+            )
+            session.add(workflow)
+            session.commit()
+            session.refresh(workflow)
+            return workflow
+
+    def list_workflows(self, limit: int = 100) -> List[Workflow]:
+        """List workflows ordered by most recently updated."""
+        with self.get_session() as session:
+            return (
+                session.query(Workflow)
+                .order_by(Workflow.updated_at.desc())
+                .limit(limit)
+                .all()
+            )
+
+    def get_workflow(self, workflow_id: str) -> Optional[Workflow]:
+        """Get a workflow by ID."""
+        with self.get_session() as session:
+            return session.query(Workflow).filter_by(id=workflow_id).first()
+
+    def update_workflow(self, workflow_id: str, **fields: Any) -> Optional[Workflow]:
+        """Update a workflow's editable fields."""
+        with self.get_session() as session:
+            workflow = session.query(Workflow).filter_by(id=workflow_id).first()
+            if not workflow:
+                return None
+
+            for key, value in fields.items():
+                if value is not None and hasattr(workflow, key):
+                    setattr(workflow, key, value)
+
+            workflow.updated_at = datetime.utcnow()
+            session.commit()
+            session.refresh(workflow)
+            return workflow
+
+    def delete_workflow(self, workflow_id: str) -> None:
+        """Delete a workflow and all of its mappings."""
+        with self.get_session() as session:
+            workflow = session.query(Workflow).filter_by(id=workflow_id).first()
+            if workflow:
+                session.delete(workflow)
+                session.commit()
+
+    def add_workflow_channel(
+        self,
+        workflow_id: str,
+        slack_channel_id: str,
+        slack_channel_name: Optional[str] = None,
+        notion_subpage_id: Optional[str] = None,
+    ) -> WorkflowChannelMapping:
+        """Add or update a channel mapping for a workflow (idempotent on workflow+channel)."""
+        with self.get_session() as session:
+            mapping = (
+                session.query(WorkflowChannelMapping)
+                .filter_by(workflow_id=workflow_id, slack_channel_id=slack_channel_id)
+                .first()
+            )
+
+            if mapping:
+                changed = False
+                if slack_channel_name and mapping.slack_channel_name != slack_channel_name:
+                    mapping.slack_channel_name = slack_channel_name
+                    changed = True
+                if notion_subpage_id and mapping.notion_subpage_id != notion_subpage_id:
+                    mapping.notion_subpage_id = notion_subpage_id
+                    changed = True
+                if changed:
+                    mapping.updated_at = datetime.utcnow()
+                    session.commit()
+                    session.refresh(mapping)
+                return mapping
+
+            mapping = WorkflowChannelMapping(
+                workflow_id=workflow_id,
+                slack_channel_id=slack_channel_id,
+                slack_channel_name=slack_channel_name,
+                notion_subpage_id=notion_subpage_id,
+            )
+            session.add(mapping)
+            session.commit()
+            session.refresh(mapping)
+            return mapping
+
+    def get_workflow_channels(self, workflow_id: str) -> List[WorkflowChannelMapping]:
+        """List all channel mappings for a workflow."""
+        with self.get_session() as session:
+            return (
+                session.query(WorkflowChannelMapping)
+                .filter_by(workflow_id=workflow_id)
+                .order_by(WorkflowChannelMapping.created_at.asc())
+                .all()
+            )
+
+    def remove_workflow_channel(self, workflow_id: str, slack_channel_id: str) -> None:
+        """Remove a channel mapping from a workflow."""
+        with self.get_session() as session:
+            mapping = (
+                session.query(WorkflowChannelMapping)
+                .filter_by(workflow_id=workflow_id, slack_channel_id=slack_channel_id)
+                .first()
+            )
+            if mapping:
+                session.delete(mapping)
+                session.commit()
+
+    def create_slack_notion_mapping(
+        self,
+        workflow_id: str,
+        slack_channel_id: str,
+        slack_ts: float,
+        notion_block_id: str,
+        parent_slack_ts: Optional[float] = None,
+    ) -> SlackNotionMessageMapping:
+        """Create a Slack→Notion message mapping in an idempotent way.
+
+        If the mapping already exists (based on the unique constraint), the
+        existing row is returned instead of raising an error.
+        """
+        with self.get_session() as session:
+            try:
+                mapping = SlackNotionMessageMapping(
+                    workflow_id=workflow_id,
+                    slack_channel_id=slack_channel_id,
+                    slack_ts=slack_ts,
+                    parent_slack_ts=parent_slack_ts,
+                    notion_block_id=notion_block_id,
+                )
+                session.add(mapping)
+                session.commit()
+                session.refresh(mapping)
+                return mapping
+            except IntegrityError:
+                session.rollback()
+                existing = (
+                    session.query(SlackNotionMessageMapping)
+                    .filter_by(
+                        workflow_id=workflow_id,
+                        slack_channel_id=slack_channel_id,
+                        slack_ts=slack_ts,
+                    )
+                    .first()
+                )
+                if existing:
+                    return existing
+                raise
+
+    def get_slack_notion_mapping(
+        self,
+        workflow_id: str,
+        slack_channel_id: str,
+        slack_ts: float,
+    ) -> Optional[SlackNotionMessageMapping]:
+        """Get a Slack→Notion message mapping if it exists."""
+        with self.get_session() as session:
+            return (
+                session.query(SlackNotionMessageMapping)
+                .filter_by(
+                    workflow_id=workflow_id,
+                    slack_channel_id=slack_channel_id,
+                    slack_ts=slack_ts,
+                )
+                .first()
+            )
+
+    def list_slack_notion_mappings_for_channel_since(
+        self,
+        workflow_id: str,
+        slack_channel_id: str,
+        min_slack_ts: float,
+    ) -> List[SlackNotionMessageMapping]:
+        """List Slack→Notion mappings for a workflow/channel since a given ts.
+
+        Used by the Slack → Notion workflow to perform best-effort deletion
+        detection for recent messages.
+        """
+        with self.get_session() as session:
+            return (
+                session.query(SlackNotionMessageMapping)
+                .filter(
+                    SlackNotionMessageMapping.workflow_id == workflow_id,
+                    SlackNotionMessageMapping.slack_channel_id == slack_channel_id,
+                    SlackNotionMessageMapping.slack_ts >= min_slack_ts,
+                )
                 .all()
             )
