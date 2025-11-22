@@ -28,81 +28,48 @@ SCOPES = [
 class GmailClient:
     """Gmail API client for authentication and API calls."""
     
-    def __init__(self, credentials_file: str = None, token_file: str = None):
+    # Expose scopes on the class so other modules can reference them
+    SCOPES = SCOPES
+
+    def __init__(self):
         """Initialize Gmail client.
         
-        Args:
-            credentials_file: Path to OAuth credentials JSON
-            token_file: Path to token pickle file
+        The client must be initialized with OAuth Credentials via
+        `init_with_credentials()` before use.
         """
-        self.credentials_file = credentials_file or Config.GMAIL_CREDENTIALS_FILE
-        self.token_file = token_file or Config.GMAIL_TOKEN_FILE
         self.service = None
         self.user_email = None
-    
-    def authenticate(self) -> bool:
-        """Authenticate with Gmail API.
-        
-        Returns:
-            True if authentication successful
-        """
-        creds = None
-        
-        # Load existing token
-        token_path = Path(self.token_file)
-        if token_path.exists():
-            with open(token_path, 'rb') as token:
-                creds = pickle.load(token)
-        
-        # Refresh or get new credentials
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                logger.info("Refreshing expired Gmail credentials...")
-                try:
-                    creds.refresh(Request())
-                except RefreshError as e:
-                    logger.error(
-                        "Failed to refresh Gmail credentials (token may be expired or revoked): %s",
-                        e,
-                    )
-                    # Best-effort cleanup so a future interactive auth flow can succeed
-                    try:
-                        token_path.unlink()
-                        logger.warning("Deleted invalid Gmail token file at %s", token_path)
-                    except Exception:
-                        # Non-fatal; we can still continue without removing the token
-                        logger.debug("Could not delete Gmail token file", exc_info=True)
-                    return False
-            else:
-                if not Path(self.credentials_file).exists():
-                    logger.error(f"Credentials file not found: {self.credentials_file}")
-                    return False
-                
-                logger.info("Starting OAuth flow...")
-                flow = InstalledAppFlow.from_client_secrets_file(
-                    self.credentials_file, SCOPES
-                )
-                creds = flow.run_local_server(port=0)
-            
-            # Save credentials
-            token_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(token_path, 'wb') as token:
-                pickle.dump(creds, token)
-            logger.info(f"Credentials saved to {token_path}")
-        
+
+    def init_with_credentials(self, creds: Credentials) -> bool:
+        """Initialize client using already-obtained OAuth credentials."""
+        if not creds:
+            return False
+
         try:
             self.service = build('gmail', 'v1', credentials=creds)
-            
+
             # Get user email
             profile = self.service.users().getProfile(userId='me').execute()
             self.user_email = profile.get('emailAddress')
-            
+
             logger.info(f"Authenticated as: {self.user_email}")
             return True
-        
         except HttpError as error:
             logger.error(f"Gmail API error: {error}")
             return False
+
+    def authenticate(self) -> bool:
+        """Deprecated stub for backward compatibility.
+        
+        File-based Gmail authentication using credentials JSON and token pickle
+        has been removed. GmailClient must be initialized with OAuth
+        `Credentials` via `init_with_credentials()` instead.
+        """
+        logger.error(
+            "GmailClient.authenticate() is deprecated. "
+            "Use OAuth-based credentials with init_with_credentials() instead."
+        )
+        return False
     
     def get_profile(self) -> Optional[Dict[str, Any]]:
         """Get Gmail profile/account info.

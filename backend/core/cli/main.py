@@ -445,33 +445,17 @@ def list_channels():
 @click.option('--query', default='', help='Gmail search query')
 @click.option('--max-messages', default=50, help='Maximum messages to extract')
 def gmail_extract(query, max_messages):
-    """Extract emails from Gmail and store in database."""
-    console.print("[bold blue]Extracting Gmail messages...[/bold blue]")
-    
-    try:
-        from gmail import GmailClient, GmailExtractor
-        
-        client = GmailClient()
-        if not client.authenticate():
-            console.print("[red]Gmail authentication failed[/red]")
-            return
-        
-        extractor = GmailExtractor(gmail_client=client)
-        
-        # Extract profile
-        extractor.extract_profile()
-        
-        # Extract labels
-        extractor.extract_labels()
-        
-        # Extract messages
-        count = extractor.extract_messages(query=query, max_messages=max_messages)
-        
-        console.print(f"[green]✓ Extracted {count} Gmail messages[/green]")
-    
-    except Exception as e:
-        console.print(f"[red]Error: {e}[/red]")
-        raise
+    """Extract emails from Gmail and store in database (deprecated).
+
+    Gmail now uses OAuth-based per-user tokens via the web app and
+    the Pipelines UI. This CLI command is kept for reference but no
+    longer performs a live Gmail sync.
+    """
+    console.print("[bold blue]Gmail extract via CLI is disabled.[/bold blue]")
+    console.print(
+        "[yellow]Use the web app Pipelines tab to run a Gmail pipeline "
+        "for the currently signed-in user.[/yellow]"
+    )
 
 
 @cli.command()

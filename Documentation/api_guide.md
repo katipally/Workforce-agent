@@ -456,39 +456,30 @@ Before creating credentials, you must configure the consent screen.
    └── ...
    ```
 
-### Step 5: Configure Environment Variables
+### Step 5: Configure Environment Variables (Google OAuth)
 
 Add to `.env`:
-```bash
-# Gmail API (Optional - for Gmail features)
-GMAIL_CREDENTIALS_FILE=credentials/gmail_credentials.json
-GMAIL_TOKEN_FILE=data/gmail_token.pickle
-```
-
-**Note:** Place `credentials.json` in `backend/core/credentials/gmail/` folder (create folders if needed).
-
-### Step 6: First-Time Authentication
-
-This triggers the OAuth flow and saves your token.
 
 ```bash
-python test_gmail.py
+# Google OAuth (for login + per-user Gmail access)
+GOOGLE_CLIENT_ID=your-google-oauth-client-id.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=your-google-oauth-client-secret
+GOOGLE_OAUTH_REDIRECT_BASE=http://localhost:8000
+FRONTEND_BASE_URL=http://localhost:5173
+SESSION_SECRET=change-me-to-a-long-random-string
 ```
 
-**What happens:**
-1. A browser window opens automatically
-2. Google asks you to sign in (if not already signed in)
-3. You see a warning: **"Google hasn't verified this app"**
-   - This is NORMAL for apps in testing mode
-   - Click **"Advanced"**
-   - Click **"Go to Gmail Extractor (unsafe)"**
-4. Google shows permissions request:
-   - "Read, compose, send, and permanently delete all your email from Gmail"
-   - Click **"Continue"** or **"Allow"**
-5. Browser shows: "The authentication flow has completed. You may close this window."
-6. Token saved to `data/gmail_token.pickle`
+### Step 6: First-Time Authentication (via Web App)
 
-**IMPORTANT**: You only do this OAuth flow ONCE. The token is saved and automatically refreshed.
+1. Start the backend: `uvicorn api.main:app --reload`
+2. Start the frontend: `cd frontend && npm run dev`
+3. Open `http://localhost:5173` in your browser
+4. Click **"Continue with Google"**
+5. Approve the requested Gmail scopes
+
+After this, your `AppUser` and `UserOAuthToken` rows are created in
+the database, and Gmail pipelines can read your mail using OAuth
+tokens (no credential JSON or pickle files are needed).
 
 ### Gmail API Capabilities (November 2025 Update)
 

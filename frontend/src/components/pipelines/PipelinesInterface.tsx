@@ -1,4 +1,5 @@
 import { useEffect, useState, useRef } from 'react'
+import { API_BASE_URL } from '../../lib/api'
 
 interface SlackPipelineStats {
   users: number
@@ -314,7 +315,9 @@ export default function PipelinesInterface() {
   const fetchGmailLabels = async () => {
     try {
       setError(null)
-      const response = await fetch('http://localhost:8000/api/pipelines/gmail/labels')
+      const response = await fetch(`${API_BASE_URL}/api/pipelines/gmail/labels`, {
+        credentials: 'include',
+      })
       if (!response.ok) {
         throw new Error(`Failed to load Gmail labels: ${response.status}`)
       }
@@ -339,7 +342,10 @@ export default function PipelinesInterface() {
       setError(null)
       const params = new URLSearchParams({ label_id: labelId })
       const response = await fetch(
-        `http://localhost:8000/api/pipelines/gmail/messages/by-label?${params.toString()}`,
+        `${API_BASE_URL}/api/pipelines/gmail/messages/by-label?${params.toString()}`,
+        {
+          credentials: 'include',
+        },
       )
       if (!response.ok) {
         throw new Error(`Failed to load Gmail messages: ${response.status}`)
@@ -357,7 +363,9 @@ export default function PipelinesInterface() {
     let done = false
     while (!done) {
       try {
-        const response = await fetch(`http://localhost:8000/api/pipelines/gmail/status/${id}`)
+        const response = await fetch(`${API_BASE_URL}/api/pipelines/gmail/status/${id}`, {
+          credentials: 'include',
+        })
         if (!response.ok) {
           throw new Error(`Failed to fetch Gmail run status: ${response.status}`)
         }
@@ -374,7 +382,10 @@ export default function PipelinesInterface() {
           }
 
           const messagesResp = await fetch(
-            `http://localhost:8000/api/pipelines/gmail/messages?run_id=${encodeURIComponent(id)}`,
+            `${API_BASE_URL}/api/pipelines/gmail/messages?run_id=${encodeURIComponent(id)}`,
+            {
+              credentials: 'include',
+            },
           )
           if (messagesResp.ok) {
             const messagesData = await messagesResp.json()
@@ -404,8 +415,9 @@ export default function PipelinesInterface() {
       setGmailRunStatus('starting')
 
       const params = new URLSearchParams({ label_id: selectedLabelId })
-      const response = await fetch(`http://localhost:8000/api/pipelines/gmail/run?${params.toString()}`, {
+      const response = await fetch(`${API_BASE_URL}/api/pipelines/gmail/run?${params.toString()}`, {
         method: 'POST',
+        credentials: 'include',
       })
 
       if (!response.ok) {
@@ -430,8 +442,9 @@ export default function PipelinesInterface() {
     if (!gmailRunId) return
     try {
       setError(null)
-      await fetch(`http://localhost:8000/api/pipelines/gmail/stop/${encodeURIComponent(gmailRunId)}`, {
+      await fetch(`${API_BASE_URL}/api/pipelines/gmail/stop/${encodeURIComponent(gmailRunId)}`, {
         method: 'POST',
+        credentials: 'include',
       })
     } catch (err: any) {
       console.error('Error stopping Gmail pipeline:', err)

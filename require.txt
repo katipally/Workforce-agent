@@ -179,20 +179,6 @@ Step 4: Create OAuth Client Credentials
 5. Click "CREATE".
 6. In the popup, click "DOWNLOAD JSON" and save the file.
 
----
-Step 5: Place Credentials and Configure Paths
----
-1. Rename the downloaded file to something like
-   gmail_credentials.json.
-2. Move it into your project (recommended path):
-   - `credentials/gmail_credentials.json`
-3. In .env, set (matching the template above):
-   - GMAIL_CREDENTIALS_FILE=credentials/gmail_credentials.json
-   - GMAIL_TOKEN_FILE=data/gmail_token.pickle
-
-
-
-
 =======================================================================
 3. NOTION API SETUP
 =======================================================================

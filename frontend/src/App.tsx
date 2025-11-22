@@ -3,9 +3,12 @@ import ChatInterface from './components/chat/ChatInterface'
 import PipelinesInterface from './components/pipelines/PipelinesInterface'
 import ProjectsInterface from './components/projects/ProjectsInterface'
 import WorkflowsInterface from './components/workflows/WorkflowsInterface'
+import SignInView from './components/auth/SignInView'
+import ProfileInterface from './components/auth/ProfileInterface'
+import { useAuthStore } from './store/authStore'
 
 function App() {
-  type Tab = 'chat' | 'pipelines' | 'projects' | 'workflows'
+  type Tab = 'chat' | 'pipelines' | 'projects' | 'workflows' | 'profile'
 
   const [activeTab, setActiveTab] = useState<Tab>(() => {
     if (typeof window === 'undefined') return 'chat'
@@ -16,11 +19,30 @@ function App() {
     return 'chat'
   })
 
+  const { user, loading, fetchMe } = useAuthStore()
+
+  useEffect(() => {
+    fetchMe()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   useEffect(() => {
     if (typeof window !== 'undefined') {
       window.localStorage.setItem('workforce-active-tab', activeTab)
     }
   }, [activeTab])
+
+  if (loading) {
+    return (
+      <div className="h-screen w-full flex items-center justify-center bg-background">
+        <p className="text-sm text-muted-foreground">Loading your workspace…</p>
+      </div>
+    )
+  }
+
+  if (!user) {
+    return <SignInView />
+  }
 
   return (
     <div className="h-screen w-full flex flex-col bg-background">
@@ -74,6 +96,17 @@ function App() {
           >
             Workflows
           </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('profile')}
+            className={`rounded-md px-3 py-1 font-medium border text-xs ${
+              activeTab === 'profile'
+                ? 'bg-blue-600 text-white border-blue-600'
+                : 'bg-background text-foreground border-border hover:bg-muted'
+            }`}
+          >
+            Profile
+          </button>
         </nav>
       </header>
 
@@ -89,6 +122,9 @@ function App() {
         </div>
         <div className={activeTab === 'workflows' ? 'h-full block' : 'h-full hidden'}>
           <WorkflowsInterface />
+        </div>
+        <div className={activeTab === 'profile' ? 'h-full block' : 'h-full hidden'}>
+          <ProfileInterface />
         </div>
       </main>
     </div>

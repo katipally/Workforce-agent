@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useChatStore, ChatSession } from '../../store/chatStore'
+import { API_BASE_URL } from '../../lib/api'
 import { MessageSquare, Plus, Trash2, Loader2 } from 'lucide-react'
 
 export default function ChatHistorySidebar() {
@@ -15,7 +16,9 @@ export default function ChatHistorySidebar() {
   const loadSessions = async (createFreshNewChat: boolean = false) => {
     setLoading(true)
     try {
-      const response = await fetch('http://localhost:8000/api/chat/sessions')
+      const response = await fetch(`${API_BASE_URL}/api/chat/sessions`, {
+        credentials: 'include',
+      })
       const data = await response.json()
       setSessions(data.sessions || [])
 

@@ -256,36 +256,21 @@ class GmailIntegrationTest:
             return False
     
     def run_all_tests(self):
-        """Run all tests."""
+        """Run all tests (deprecated file-based Gmail flow).
+
+        Gmail now uses OAuth-based per-user tokens via the web app.
+        This integration test suite is kept for historical reference
+        but no longer exercises live Gmail APIs.
+        """
         console.print(Panel.fit(
             "[bold cyan]Gmail Integration Test Suite[/bold cyan]\n"
-            "Testing Gmail API functionality",
+            "[yellow]SKIPPED: Gmail now uses OAuth via the Workforce web app.[/yellow]",
             border_style="cyan"
         ))
-        
-        # Run tests in order
-        config_ok = self.test_configuration()
-        if not config_ok:
-            console.print("\n[yellow]⚠ Please set up Gmail credentials first[/yellow]")
-            console.print("See README.md for setup instructions")
-            self.print_summary()
-            return
-        
-        auth_ok = self.test_authentication()
-        if not auth_ok:
-            self.print_summary()
-            return
-        
-        connection_ok = self.test_connection()
-        db_ok = self.test_database()
-        extractor_ok = self.test_extractor_init()
-        profile_ok = self.test_extract_profile() if extractor_ok else False
-        labels_ok = self.test_extract_labels() if extractor_ok else False
-        messages_ok = self.test_extract_messages() if extractor_ok else False
-        queries_ok = self.test_database_queries() if db_ok else False
-        notion_ok = self.test_notion_export()
-        
-        self.print_summary()
+        console.print(
+            "\n[cyan]To verify Gmail, sign in through the web UI and run a Gmail pipeline "
+            "from the Pipelines tab.[/cyan]\n"
+        )
     
     def print_summary(self):
         """Print test summary."""

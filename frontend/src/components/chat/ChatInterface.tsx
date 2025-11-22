@@ -6,6 +6,7 @@ import MessageInput from './MessageInput'
 import ChatHistorySidebar from './ChatHistorySidebar'
 import QuickActions from './QuickActions'
 import { Bot, History, Sparkles } from 'lucide-react'
+import { API_BASE_URL } from '../../lib/api'
 
 export default function ChatInterface() {
   const { messages, streamingMessage, isStreaming } = useChatStore()
@@ -42,9 +43,10 @@ export default function ChatInterface() {
         files.forEach(file => formData.append('files', file))
         formData.append('session_id', currentSessionId)
         
-        const response = await fetch('http://localhost:8000/api/files/upload', {
+        const response = await fetch(`${API_BASE_URL}/api/files/upload`, {
           method: 'POST',
-          body: formData
+          body: formData,
+          credentials: 'include',
         })
         
         if (response.ok) {

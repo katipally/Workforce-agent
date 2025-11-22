@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
+import { API_BASE_URL } from '../lib/api'
 
 export interface Message {
   id: string
@@ -69,6 +70,7 @@ interface ChatState {
   setSessions: (sessions: ChatSession[]) => void
   createNewSession: () => void
   deleteSession: (sessionId: string) => void
+  resetStore: () => void
 }
 
 // Generate unique session ID
@@ -97,7 +99,9 @@ export const useChatStore = create<ChatState>()(
       
       loadSessionMessages: async (sessionId: string) => {
         try {
-          const response = await fetch(`http://localhost:8000/api/chat/sessions/${sessionId}`)
+          const response = await fetch(`${API_BASE_URL}/api/chat/sessions/${sessionId}`, {
+            credentials: 'include',
+          })
           if (response.ok) {
             const data = await response.json()
 
@@ -256,17 +260,37 @@ export const useChatStore = create<ChatState>()(
         })
         
         // Delete from backend
-        fetch(`http://localhost:8000/api/chat/sessions/${sessionId}`, {
-          method: 'DELETE'
+        fetch(`${API_BASE_URL}/api/chat/sessions/${sessionId}`, {
+          method: 'DELETE',
+          credentials: 'include',
         }).catch(console.error)
+      },
+
+      resetStore: () => {
+        const newSessionId = generateSessionId()
+        const nowIso = new Date().toISOString()
+        set({
+          currentSessionId: newSessionId,
+          sessionMessages: { [newSessionId]: [] },
+          messages: [],
+          streamingMessage: '',
+          sources: [],
+          isStreaming: false,
+          currentReasoningSteps: [],
+          sessions: [
+            {
+              session_id: newSessionId,
+              title: 'New Chat',
+              created_at: nowIso,
+              updated_at: nowIso,
+            },
+          ],
+        })
       },
     }),
     {
       name: 'chat-storage',
       partialize: (state) => ({
-        // Persist past sessions and their messages, but not the active session ID.
-        // On a full reload we always start with a brand-new session, so the
-        // "new chat" view truly represents a new conversation.
         sessionMessages: state.sessionMessages,
         sessions: state.sessions,
       }),
