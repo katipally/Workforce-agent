@@ -1218,7 +1218,12 @@ class WorkforceAIBrain:
             }
         ]
     
-    async def _execute_tool(self, tool_name: str, arguments: Dict[str, Any]) -> str:
+    async def _execute_tool(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        user_email: Optional[str] = None,
+    ) -> str:
         """Execute a tool and return the result.
         
         Args:
@@ -1300,7 +1305,8 @@ class WorkforceAIBrain:
             elif tool_name == "search_gmail":
                 result = self.tools_handler.search_gmail_messages(
                     query=arguments.get("query", ""),
-                    limit=arguments.get("limit", 10)
+                    limit=arguments.get("limit", 10),
+                    gmail_account_email=user_email,
                 )
             
             elif tool_name == "send_gmail":
@@ -1345,11 +1351,15 @@ class WorkforceAIBrain:
                 )
             
             elif tool_name == "search_workspace":
-                # Use RAG engine
+                # Use RAG engine; scope Gmail results to the caller's Gmail account
                 query = arguments.get("query", "")
                 sources = arguments.get("sources", ["slack", "gmail"])
-                
-                rag_results = self.rag_engine._retrieve_context(query, top_k=5)
+
+                rag_results = self.rag_engine._retrieve_context(
+                    query,
+                    top_k=5,
+                    gmail_account_email=user_email,
+                )
                 result = f"Found {len(rag_results)} relevant results:\n\n{rag_results}"
             
             # NEW GMAIL TOOLS - Nov 2025
@@ -1499,33 +1509,38 @@ class WorkforceAIBrain:
                 result = await self.tools_handler.track_project(
                     project_name=arguments.get("project_name", ""),
                     days_back=arguments.get("days_back", 7),
-                    notion_page_id=arguments.get("notion_page_id")
+                    notion_page_id=arguments.get("notion_page_id"),
+                    gmail_account_email=user_email,
                 )
             
             elif tool_name == "generate_project_report":
                 result = await self.tools_handler.generate_project_report(
                     project_name=arguments.get("project_name", ""),
-                    days_back=arguments.get("days_back", 7)
+                    days_back=arguments.get("days_back", 7),
+                    gmail_account_email=user_email,
                 )
             
             elif tool_name == "update_project_notion_page":
                 result = await self.tools_handler.update_project_notion_page(
                     page_id=arguments.get("page_id", ""),
                     project_name=arguments.get("project_name", ""),
-                    days_back=arguments.get("days_back", 7)
+                    days_back=arguments.get("days_back", 7),
+                    gmail_account_email=user_email,
                 )
             
             # UTILITY TOOLS
             elif tool_name == "search_all_platforms":
                 result = await self.tools_handler.search_all_platforms(
                     query=arguments.get("query", ""),
-                    limit_per_platform=arguments.get("limit_per_platform", 10)
+                    limit_per_platform=arguments.get("limit_per_platform", 10),
+                    gmail_account_email=user_email,
                 )
             
             elif tool_name == "get_team_activity_summary":
                 result = await self.tools_handler.get_team_activity_summary(
                     person_name=arguments.get("person_name", ""),
-                    days_back=arguments.get("days_back", 7)
+                    days_back=arguments.get("days_back", 7),
+                    gmail_account_email=user_email,
                 )
             
             elif tool_name == "analyze_slack_channel":
@@ -1544,7 +1559,12 @@ class WorkforceAIBrain:
             logger.error(f"Tool execution failed: {e}", exc_info=True)
             return f"Tool execution error: {str(e)}"
     
-    async def stream_query(self, query: str, conversation_history: List[Dict] = None) -> AsyncIterator[Dict[str, Any]]:
+    async def stream_query(
+        self,
+        query: str,
+        conversation_history: List[Dict] = None,
+        user_email: Optional[str] = None,
+    ) -> AsyncIterator[Dict[str, Any]]:
         """Process a query and stream the response.
         
         Args:
@@ -1690,8 +1710,12 @@ class WorkforceAIBrain:
                     "content": "\n".join(status_lines),
                 }
 
-                # Execute tool
-                tool_result = await self._execute_tool(function_name, args)
+                # Execute tool (scoped to the caller's email for Gmail/DB-backed tools)
+                tool_result = await self._execute_tool(
+                    tool_name=function_name,
+                    arguments=args,
+                    user_email=user_email,
+                )
                 
                 # Add tool call and result to conversation
                 messages.append({

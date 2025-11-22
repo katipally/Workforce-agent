@@ -55,15 +55,16 @@ class RateLimiter:
     
     def wait_if_needed(self, method: str) -> float:
         """Wait if rate limit would be exceeded. Returns wait time."""
-        limit = get_rate_limit_for_method(method)
+        # get_rate_limit_for_method returns (max_calls, period_seconds)
+        max_calls, _ = get_rate_limit_for_method(method)
         
         with self._locks[method]:
-            wait_time = self._get_wait_time(method, limit)
+            wait_time = self._get_wait_time(method, max_calls)
             
             if wait_time > 0:
                 logger.debug(
                     f"Rate limit approaching for {method}. "
-                    f"Waiting {wait_time:.2f}s (limit: {limit}/min)"
+                    f"Waiting {wait_time:.2f}s (limit: {max_calls}/min)"
                 )
                 time.sleep(wait_time)
             
@@ -73,15 +74,15 @@ class RateLimiter:
     
     async def async_wait_if_needed(self, method: str) -> float:
         """Async version of wait_if_needed."""
-        limit = get_rate_limit_for_method(method)
+        max_calls, _ = get_rate_limit_for_method(method)
         
         # Use asyncio-compatible approach
-        wait_time = self._get_wait_time(method, limit)
+        wait_time = self._get_wait_time(method, max_calls)
         
         if wait_time > 0:
             logger.debug(
                 f"Rate limit approaching for {method}. "
-                f"Waiting {wait_time:.2f}s (limit: {limit}/min)"
+                f"Waiting {wait_time:.2f}s (limit: {max_calls}/min)"
             )
             await asyncio.sleep(wait_time)
         
@@ -92,8 +93,8 @@ class RateLimiter:
     def get_current_usage(self, method: str) -> tuple[int, int]:
         """Get current usage (requests made, limit)."""
         self._clean_old_requests(method)
-        limit = get_rate_limit_for_method(method)
-        return len(self._requests[method]), limit
+        max_calls, _ = get_rate_limit_for_method(method)
+        return len(self._requests[method]), max_calls
     
     def reset(self, method: Optional[str] = None):
         """Reset rate limiter for method or all methods."""

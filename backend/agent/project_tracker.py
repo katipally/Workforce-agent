@@ -229,10 +229,21 @@ class ProjectTracker:
         self,
         project_name: str,
         days_back: int = 7,
-        domains: Optional[List[str]] = None
+        domains: Optional[List[str]] = None,
+        gmail_account_email: Optional[str] = None,
     ) -> List[ProjectUpdate]:
-        """Gather project updates from Gmail via structured DB queries."""
-        logger.info(f"Gathering Gmail updates for '{project_name}' (last {days_back} days)")
+        """Gather project updates from Gmail via structured DB queries.
+
+        When ``gmail_account_email`` is provided, results are restricted to
+        that Gmail account (``gmail_messages.account_email``) to ensure
+        per-user data isolation in multi-tenant deployments.
+        """
+        logger.info(
+            "Gathering Gmail updates for '%s' (last %s days) [account=%s]",
+            project_name,
+            days_back,
+            gmail_account_email or "<any>",
+        )
         keywords = self.extract_keywords(project_name) or [project_name]
         cutoff_date = datetime.utcnow() - timedelta(days=days_back)
 
@@ -240,16 +251,21 @@ class ProjectTracker:
             updates: List[ProjectUpdate] = []
             with self.tools.db.get_session() as session:
                 keyword_filters = [
-                    GmailMessage.subject.ilike(f"%{kw}%") |
-                    GmailMessage.body_text.ilike(f"%{kw}%")
+                    GmailMessage.subject.ilike(f"%{kw}%")
+                    | GmailMessage.body_text.ilike(f"%{kw}%")
                     for kw in keywords
                 ]
 
                 # Build base query and apply all filters BEFORE limit/offset
-                message_query = (
-                    session.query(GmailMessage)
-                    .filter(GmailMessage.date >= cutoff_date)
+                message_query = session.query(GmailMessage).filter(
+                    GmailMessage.date >= cutoff_date
                 )
+
+                # Scope to a specific Gmail account when provided
+                if gmail_account_email:
+                    message_query = message_query.filter(
+                        GmailMessage.account_email == gmail_account_email
+                    )
 
                 if keyword_filters:
                     message_query = message_query.filter(or_(*keyword_filters))
@@ -257,8 +273,7 @@ class ProjectTracker:
                 # If project-specific domains are provided, scope to those
                 if domains:
                     domain_filters = [
-                        GmailMessage.from_address.ilike(f"%{dom}%")
-                        for dom in domains
+                        GmailMessage.from_address.ilike(f"%{dom}%") for dom in domains
                     ]
                     message_query = message_query.filter(or_(*domain_filters))
 
@@ -271,12 +286,16 @@ class ProjectTracker:
                             source='gmail',
                             timestamp=message.date or datetime.utcnow(),
                             author=message.from_address or "Unknown",
-                            content=(message.snippet or message.body_text or "(no content)")[:500],
+                            content=(
+                                message.snippet
+                                or message.body_text
+                                or "(no content)"
+                            )[:500],
                             channel_or_thread=message.subject or "(no subject)",
                             metadata={
                                 'message_id': message.message_id,
                                 'thread_id': message.thread_id,
-                            }
+                            },
                         )
                     )
             return updates
@@ -447,7 +466,8 @@ class ProjectTracker:
         self,
         project_name: str,
         days_back: int = 7,
-        notion_page_id: Optional[str] = None
+        notion_page_id: Optional[str] = None,
+        gmail_account_email: Optional[str] = None,
     ) -> ProjectStatus:
         """Main method to track a project across all platforms.
         
@@ -481,7 +501,12 @@ class ProjectTracker:
         
         # Gather updates from all sources, scoped by registry if available
         slack_updates = await self.gather_slack_updates(project_name, days_back, channels=slack_channels)
-        gmail_updates = await self.gather_gmail_updates(project_name, days_back, domains=gmail_domains)
+        gmail_updates = await self.gather_gmail_updates(
+            project_name,
+            days_back,
+            domains=gmail_domains,
+            gmail_account_email=gmail_account_email,
+        )
         notion_updates = await self.gather_notion_updates(project_name, effective_page_id)
         
         # Combine all updates

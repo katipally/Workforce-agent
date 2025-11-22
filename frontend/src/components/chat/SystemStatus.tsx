@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { MessageSquare, Mail, FileText, Database, Activity, CheckCircle, XCircle, Loader2 } from 'lucide-react'
+import { API_BASE_URL } from '../../lib/api'
 
 interface PlatformStatus {
   name: string
@@ -45,7 +46,9 @@ export default function SystemStatus({ wsConnected }: SystemStatusProps) {
     // Poll for system status
     const checkStatus = async () => {
       try {
-        const response = await fetch('http://localhost:8000/health')
+        const response = await fetch(`${API_BASE_URL}/health`, {
+          credentials: 'include',
+        })
         if (response.ok) {
           const data = await response.json()
           // Update status based on response

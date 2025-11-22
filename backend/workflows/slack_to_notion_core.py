@@ -203,6 +203,42 @@ def process_workflow_once(workflow_id: str) -> Dict[str, Any]:
 
         # Ensure a Notion subpage exists for this channel
         notion_subpage_id = mapping.notion_subpage_id
+
+        # If the existing subpage has been archived in Notion, automatically
+        # repair the mapping by creating a fresh subpage and updating the DB
+        # so workflows can keep running without manual intervention.
+        if notion_subpage_id:
+            is_archived = notion.is_block_archived(notion_subpage_id)
+            if is_archived:
+                logger.info(
+                    "Notion subpage %s for workflow %s channel %s is archived; "
+                    "creating a new subpage and remapping this channel.",
+                    notion_subpage_id,
+                    workflow_id,
+                    channel_id,
+                )
+                title = f"#{channel_name} – Slack feed"
+                new_page_id = notion.create_page(
+                    parent_page_id=workflow.notion_master_page_id,
+                    title=title,
+                    children=None,
+                )
+                if not new_page_id:
+                    logger.error(
+                        "Failed to recreate Notion subpage for workflow %s channel %s",
+                        workflow_id,
+                        channel_id,
+                    )
+                    channels_processed += 1
+                    continue
+                mapping = db.add_workflow_channel(
+                    workflow_id=workflow_id,
+                    slack_channel_id=channel_id,
+                    slack_channel_name=channel_name,
+                    notion_subpage_id=new_page_id,
+                )
+                notion_subpage_id = new_page_id
+
         if not notion_subpage_id:
             title = f"#{channel_name} – Slack feed"
             page_id = notion.create_page(
@@ -367,6 +403,21 @@ def process_workflow_once(workflow_id: str) -> Dict[str, Any]:
 
                     reply_text = _build_message_text(reply, is_reply=True)
                     reply_block = notion.create_bulleted_list_item(reply_text)
+
+                    # If the root Notion block for this thread has been archived,
+                    # skip syncing replies instead of repeatedly raising API errors.
+                    is_root_archived = notion.is_block_archived(notion_root_block_id)
+                    if is_root_archived:
+                        logger.warning(
+                            "Notion root block %s for workflow %s channel %s ts=%s is archived; "
+                            "skipping replies for this thread. Unarchive or delete the block to resume syncing.",
+                            notion_root_block_id,
+                            workflow_id,
+                            channel_id,
+                            r_ts_raw,
+                        )
+                        continue
+
                     child_ids = notion.append_blocks_and_get_ids(
                         notion_root_block_id,
                         [reply_block],

@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useState } from 'react'
 import { API_BASE_URL } from '../../lib/api'
 
 interface ProjectSummary {
@@ -123,7 +123,9 @@ export default function ProjectsInterface() {
   const loadProjects = async () => {
     try {
       setLoading(true)
-      const data = await fetchJSON<{ projects: ProjectSummary[] }>('http://localhost:8000/api/projects')
+      const data = await fetchJSON<{ projects: ProjectSummary[] }>(
+        `${API_BASE_URL}/api/projects`,
+      )
       setProjects(data.projects || [])
       if (!selectedProjectId && data.projects.length > 0) {
         setSelectedProjectId(data.projects[0].id)
@@ -138,7 +140,9 @@ export default function ProjectsInterface() {
   const loadProjectDetail = async (projectId: string) => {
     try {
       setLoading(true)
-      const data = await fetchJSON<ProjectDetail>(`http://localhost:8000/api/projects/${projectId}`)
+      const data = await fetchJSON<ProjectDetail>(
+        `${API_BASE_URL}/api/projects/${projectId}`,
+      )
       setSelectedProject(data)
       // Reset chat state for the new project
       setChatMessages([])
@@ -163,7 +167,7 @@ export default function ProjectsInterface() {
           gmail: string | null
           notion: string | null
         }
-      }>(`http://localhost:8000/api/projects/${selectedProject.id}/sync`, {
+      }>(`${API_BASE_URL}/api/projects/${selectedProject.id}/sync`, {
         method: 'POST',
       })
 
@@ -238,7 +242,7 @@ export default function ProjectsInterface() {
     const name = prompt('Project name')
     if (!name) return
     try {
-      const data = await fetchJSON<ProjectDetail>('http://localhost:8000/api/projects', {
+      const data = await fetchJSON<ProjectDetail>(`${API_BASE_URL}/api/projects`, {
         method: 'POST',
         body: JSON.stringify({ name }),
       })
@@ -259,7 +263,7 @@ export default function ProjectsInterface() {
         current_status?: string | null
         important_notes?: string | null
         raw: string
-      }>(`http://localhost:8000/api/projects/${selectedProject.id}/auto-summary`, {
+      }>(`${API_BASE_URL}/api/projects/${selectedProject.id}/auto-summary`, {
         method: 'POST',
         body: JSON.stringify({ max_tokens: 256 }),
       })
@@ -276,7 +280,7 @@ export default function ProjectsInterface() {
       }
 
       const savedCore = await fetchJSON<ProjectSummary>(
-        `http://localhost:8000/api/projects/${selectedProject.id}`,
+        `${API_BASE_URL}/api/projects/${selectedProject.id}`,
         {
           method: 'PUT',
           body: JSON.stringify({
@@ -322,7 +326,7 @@ export default function ProjectsInterface() {
         },
       ]
       await fetchJSON<{ sources: any[] }>(
-        `http://localhost:8000/api/projects/${selectedProject.id}/sources`,
+        `${API_BASE_URL}/api/projects/${selectedProject.id}/sources`,
         {
           method: 'POST',
           body: JSON.stringify(payload),
@@ -345,7 +349,7 @@ export default function ProjectsInterface() {
     if (!selectedProject) return
     try {
       await fetchJSON(
-        `http://localhost:8000/api/projects/${selectedProject.id}/sources/${sourceType}/${encodeURIComponent(
+        `${API_BASE_URL}/api/projects/${selectedProject.id}/sources/${sourceType}/${encodeURIComponent(
           sourceId,
         )}`,
         {
@@ -382,7 +386,7 @@ export default function ProjectsInterface() {
         sources: any[]
         intent?: string
       }>(
-        `http://localhost:8000/api/chat/project/${selectedProject.id}`,
+        `${API_BASE_URL}/api/chat/project/${selectedProject.id}`,
         {
           method: 'POST',
           body: JSON.stringify({ query, conversation_history: historyPayload }),

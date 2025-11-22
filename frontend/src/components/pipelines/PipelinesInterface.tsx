@@ -174,7 +174,9 @@ export default function PipelinesInterface() {
   const fetchSlackData = async () => {
     try {
       setError(null)
-      const response = await fetch('http://localhost:8000/api/pipelines/slack/data')
+      const response = await fetch(`${API_BASE_URL}/api/pipelines/slack/data`, {
+        credentials: 'include',
+      })
       if (!response.ok) {
         throw new Error(`Failed to load Slack data: ${response.status}`)
       }
@@ -194,7 +196,10 @@ export default function PipelinesInterface() {
     try {
       setError(null)
       const response = await fetch(
-        `http://localhost:8000/api/pipelines/slack/messages?channel_id=${encodeURIComponent(channelId)}&limit=200`,
+        `${API_BASE_URL}/api/pipelines/slack/messages?channel_id=${encodeURIComponent(channelId)}&limit=200`,
+        {
+          credentials: 'include',
+        },
       )
       if (!response.ok) {
         throw new Error(`Failed to load Slack messages: ${response.status}`)
@@ -211,7 +216,9 @@ export default function PipelinesInterface() {
     let done = false
     while (!done) {
       try {
-        const response = await fetch(`http://localhost:8000/api/pipelines/slack/status/${id}`)
+        const response = await fetch(`${API_BASE_URL}/api/pipelines/slack/status/${id}`, {
+          credentials: 'include',
+        })
         if (!response.ok) {
           throw new Error(`Failed to fetch run status: ${response.status}`)
         }
@@ -248,8 +255,9 @@ export default function PipelinesInterface() {
       setSlackIsRunning(true)
       setSlackRunStatus('starting')
 
-      const response = await fetch('http://localhost:8000/api/pipelines/slack/run', {
+      const response = await fetch(`${API_BASE_URL}/api/pipelines/slack/run`, {
         method: 'POST',
+        credentials: 'include',
       })
 
       if (!response.ok) {
@@ -273,9 +281,13 @@ export default function PipelinesInterface() {
     if (!slackRunId) return
     try {
       setError(null)
-      await fetch(`http://localhost:8000/api/pipelines/slack/stop/${encodeURIComponent(slackRunId)}`, {
-        method: 'POST',
-      })
+      await fetch(
+        `${API_BASE_URL}/api/pipelines/slack/stop/${encodeURIComponent(slackRunId)}`,
+        {
+          method: 'POST',
+          credentials: 'include',
+        },
+      )
     } catch (err: any) {
       console.error('Error stopping Slack pipeline:', err)
       setError(err.message || 'Failed to stop Slack pipeline')
@@ -460,7 +472,9 @@ export default function PipelinesInterface() {
     let done = false
     while (!done) {
       try {
-        const response = await fetch(`http://localhost:8000/api/pipelines/notion/status/${id}`)
+        const response = await fetch(`${API_BASE_URL}/api/pipelines/notion/status/${id}`, {
+          credentials: 'include',
+        })
         if (!response.ok) {
           throw new Error(`Failed to fetch Notion run status: ${response.status}`)
         }
@@ -496,8 +510,9 @@ export default function PipelinesInterface() {
       setNotionIsRunning(true)
       setNotionRunStatus('starting')
 
-      const response = await fetch('http://localhost:8000/api/pipelines/notion/run', {
+      const response = await fetch(`${API_BASE_URL}/api/pipelines/notion/run`, {
         method: 'POST',
+        credentials: 'include',
       })
 
       if (!response.ok) {
@@ -522,9 +537,13 @@ export default function PipelinesInterface() {
     if (!notionRunId) return
     try {
       setError(null)
-      await fetch(`http://localhost:8000/api/pipelines/notion/stop/${encodeURIComponent(notionRunId)}`, {
-        method: 'POST',
-      })
+      await fetch(
+        `${API_BASE_URL}/api/pipelines/notion/stop/${encodeURIComponent(notionRunId)}`,
+        {
+          method: 'POST',
+          credentials: 'include',
+        },
+      )
     } catch (err: any) {
       console.error('Error stopping Notion pipeline:', err)
       setError(err.message || 'Failed to stop Notion pipeline')
@@ -574,7 +593,9 @@ export default function PipelinesInterface() {
   const fetchNotionHierarchy = async () => {
     try {
       setError(null)
-      const response = await fetch('http://localhost:8000/api/notion/hierarchy')
+      const response = await fetch(`${API_BASE_URL}/api/notion/hierarchy`, {
+        credentials: 'include',
+      })
       if (!response.ok) {
         throw new Error(`Failed to load Notion hierarchy: ${response.status}`)
       }
@@ -605,7 +626,10 @@ export default function PipelinesInterface() {
 
     try {
       const response = await fetch(
-        `http://localhost:8000/api/notion/page-content?page_id=${encodeURIComponent(pageId)}`,
+        `${API_BASE_URL}/api/notion/page-content?page_id=${encodeURIComponent(pageId)}`,
+        {
+          credentials: 'include',
+        },
       )
       if (!response.ok) {
         throw new Error(`Failed to load Notion page content: ${response.status}`)

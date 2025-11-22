@@ -659,28 +659,41 @@ class WorkforceTools:
             logger.error(f"Error calling Gmail API: {e}")
             return f"❌ Error: {str(e)}"
     
-    def search_gmail_messages(self, query: str, limit: int = 10) -> str:
+    def search_gmail_messages(
+        self,
+        query: str,
+        limit: int = 10,
+        gmail_account_email: Optional[str] = None,
+    ) -> str:
         """Search Gmail messages in the database.
-        
+
         Args:
             query: Search query
             limit: Maximum results
-            
+            gmail_account_email: If provided, restrict results to this Gmail
+                account (gmail_messages.account_email).
+
         Returns:
             Formatted search results
         """
         try:
             with self.db.get_session() as session:
                 from database.models import GmailMessage
-                
-                # Build query
+
+                # Build base query
                 db_query = session.query(GmailMessage)
-                
+
+                # Scope to a specific Gmail account when requested (multi-tenant safety)
+                if gmail_account_email:
+                    db_query = db_query.filter(
+                        GmailMessage.account_email == gmail_account_email
+                    )
+
                 # Text search in subject and body
                 if query:
                     db_query = db_query.filter(
-                        (GmailMessage.subject.ilike(f"%{query}%")) |
-                        (GmailMessage.body_text.ilike(f"%{query}%"))
+                        (GmailMessage.subject.ilike(f"%{query}%"))
+                        | (GmailMessage.body_text.ilike(f"%{query}%"))
                     )
 
                 # Apply global Gmail read-domain restriction if configured
@@ -691,25 +704,29 @@ class WorkforceTools:
                         for dom in allowed_domains
                     ]
                     db_query = db_query.filter(or_(*domain_filters))
-                
+
                 # Order by most recent
-                messages = db_query.order_by(GmailMessage.date.desc()).limit(limit).all()
-                
+                messages = (
+                    db_query.order_by(GmailMessage.date.desc()).limit(limit).all()
+                )
+
                 if not messages:
                     return f"No Gmail messages found matching '{query}'"
-                
+
                 # Format results
                 results = []
                 for msg in messages:
-                    date_str = msg.date.strftime("%Y-%m-%d %H:%M") if msg.date else "N/A"
+                    date_str = (
+                        msg.date.strftime("%Y-%m-%d %H:%M") if msg.date else "N/A"
+                    )
                     results.append(
                         f"[{date_str}] From: {msg.from_address}\n"
                         f"Subject: {msg.subject}\n"
                         f"Preview: {msg.body_text[:200] if msg.body_text else 'No content'}..."
                     )
-                
+
                 return "\n\n---\n\n".join(results)
-        
+
         except Exception as e:
             logger.error(f"Error searching Gmail: {e}")
             return f"Error searching Gmail messages: {str(e)}"
@@ -2622,7 +2639,8 @@ Subject: {subject}
         self,
         project_name: str,
         days_back: int = 7,
-        notion_page_id: Optional[str] = None
+        notion_page_id: Optional[str] = None,
+        gmail_account_email: Optional[str] = None,
     ) -> str:
         """Track a project across Slack, Gmail, and Notion.
         
@@ -2645,11 +2663,16 @@ Subject: {subject}
             return "❌ Project Tracker not available"
         
         try:
-            logger.info(f"Tracking project: {project_name}")
+            logger.info(
+                "Tracking project: %s [gmail_account=%s]",
+                project_name,
+                gmail_account_email or "<any>",
+            )
             status = await self.project_tracker.track_project(
                 project_name=project_name,
                 days_back=days_back,
-                notion_page_id=notion_page_id
+                notion_page_id=notion_page_id,
+                gmail_account_email=gmail_account_email,
             )
             
             # Format response
@@ -2685,7 +2708,8 @@ Subject: {subject}
     async def generate_project_report(
         self,
         project_name: str,
-        days_back: int = 7
+        days_back: int = 7,
+        gmail_account_email: Optional[str] = None,
     ) -> str:
         """Generate a comprehensive formatted project report.
         
@@ -2703,10 +2727,15 @@ Subject: {subject}
             return "❌ Project Tracker not available"
         
         try:
-            logger.info(f"Generating report for: {project_name}")
+            logger.info(
+                "Generating report for: %s [gmail_account=%s]",
+                project_name,
+                gmail_account_email or "<any>",
+            )
             report = await self.project_tracker.generate_report(
                 project_name=project_name,
-                days_back=days_back
+                days_back=days_back,
+                gmail_account_email=gmail_account_email,
             )
             return report
         
@@ -2718,7 +2747,8 @@ Subject: {subject}
         self,
         page_id: str,
         project_name: str,
-        days_back: int = 7
+        days_back: int = 7,
+        gmail_account_email: Optional[str] = None,
     ) -> str:
         """Update existing Notion page with current project status.
         
@@ -2742,12 +2772,18 @@ Subject: {subject}
             return "❌ Project Tracker not available"
         
         try:
-            logger.info(f"Updating Notion page {page_id} for project: {project_name}")
+            logger.info(
+                "Updating Notion page %s for project %s [gmail_account=%s]",
+                page_id,
+                project_name,
+                gmail_account_email or "<any>",
+            )
             
             # Track the project
             status = await self.project_tracker.track_project(
                 project_name=project_name,
-                days_back=days_back
+                days_back=days_back,
+                gmail_account_email=gmail_account_email,
             )
             
             # Update Notion page
@@ -2769,7 +2805,8 @@ Subject: {subject}
     async def search_all_platforms(
         self,
         query: str,
-        limit_per_platform: int = 10
+        limit_per_platform: int = 10,
+        gmail_account_email: Optional[str] = None,
     ) -> str:
         """Search across all platforms simultaneously.
         
@@ -2791,9 +2828,13 @@ Subject: {subject}
         except Exception as e:
             results.append(f"## 💬 SLACK RESULTS\n❌ Error: {e}\n")
         
-        # Search Gmail
+        # Search Gmail (scoped to a single Gmail account when provided)
         try:
-            gmail_results = self.search_gmail_messages(query, limit=limit_per_platform)
+            gmail_results = self.search_gmail_messages(
+                query,
+                limit=limit_per_platform,
+                gmail_account_email=gmail_account_email,
+            )
             results.append(f"## 📧 GMAIL RESULTS\n{gmail_results}\n")
         except Exception as e:
             results.append(f"## 📧 GMAIL RESULTS\n❌ Error: {e}\n")
@@ -2819,7 +2860,8 @@ Subject: {subject}
     async def get_team_activity_summary(
         self,
         person_name: str,
-        days_back: int = 7
+        days_back: int = 7,
+        gmail_account_email: Optional[str] = None,
     ) -> str:
         """Get activity summary for a team member.
         
@@ -2850,7 +2892,11 @@ Subject: {subject}
         # Search Gmail for person's emails
         try:
             gmail_query = f"from:{person_name}"
-            gmail_results = self.search_gmail_messages(gmail_query, limit=20)
+            gmail_results = self.search_gmail_messages(
+                gmail_query,
+                limit=20,
+                gmail_account_email=gmail_account_email,
+            )
             if "emails found" in gmail_results.lower():
                 email_count = gmail_results.count('Subject:')
                 activities.append(f"📧 **Gmail:** {email_count} emails found")

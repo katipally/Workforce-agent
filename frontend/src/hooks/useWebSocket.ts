@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { useChatStore } from '../store/chatStore'
+import { API_BASE_URL } from '../lib/api'
 
 interface WebSocketHook {
   sendMessage: (query: string) => void
@@ -7,7 +8,11 @@ interface WebSocketHook {
   connectionStatus: 'connecting' | 'connected' | 'disconnected' | 'error'
 }
 
-const WS_URL = 'ws://localhost:8000/api/chat/ws'
+const wsBase = API_BASE_URL.startsWith('https')
+  ? API_BASE_URL.replace(/^https/, 'wss')
+  : API_BASE_URL.replace(/^http/, 'ws')
+
+const WS_URL = `${wsBase}/api/chat/ws`
 const RECONNECT_INTERVAL = 3000 // 3 seconds
 const MAX_RECONNECT_ATTEMPTS = 5
 
