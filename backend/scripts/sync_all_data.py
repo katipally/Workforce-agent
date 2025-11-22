@@ -100,36 +100,12 @@ class DataSyncManager:
         - Contacts (from/to addresses)
         """
         logger.info("Starting Gmail data sync...")
-        
-        try:
-            extractor = GmailExtractor()
-            if not extractor.authenticate():
-                logger.error("Gmail authentication failed")
-                return {'error': 'Authentication failed'}
-            
-            stats = {
-                'accounts': 1,
-                'labels': 0,
-                'threads': 0,
-                'messages': 0,
-                'attachments': 0
-            }
-            
-            # Extract messages (includes threads, labels, attachments)
-            logger.info("Syncing Gmail messages...")
-            messages_count = extractor.extract_messages(
-                max_messages=500,  # Adjust based on needs
-                include_spam_trash=False
-            )
-            stats['messages'] = messages_count
-            logger.info(f"✓ Synced {messages_count} messages")
-            
-            logger.info(f"✅ Gmail sync complete: {stats}")
-            return stats
-        
-        except Exception as e:
-            logger.error(f"Gmail sync failed: {e}", exc_info=True)
-            return {'error': str(e)}
+        logger.warning(
+            "Gmail sync via sync_all_data.py is disabled. "
+            "Gmail now uses per-user OAuth tokens via the web app and "
+            "Pipelines UI. Run a Gmail pipeline from the frontend instead."
+        )
+        return {'error': 'gmail_sync_disabled'}
     
     async def sync_notion_data(self) -> dict:
         """

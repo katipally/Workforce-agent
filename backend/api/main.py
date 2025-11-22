@@ -5,25 +5,49 @@ Main application with WebSocket streaming support.
 
 import asyncio
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Form
+from fastapi import (
+    FastAPI,
+    WebSocket,
+    WebSocketDisconnect,
+    HTTPException,
+    UploadFile,
+    File,
+    Form,
+    Depends,
+    Request,
+    Response,
+    status,
+)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional, Tuple
 import json
 import os
+
+# Disable HuggingFace tokenizers parallelism by default to avoid noisy fork
+# warnings. Users can override this via the TOKENIZERS_PARALLELISM env var.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import sys
 import aiofiles
 import hashlib
+import hmac
 import threading
 import uuid
 import base64
-from datetime import datetime
+import secrets
+from datetime import datetime, timedelta
 from pathlib import Path
 from email.utils import parsedate_to_datetime
+from urllib.parse import urlencode
 import requests
 from sqlalchemy import cast, or_
 from sqlalchemy.dialects.postgresql import JSONB
+from google.oauth2 import id_token as google_id_token
+from google.auth.transport import requests as google_requests
+from google.oauth2.credentials import Credentials
+from google.auth.exceptions import RefreshError
 
 # LLM message types for summary generation
 from langchain.schema import SystemMessage, HumanMessage
@@ -53,6 +77,9 @@ from database.models import (
     NotionPage,
     Project,
     ProjectSource,
+    AppUser,
+    UserOAuthToken,
+    AppSession,
 )
 from slack.extractor import ExtractionCoordinator
 from gmail import GmailClient
@@ -62,6 +89,159 @@ logger = get_logger(__name__)
 
 # Initialize database manager
 db_manager = DatabaseManager()
+
+SESSION_COOKIE_NAME = "wf_session"
+SESSION_TTL_SECONDS = 60 * 60 * 24 * 7
+
+
+def _cookie_settings() -> Dict[str, Any]:
+    secure = not (
+        Config.FRONTEND_BASE_URL.startswith("http://localhost")
+        or Config.FRONTEND_BASE_URL.startswith("http://127.0.0.1")
+    )
+    return {
+        "httponly": True,
+        "secure": secure,
+        "samesite": "lax",
+    }
+
+
+def _delete_app_session(session_id: str) -> None:
+    if not session_id:
+        return
+    with db_manager.get_session() as session:
+        db_sess = session.query(AppSession).filter_by(id=session_id).first()
+        if db_sess:
+            session.delete(db_sess)
+            session.commit()
+
+
+def get_current_user(request: Request) -> AppUser:
+    session_id = request.cookies.get(SESSION_COOKIE_NAME)
+    if not session_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+
+    with db_manager.get_session() as session:
+        app_session = session.query(AppSession).filter_by(id=session_id).first()
+        if not app_session or (app_session.expires_at and app_session.expires_at < datetime.utcnow()):
+            if app_session:
+                session.delete(app_session)
+                session.commit()
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session expired")
+
+        user = session.query(AppUser).filter_by(id=app_session.user_id).first()
+        if not user:
+            session.delete(app_session)
+            session.commit()
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+
+        app_session.last_seen_at = datetime.utcnow()
+        session.commit()
+        return user
+
+
+def get_current_user_with_gmail(request: Request) -> AppUser:
+    user = get_current_user(request)
+
+    with db_manager.get_session() as session:
+        token = (
+            session.query(UserOAuthToken)
+            .filter_by(user_id=user.id, provider="google", revoked=False)
+            .first()
+        )
+        if not token:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Gmail not authorized",
+            )
+
+    return user
+
+
+def _build_google_credentials_for_user_id(user_id: str) -> Optional[Credentials]:
+    if not user_id:
+        return None
+
+    with db_manager.get_session() as session:
+        token = (
+            session.query(UserOAuthToken)
+            .filter_by(user_id=user_id, provider="google", revoked=False)
+            .first()
+        )
+        if not token or not token.access_token:
+            return None
+
+        scopes = token.scope.split() if token.scope else GmailClient.SCOPES
+
+        creds = Credentials(
+            token=token.access_token,
+            refresh_token=token.refresh_token,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=Config.GOOGLE_CLIENT_ID or None,
+            client_secret=Config.GOOGLE_CLIENT_SECRET or None,
+            scopes=scopes,
+        )
+
+        if token.expires_at and token.expires_at <= datetime.utcnow():
+            if token.refresh_token and Config.GOOGLE_CLIENT_ID and Config.GOOGLE_CLIENT_SECRET:
+                try:
+                    creds.refresh(google_requests.Request())
+                except RefreshError as e:
+                    logger.error("Failed to refresh Google token for user %s: %s", user_id, e)
+                    token.revoked = True
+                    session.commit()
+                    return None
+
+                token.access_token = creds.token
+                expiry = getattr(creds, "expiry", None)
+                token.expires_at = expiry or datetime.utcnow() + timedelta(seconds=3600)
+                session.commit()
+            else:
+                return None
+
+        return creds
+ 
+
+def _build_oauth_state(redirect_path: Optional[str] = "/") -> str:
+    payload = {
+        "nonce": secrets.token_hex(16),
+        "redirect_path": redirect_path or "/",
+    }
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+    if not Config.SESSION_SECRET:
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    sig = hmac.new(Config.SESSION_SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest().encode("ascii")
+    token = base64.urlsafe_b64encode(raw + b"." + sig).decode("ascii").rstrip("=")
+    return token
+
+
+def _parse_oauth_state(state: str) -> Optional[Dict[str, Any]]:
+    if not state:
+        return None
+
+    try:
+        padded = state + "=" * (-len(state) % 4)
+        data = base64.urlsafe_b64decode(padded.encode("ascii"))
+
+        if Config.SESSION_SECRET:
+            raw, sig = data.rsplit(b".", 1)
+            expected_sig = hmac.new(
+                Config.SESSION_SECRET.encode("utf-8"), raw, hashlib.sha256
+            ).hexdigest().encode("ascii")
+            if not hmac.compare_digest(sig, expected_sig):
+                logger.warning("Invalid OAuth state signature")
+                return None
+        else:
+            raw = data
+
+        payload = json.loads(raw.decode("utf-8"))
+        return payload if isinstance(payload, dict) else None
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(f"Failed to parse OAuth state: {e}", exc_info=True)
+        return None
+
 
 # Import agent modules after setting up paths
 import sys
@@ -169,10 +349,234 @@ app = FastAPI(
     version="1.0.0"
 )
 
+
+@app.get("/auth/google/login")
+async def google_login(request: Request, redirect_path: Optional[str] = "/"):
+    """Start Google OAuth login flow."""
+
+    if not (Config.GOOGLE_CLIENT_ID and Config.GOOGLE_CLIENT_SECRET and Config.GOOGLE_OAUTH_REDIRECT_BASE):
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Google OAuth not configured")
+
+    if not redirect_path or not redirect_path.startswith("/"):
+        redirect_path = "/"
+
+    state = _build_oauth_state(redirect_path)
+    redirect_uri = f"{Config.GOOGLE_OAUTH_REDIRECT_BASE.rstrip('/')}/auth/google/callback"
+
+    scopes = [
+        "openid",
+        "email",
+        "profile",
+    ] + GmailClient.SCOPES
+
+    params = {
+        "client_id": Config.GOOGLE_CLIENT_ID,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": " ".join(scopes),
+        "access_type": "offline",
+        "include_granted_scopes": "true",
+        "state": state,
+        "prompt": "consent",
+    }
+
+    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+    return RedirectResponse(auth_url, status_code=status.HTTP_302_FOUND)
+
+
+@app.get("/auth/google/callback")
+async def google_callback(request: Request, code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None):
+    """Handle Google OAuth callback, create/update user, and set session cookie."""
+
+    frontend_base = Config.FRONTEND_BASE_URL or "http://localhost:5173"
+    default_redirect = frontend_base.rstrip("/") or "http://localhost:5173"
+
+    if error or not code:
+        redirect_url = f"{default_redirect}?auth_error={error or 'missing_code'}"
+        return RedirectResponse(redirect_url, status_code=status.HTTP_302_FOUND)
+
+    state_payload = _parse_oauth_state(state or "")
+    if not state_payload:
+        redirect_url = f"{default_redirect}?auth_error=invalid_state"
+        return RedirectResponse(redirect_url, status_code=status.HTTP_302_FOUND)
+
+    redirect_path = state_payload.get("redirect_path") or "/"
+    if not redirect_path.startswith("/"):
+        redirect_path = "/"
+
+    redirect_uri = f"{Config.GOOGLE_OAUTH_REDIRECT_BASE.rstrip('/')}/auth/google/callback"
+
+    token_data = {
+        "code": code,
+        "client_id": Config.GOOGLE_CLIENT_ID,
+        "client_secret": Config.GOOGLE_CLIENT_SECRET,
+        "redirect_uri": redirect_uri,
+        "grant_type": "authorization_code",
+    }
+
+    try:
+        token_resp = requests.post("https://oauth2.googleapis.com/token", data=token_data, timeout=10)
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(f"Error exchanging code for token: {e}", exc_info=True)
+        redirect_url = f"{default_redirect}?auth_error=token_exchange_failed"
+        return RedirectResponse(redirect_url, status_code=status.HTTP_302_FOUND)
+
+    if token_resp.status_code != 200:
+        logger.error("Token endpoint error %s: %s", token_resp.status_code, token_resp.text)
+        redirect_url = f"{default_redirect}?auth_error=token_exchange_failed"
+        return RedirectResponse(redirect_url, status_code=status.HTTP_302_FOUND)
+
+    tokens = token_resp.json()
+    id_token_str = tokens.get("id_token")
+    access_token = tokens.get("access_token")
+    refresh_token = tokens.get("refresh_token")
+    expires_in = tokens.get("expires_in")
+    scope_str = tokens.get("scope", "")
+    token_type = tokens.get("token_type")
+
+    if not id_token_str or not access_token:
+        redirect_url = f"{default_redirect}?auth_error=invalid_token_response"
+        return RedirectResponse(redirect_url, status_code=status.HTTP_302_FOUND)
+
+    try:
+        id_info = google_id_token.verify_oauth2_token(
+            id_token_str,
+            google_requests.Request(),
+            audience=Config.GOOGLE_CLIENT_ID,
+        )
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(f"Failed to verify ID token: {e}", exc_info=True)
+        redirect_url = f"{default_redirect}?auth_error=id_token_invalid"
+        return RedirectResponse(redirect_url, status_code=status.HTTP_302_FOUND)
+
+    sub = id_info.get("sub")
+    email = id_info.get("email")
+    name = id_info.get("name") or ""
+    picture = id_info.get("picture")
+
+    if not sub or not email:
+        redirect_url = f"{default_redirect}?auth_error=missing_profile"
+        return RedirectResponse(redirect_url, status_code=status.HTTP_302_FOUND)
+
+    session_id: Optional[str] = None
+
+    with db_manager.get_session() as session:
+        user = session.query(AppUser).filter_by(google_sub=sub).first()
+        if not user:
+            user = session.query(AppUser).filter_by(email=email).first()
+        if not user:
+            user = AppUser(
+                google_sub=sub,
+                email=email,
+                name=name,
+                picture_url=picture,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+                last_login_at=datetime.utcnow(),
+            )
+            session.add(user)
+        else:
+            user.email = email
+            user.name = name
+            user.picture_url = picture
+            user.last_login_at = datetime.utcnow()
+            user.updated_at = datetime.utcnow()
+
+        expires_at: Optional[datetime] = None
+        try:
+            if isinstance(expires_in, (int, float)):
+                expires_at = datetime.utcnow() + timedelta(seconds=int(expires_in))
+        except Exception:
+            expires_at = None
+
+        token = (
+            session.query(UserOAuthToken)
+            .filter_by(user_id=user.id, provider="google")
+            .first()
+        )
+        if not token:
+            token = UserOAuthToken(
+                user_id=user.id,
+                provider="google",
+                access_token=access_token,
+                refresh_token=refresh_token,
+                expires_at=expires_at,
+                scope=scope_str,
+                token_type=token_type,
+                revoked=False,
+            )
+            session.add(token)
+        else:
+            token.access_token = access_token
+            if refresh_token:
+                token.refresh_token = refresh_token
+            token.expires_at = expires_at
+            token.scope = scope_str
+            token.token_type = token_type
+            token.revoked = False
+
+        scopes = (scope_str or "").split()
+        has_gmail = any(s.startswith("https://www.googleapis.com/auth/gmail") for s in scopes)
+        user.has_gmail_access = has_gmail
+
+        now = datetime.utcnow()
+        session_id = secrets.token_hex(32)
+        app_session = AppSession(
+            id=session_id,
+            user_id=user.id,
+            created_at=now,
+            updated_at=now,
+            expires_at=now + timedelta(seconds=SESSION_TTL_SECONDS),
+            last_seen_at=now,
+        )
+        session.add(app_session)
+        session.commit()
+
+    redirect_url = f"{default_redirect}{redirect_path}"
+    response = RedirectResponse(url=redirect_url, status_code=status.HTTP_302_FOUND)
+    if session_id:
+        response.set_cookie(
+            key=SESSION_COOKIE_NAME,
+            value=session_id,
+            max_age=SESSION_TTL_SECONDS,
+            **_cookie_settings(),
+        )
+    return response
+
+
+@app.post("/auth/logout")
+async def logout(request: Request):
+    """Log the current user out and clear the session cookie."""
+
+    session_id = request.cookies.get(SESSION_COOKIE_NAME)
+    if session_id:
+        _delete_app_session(session_id)
+
+    response = JSONResponse({"detail": "logged_out"})
+    response.delete_cookie(SESSION_COOKIE_NAME)
+    return response
+
+
+@app.get("/auth/me")
+async def auth_me(current_user: AppUser = Depends(get_current_user)):
+    """Return the current authenticated user's profile."""
+
+    return {
+        "id": current_user.id,
+        "email": current_user.email,
+        "name": current_user.name,
+        "picture_url": current_user.picture_url,
+        "has_gmail_access": bool(current_user.has_gmail_access),
+    }
+
 # CORS middleware for React frontend
+_frontend_origins = ["http://localhost:5173", "http://localhost:3000"]
+if Config.FRONTEND_BASE_URL and Config.FRONTEND_BASE_URL not in _frontend_origins:
+    _frontend_origins.append(Config.FRONTEND_BASE_URL)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],  # Vite and CRA
+    allow_origins=_frontend_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -594,14 +998,10 @@ async def load_models():
 # ============================================================================
 
 @app.get("/api/chat/sessions")
-async def list_sessions():
-    """List all chat sessions ordered by last update.
-    
-    Returns:
-        List of chat sessions with metadata
-    """
+async def list_sessions(current_user: AppUser = Depends(get_current_user)):
+    """List chat sessions for the current user ordered by last update."""
     try:
-        sessions = db_manager.list_chat_sessions(limit=100)
+        sessions = db_manager.list_chat_sessions(owner_user_id=current_user.id, limit=100)
         return {
             "sessions": [
                 {
@@ -619,7 +1019,7 @@ async def list_sessions():
 
 
 @app.get("/api/chat/sessions/{session_id}")
-async def get_session(session_id: str):
+async def get_session(session_id: str, current_user: AppUser = Depends(get_current_user)):
     """Get a specific chat session with all messages.
     
     Args:
@@ -629,13 +1029,14 @@ async def get_session(session_id: str):
         Session details with messages
     """
     try:
-        session = db_manager.get_chat_session(session_id)
+        session = db_manager.get_chat_session(session_id, owner_user_id=current_user.id)
 
-        # For brand new sessions, auto-create an empty session instead of
-        # returning 404 so the frontend can immediately attach messages.
+        # For brand new sessions, auto-create an empty session for this user
+        # instead of returning 404 so the frontend can immediately attach
+        # messages.
         if not session:
-            db_manager.create_chat_session(session_id)
-            session = db_manager.get_chat_session(session_id)
+            db_manager.create_chat_session(session_id, owner_user_id=current_user.id)
+            session = db_manager.get_chat_session(session_id, owner_user_id=current_user.id)
             if not session:
                 raise HTTPException(status_code=500, detail="Failed to create chat session")
         
@@ -657,7 +1058,7 @@ async def get_session(session_id: str):
 
 
 @app.delete("/api/chat/sessions/{session_id}")
-async def delete_session(session_id: str):
+async def delete_session(session_id: str, current_user: AppUser = Depends(get_current_user)):
     """Delete a chat session and all its messages.
     
     Args:
@@ -667,7 +1068,7 @@ async def delete_session(session_id: str):
         Success message
     """
     try:
-        db_manager.delete_chat_session(session_id)
+        db_manager.delete_chat_session(session_id, owner_user_id=current_user.id)
         return {"status": "ok", "message": "Session deleted successfully"}
     except Exception as e:
         logger.error(f"Error deleting session: {e}")
@@ -680,10 +1081,10 @@ async def delete_session(session_id: str):
 
 
 @app.get("/api/projects")
-async def list_projects():
-    """List projects for the Projects tab."""
+async def list_projects(current_user: AppUser = Depends(get_current_user)):
+    """List projects for the Projects tab for the current user."""
     try:
-        projects = db_manager.list_projects(limit=100)
+        projects = db_manager.list_projects(owner_user_id=current_user.id, limit=100)
         return {
             "projects": [
                 {
@@ -709,7 +1110,7 @@ async def list_projects():
 
 
 @app.post("/api/projects")
-async def create_project(payload: ProjectCreateRequest):
+async def create_project(payload: ProjectCreateRequest, current_user: AppUser = Depends(get_current_user)):
     """Create a new project."""
     try:
         status = payload.status or "not_started"
@@ -721,6 +1122,7 @@ async def create_project(payload: ProjectCreateRequest):
             main_goal=payload.main_goal,
             current_status_summary=payload.current_status_summary,
             important_notes=payload.important_notes,
+            owner_user_id=current_user.id,
         )
         return {
             "id": project.id,
@@ -742,10 +1144,10 @@ async def create_project(payload: ProjectCreateRequest):
 
 
 @app.get("/api/projects/{project_id}")
-async def get_project(project_id: str):
+async def get_project(project_id: str, current_user: AppUser = Depends(get_current_user)):
     """Get a project with its linked sources."""
     try:
-        project = db_manager.get_project(project_id)
+        project = db_manager.get_project(project_id, owner_user_id=current_user.id)
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
 
@@ -794,11 +1196,11 @@ async def get_project(project_id: str):
 
 
 @app.put("/api/projects/{project_id}")
-async def update_project(project_id: str, payload: ProjectUpdateRequest):
+async def update_project(project_id: str, payload: ProjectUpdateRequest, current_user: AppUser = Depends(get_current_user)):
     """Update an existing project."""
     try:
         fields: Dict[str, Any] = payload.dict(exclude_unset=True)
-        project = db_manager.update_project(project_id, **fields)
+        project = db_manager.update_project(project_id, owner_user_id=current_user.id, **fields)
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
 
@@ -824,10 +1226,10 @@ async def update_project(project_id: str, payload: ProjectUpdateRequest):
 
 
 @app.delete("/api/projects/{project_id}")
-async def delete_project(project_id: str):
+async def delete_project(project_id: str, current_user: AppUser = Depends(get_current_user)):
     """Delete a project and all associated mappings."""
     try:
-        db_manager.delete_project(project_id)
+        db_manager.delete_project(project_id, owner_user_id=current_user.id)
         return {"status": "ok"}
     except Exception as e:  # pragma: no cover - defensive logging
         logger.error(f"Error deleting project {project_id}: {e}", exc_info=True)
@@ -835,7 +1237,7 @@ async def delete_project(project_id: str):
 
 
 @app.post("/api/projects/{project_id}/sources")
-async def add_project_sources(project_id: str, sources: List[ProjectSourcePayload]):
+async def add_project_sources(project_id: str, sources: List[ProjectSourcePayload], current_user: AppUser = Depends(get_current_user)):
     """Add one or more sources to a project."""
     try:
         project = db_manager.get_project(project_id)
@@ -868,7 +1270,7 @@ async def add_project_sources(project_id: str, sources: List[ProjectSourcePayloa
 
 
 @app.delete("/api/projects/{project_id}/sources/{source_type}/{source_id}")
-async def delete_project_source(project_id: str, source_type: str, source_id: str):
+async def delete_project_source(project_id: str, source_type: str, source_id: str, current_user: AppUser = Depends(get_current_user)):
     """Remove a specific source mapping from a project."""
     try:
         project = db_manager.get_project(project_id)
@@ -2284,15 +2686,15 @@ def _persist_gmail_message_from_full(
         logger.error(f"Failed to persist Gmail message {full_msg.get('id')}: {e}", exc_info=True)
 
 
-def _run_gmail_pipeline(run_id: str, label_id: str) -> None:
+def _run_gmail_pipeline(run_id: str, label_id: str, user_id: str) -> None:
     """Background worker to fetch new Gmail messages for a specific label.
 
-    Uses GmailClient directly, stores messages in PostgreSQL, and syncs embeddings.
-    Incremental behavior is controlled by internalDate stored per label in a
-    small JSON state file.
+    Uses GmailClient with per-user OAuth credentials, stores messages in
+    PostgreSQL, and syncs embeddings. Incremental behavior is controlled by
+    internalDate stored per label in a small JSON state file.
     """
 
-    logger.info("Starting Gmail pipeline run %s for label %s", run_id, label_id)
+    logger.info("Starting Gmail pipeline run %s for label %s (user_id=%s)", run_id, label_id, user_id)
 
     run_info = gmail_pipeline_runs.get(run_id) or {}
     gmail_pipeline_runs[run_id] = run_info
@@ -2300,9 +2702,18 @@ def _run_gmail_pipeline(run_id: str, label_id: str) -> None:
     run_info["status"] = "running"
     run_info["started_at"] = datetime.utcnow().isoformat()
     run_info["label_id"] = label_id
+    run_info["user_id"] = user_id
+
+    creds = _build_google_credentials_for_user_id(user_id)
+    if not creds:
+        run_info["status"] = "failed"
+        run_info["finished_at"] = datetime.utcnow().isoformat()
+        run_info["error"] = "Gmail not authorized for user"
+        logger.error("No valid Gmail credentials for user %s in pipeline run %s", user_id, run_id)
+        return
 
     client = GmailClient()
-    if not client.authenticate():
+    if not client.init_with_credentials(creds):
         run_info["status"] = "failed"
         run_info["finished_at"] = datetime.utcnow().isoformat()
         run_info["error"] = "Gmail authentication failed"
@@ -2516,22 +2927,17 @@ def _run_gmail_pipeline(run_id: str, label_id: str) -> None:
 
 
 @app.get("/api/pipelines/gmail/labels")
-async def list_gmail_labels():
+async def list_gmail_labels(current_user: AppUser = Depends(get_current_user)):
     """List available Gmail labels using the Gmail API."""
+    creds = _build_google_credentials_for_user_id(current_user.id)
+    if not creds:
+        # Return empty label list if Gmail is not connected for this user.
+        logger.warning("Gmail not connected for user %s; returning empty label list", current_user.id)
+        return {"labels": []}
 
     client = GmailClient()
-
-    try:
-        authed = client.authenticate()
-    except Exception as e:  # pragma: no cover - defensive logging
-        logger.error("Gmail authenticate() raised an exception when listing labels: %s", e, exc_info=True)
-        authed = False
-
-    if not authed:
-        # Do not crash the pipelines or projects UI if Gmail tokens are invalid.
-        # Instead, return an empty label list so the frontend can continue working
-        # with Slack/Notion pipelines while the user fixes Gmail credentials.
-        logger.warning("Gmail authentication failed; returning empty label list")
+    if not client.init_with_credentials(creds):
+        logger.error("Gmail init_with_credentials failed when listing labels for user %s", current_user.id)
         return {"labels": []}
 
     labels = client.list_labels() or []
@@ -2545,7 +2951,7 @@ async def list_gmail_labels():
 
 
 @app.post("/api/pipelines/gmail/run")
-async def run_gmail_pipeline(label_id: str):
+async def run_gmail_pipeline(label_id: str, current_user: AppUser = Depends(get_current_user)):
     """Trigger a Gmail pipeline run for a specific label.
 
     Args:
@@ -2555,23 +2961,29 @@ async def run_gmail_pipeline(label_id: str):
     if not label_id:
         raise HTTPException(status_code=400, detail="label_id is required")
 
+    # Ensure the user has Gmail connected before starting the pipeline
+    creds = _build_google_credentials_for_user_id(current_user.id)
+    if not creds:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Gmail not authorized")
+
     run_id = uuid.uuid4().hex
     gmail_pipeline_runs[run_id] = {
         "run_id": run_id,
         "label_id": label_id,
+        "user_id": current_user.id,
         "status": "pending",
         "created_at": datetime.utcnow().isoformat(),
         "cancel_requested": False,
     }
 
-    thread = threading.Thread(target=_run_gmail_pipeline, args=(run_id, label_id), daemon=True)
+    thread = threading.Thread(target=_run_gmail_pipeline, args=(run_id, label_id, current_user.id), daemon=True)
     thread.start()
 
     return {"run_id": run_id, "status": "started"}
 
 
 @app.get("/api/pipelines/gmail/status/{run_id}")
-async def get_gmail_pipeline_status(run_id: str):
+async def get_gmail_pipeline_status(run_id: str, current_user: AppUser = Depends(get_current_user)):
     """Get the status of a Gmail pipeline run."""
 
     run = gmail_pipeline_runs.get(run_id)
@@ -2581,7 +2993,7 @@ async def get_gmail_pipeline_status(run_id: str):
 
 
 @app.post("/api/pipelines/gmail/stop/{run_id}")
-async def stop_gmail_pipeline(run_id: str):
+async def stop_gmail_pipeline(run_id: str, current_user: AppUser = Depends(get_current_user)):
     """Request cancellation of a Gmail pipeline run."""
 
     run = gmail_pipeline_runs.get(run_id)
@@ -2596,7 +3008,7 @@ async def stop_gmail_pipeline(run_id: str):
 
 
 @app.get("/api/pipelines/gmail/messages")
-async def get_gmail_pipeline_messages(run_id: str):
+async def get_gmail_pipeline_messages(run_id: str, current_user: AppUser = Depends(get_current_user)):
     """Return messages for a specific Gmail pipeline run."""
 
     run = gmail_pipeline_runs.get(run_id)
@@ -2616,6 +3028,7 @@ async def get_gmail_pipeline_messages(run_id: str):
             with db_manager.get_session() as session:
                 query = (
                     session.query(GmailMessage)
+                    .filter(GmailMessage.account_email == current_user.email)
                     .filter(cast(GmailMessage.label_ids, JSONB).contains([label_id]))
                     .order_by(GmailMessage.date.asc())
                     .limit(500)
@@ -2657,7 +3070,7 @@ async def get_gmail_pipeline_messages(run_id: str):
 
 
 @app.get("/api/pipelines/gmail/messages/by-label")
-async def get_gmail_messages_by_label(label_id: str, limit: int = 200):
+async def get_gmail_messages_by_label(label_id: str, limit: int = 200, current_user: AppUser = Depends(get_current_user)):
     """Return stored Gmail messages for a specific label from the database.
 
     This lets the Pipelines UI show previously-synced data for any label
@@ -2675,6 +3088,7 @@ async def get_gmail_messages_by_label(label_id: str, limit: int = 200):
         with db_manager.get_session() as session:
             query = (
                 session.query(GmailMessage)
+                .filter(GmailMessage.account_email == current_user.email)
                 .filter(cast(GmailMessage.label_ids, JSONB).contains([label_id]))
                 .order_by(GmailMessage.date.asc())
                 .limit(limit)

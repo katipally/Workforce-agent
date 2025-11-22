@@ -460,6 +460,7 @@ class ChatSession(Base):
     
     session_id = Column(String(50), primary_key=True)
     title = Column(String(255))  # Auto-generated from first message
+    owner_user_id = Column(String(50), ForeignKey("app_users.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -467,6 +468,7 @@ class ChatSession(Base):
     messages = relationship("ChatMessage", back_populates="session", cascade="all, delete-orphan")
     
     __table_args__ = (
+        Index("idx_chat_session_owner", "owner_user_id"),
         Index("idx_chat_session_updated", "updated_at"),
     )
 
@@ -496,6 +498,7 @@ class Project(Base):
     __tablename__ = "projects"
 
     id = Column(String(50), primary_key=True, default=lambda: uuid4().hex)
+    owner_user_id = Column(String(50), ForeignKey("app_users.id"))
     name = Column(String(255), nullable=False)
     description = Column(Text)
     status = Column(String(50), default="not_started")
@@ -511,6 +514,7 @@ class Project(Base):
     sources = relationship("ProjectSource", back_populates="project", cascade="all, delete-orphan")
 
     __table_args__ = (
+        Index("idx_project_owner", "owner_user_id"),
         Index("idx_project_status", "status"),
         Index("idx_project_updated", "updated_at"),
     )
@@ -618,4 +622,61 @@ class SlackNotionMessageMapping(Base):
         Index("idx_slack_notion_workflow", "workflow_id"),
         Index("idx_slack_notion_channel", "slack_channel_id"),
         Index("idx_slack_notion_parent_ts", "parent_slack_ts"),
+    )
+
+
+class AppUser(Base):
+    """Application user."""
+    __tablename__ = "app_users"
+
+    id = Column(String(50), primary_key=True, default=lambda: uuid4().hex)
+    google_sub = Column(String(255), unique=True, nullable=False)
+    email = Column(String(255), unique=True, nullable=False)
+    name = Column(String(255))
+    picture_url = Column(String(500))
+    is_admin = Column(Boolean, default=False)
+    has_gmail_access = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_login_at = Column(DateTime)
+
+
+class UserOAuthToken(Base):
+    """User OAuth token."""
+    __tablename__ = "user_oauth_tokens"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String(50), ForeignKey("app_users.id"), nullable=False)
+    provider = Column(String(50), nullable=False)
+    access_token = Column(Text, nullable=False)
+    refresh_token = Column(Text)
+    expires_at = Column(DateTime)
+    scope = Column(Text)
+    token_type = Column(String(50))
+    revoked = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "provider", name="uq_user_oauth_provider"),
+        Index("idx_user_oauth_user", "user_id"),
+    )
+
+
+class AppSession(Base):
+    """Application session."""
+    __tablename__ = "app_sessions"
+
+    id = Column(String(64), primary_key=True)
+    user_id = Column(String(50), ForeignKey("app_users.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    expires_at = Column(DateTime)
+    last_seen_at = Column(DateTime)
+    ip_address = Column(String(100))
+    user_agent = Column(String(500))
+
+    __table_args__ = (
+        Index("idx_app_session_user", "user_id"),
+        Index("idx_app_session_expires", "expires_at"),
     )

@@ -139,41 +139,19 @@ def test_slack():
 
 
 def test_gmail():
-    """Test Gmail API connection."""
+    """Test Gmail API connection (deprecated file-based flow).
+
+    Gmail now uses OAuth-based per-user tokens via the web app.
+    This legacy setup check is kept for backwards compatibility but
+    no longer verifies a credentials.json file.
+    """
     logger.info("=" * 60)
-    logger.info("Testing Gmail API")
+    logger.info("Testing Gmail API (OAuth-based)")
     logger.info("=" * 60)
-    
-    try:
-        if GmailClient is None:
-            logger.warning("⚠ GmailClient not available - check imports")
-            logger.info("")
-            return False
-        
-        if not os.path.exists(Config.GMAIL_CREDENTIALS_FILE):
-            logger.warning(f"⚠ Gmail credentials file not found: {Config.GMAIL_CREDENTIALS_FILE}")
-            logger.info("")
-            return False
-        
-        client = GmailClient()
-        profile = client.get_profile()
-        
-        if profile:
-            logger.info(f"✓ Gmail API connected!")
-            logger.info(f"  Email: {profile.get('emailAddress', 'Unknown')}")
-            logger.info(f"  Messages Total: {profile.get('messagesTotal', 0)}")
-            logger.info(f"  Threads Total: {profile.get('threadsTotal', 0)}")
-            logger.info("")
-            return True
-        else:
-            logger.error("✗ Gmail profile fetch failed")
-            logger.info("")
-            return False
-    
-    except Exception as e:
-        logger.error(f"✗ Gmail connection failed: {e}")
-        logger.info("")
-        return False
+    logger.info("Gmail file-based credentials are no longer used.")
+    logger.info("To verify Gmail, sign in via the web UI and run a Gmail pipeline.")
+    logger.info("")
+    return True
 
 
 def test_notion():

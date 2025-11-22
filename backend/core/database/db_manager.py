@@ -15,13 +15,32 @@ from sqlalchemy.exc import IntegrityError
 
 from config import Config
 from .models import (
-    Base, Workspace, User, Channel, Message, File,
-    MessageFile, Reaction, SyncStatus,
-    NotionWorkspace, NotionPage,
-    GmailAccount, GmailLabel, GmailThread, GmailMessage, GmailAttachment,
-    ChatSession, ChatMessage,
-    Project, ProjectSource,
-    Workflow, WorkflowChannelMapping, SlackNotionMessageMapping,
+    Base,
+    Workspace,
+    User,
+    Channel,
+    Message,
+    File,
+    MessageFile,
+    Reaction,
+    SyncStatus,
+    NotionWorkspace,
+    NotionPage,
+    GmailAccount,
+    GmailLabel,
+    GmailThread,
+    GmailMessage,
+    GmailAttachment,
+    ChatSession,
+    ChatMessage,
+    Project,
+    ProjectSource,
+    Workflow,
+    WorkflowChannelMapping,
+    SlackNotionMessageMapping,
+    AppUser,
+    UserOAuthToken,
+    AppSession,
 )
 from utils.logger import get_logger
 
@@ -52,7 +71,10 @@ class DatabaseManager:
             pool_pre_ping=True,  # Verify connections before using
             pool_recycle=3600  # Recycle connections after 1 hour
         )
-        self.SessionLocal = sessionmaker(bind=self.engine)
+        # expire_on_commit=False so objects (e.g., AppUser) remain usable after commits
+        # in helper functions like get_current_user, where the session is closed
+        # before the object is returned to FastAPI dependencies.
+        self.SessionLocal = sessionmaker(bind=self.engine, expire_on_commit=False)
         self.init_db()
     
     def init_db(self):
@@ -113,14 +135,30 @@ class DatabaseManager:
                                 )
                             )
 
+            # Chat sessions table: add owner_user_id for per-user chat history
+            if "chat_sessions" in table_names:
+                columns = {col["name"] for col in inspector.get_columns("chat_sessions")}
+                needs_owner = "owner_user_id" not in columns
+                if needs_owner:
+                    with self.engine.begin() as conn:
+                        conn.execute(
+                            text("ALTER TABLE chat_sessions ADD COLUMN owner_user_id VARCHAR(50)")
+                        )
+
             # Project table: add tracking columns for sync and summary freshness
+            # and owner_user_id for per-user projects.
             if "projects" in table_names:
                 columns = {col["name"] for col in inspector.get_columns("projects")}
+                needs_owner = "owner_user_id" not in columns
                 needs_last_sync = "last_project_sync_at" not in columns
                 needs_last_summary = "last_summary_generated_at" not in columns
 
-                if needs_last_sync or needs_last_summary:
+                if needs_owner or needs_last_sync or needs_last_summary:
                     with self.engine.begin() as conn:
+                        if needs_owner:
+                            conn.execute(
+                                text("ALTER TABLE projects ADD COLUMN owner_user_id VARCHAR(50)")
+                            )
                         if needs_last_sync:
                             conn.execute(
                                 text(
@@ -460,7 +498,12 @@ class DatabaseManager:
     # Chat Session Operations
     # ============================================================================
     
-    def create_chat_session(self, session_id: str, title: str = "New Chat") -> ChatSession:
+    def create_chat_session(
+        self,
+        session_id: str,
+        title: str = "New Chat",
+        owner_user_id: Optional[str] = None,
+    ) -> ChatSession:
         """Create a new chat session.
         
         Args:
@@ -468,19 +511,39 @@ class DatabaseManager:
             title: Session title (defaults to "New Chat")
             
         Returns:
-            Created ChatSession
+            Created or existing ChatSession
         """
         with self.get_session() as session:
+            # If a session with this ID already exists, reuse it instead of
+            # trying to insert a duplicate primary key. This makes the method
+            # idempotent and also lets us "adopt" legacy sessions that were
+            # created before owner_user_id was introduced.
+            existing = (
+                session.query(ChatSession)
+                .filter_by(session_id=session_id)
+                .first()
+            )
+            if existing:
+                # If the existing row has no owner yet and we now know who
+                # owns it, attach the owner and bump updated_at.
+                if owner_user_id and not existing.owner_user_id:
+                    existing.owner_user_id = owner_user_id
+                    existing.updated_at = datetime.utcnow()
+                    session.commit()
+                    session.refresh(existing)
+                return existing
+
             chat_session = ChatSession(
                 session_id=session_id,
-                title=title
+                title=title,
+                owner_user_id=owner_user_id,
             )
             session.add(chat_session)
             session.commit()
             session.refresh(chat_session)
             return chat_session
     
-    def get_chat_session(self, session_id: str) -> Optional[ChatSession]:
+    def get_chat_session(self, session_id: str, owner_user_id: Optional[str] = None) -> Optional[ChatSession]:
         """Get a chat session by ID.
         
         Args:
@@ -490,9 +553,12 @@ class DatabaseManager:
             ChatSession if found, None otherwise
         """
         with self.get_session() as session:
-            return session.query(ChatSession).filter_by(session_id=session_id).first()
+            query = session.query(ChatSession).filter(ChatSession.session_id == session_id)
+            if owner_user_id:
+                query = query.filter(ChatSession.owner_user_id == owner_user_id)
+            return query.first()
     
-    def list_chat_sessions(self, limit: int = 50) -> List[ChatSession]:
+    def list_chat_sessions(self, owner_user_id: Optional[str] = None, limit: int = 50) -> List[ChatSession]:
         """List chat sessions ordered by last update.
         
         Args:
@@ -502,9 +568,14 @@ class DatabaseManager:
             List of ChatSession objects
         """
         with self.get_session() as session:
-            return session.query(ChatSession).order_by(
-                ChatSession.updated_at.desc()
-            ).limit(limit).all()
+            query = session.query(ChatSession)
+            if owner_user_id:
+                query = query.filter(ChatSession.owner_user_id == owner_user_id)
+            return (
+                query.order_by(ChatSession.updated_at.desc())
+                .limit(limit)
+                .all()
+            )
     
     def add_chat_message(self, session_id: str, role: str, content: str, sources: Optional[List[Dict]] = None) -> ChatMessage:
         """Add a message to a chat session.
@@ -579,14 +650,17 @@ class DatabaseManager:
                 chat_session.updated_at = datetime.utcnow()
                 session.commit()
     
-    def delete_chat_session(self, session_id: str) -> None:
+    def delete_chat_session(self, session_id: str, owner_user_id: Optional[str] = None) -> None:
         """Delete a chat session and all its messages.
         
         Args:
             session_id: Session identifier
         """
         with self.get_session() as session:
-            chat_session = session.query(ChatSession).filter_by(session_id=session_id).first()
+            query = session.query(ChatSession).filter(ChatSession.session_id == session_id)
+            if owner_user_id:
+                query = query.filter(ChatSession.owner_user_id == owner_user_id)
+            chat_session = query.first()
             if chat_session:
                 session.delete(chat_session)
                 session.commit()
@@ -604,10 +678,12 @@ class DatabaseManager:
         main_goal: Optional[str] = None,
         current_status_summary: Optional[str] = None,
         important_notes: Optional[str] = None,
+        owner_user_id: Optional[str] = None,
     ) -> Project:
         """Create a new cross-application project."""
         with self.get_session() as session:
             project = Project(
+                owner_user_id=owner_user_id,
                 name=name,
                 description=description,
                 status=status,
@@ -621,25 +697,29 @@ class DatabaseManager:
             session.refresh(project)
             return project
 
-    def list_projects(self, limit: int = 100) -> List[Project]:
+    def list_projects(self, owner_user_id: Optional[str] = None, limit: int = 100) -> List[Project]:
         """List projects ordered by most recently updated."""
         with self.get_session() as session:
-            return (
-                session.query(Project)
-                .order_by(Project.updated_at.desc())
-                .limit(limit)
-                .all()
-            )
+            query = session.query(Project)
+            if owner_user_id:
+                query = query.filter(Project.owner_user_id == owner_user_id)
+            return query.order_by(Project.updated_at.desc()).limit(limit).all()
 
-    def get_project(self, project_id: str) -> Optional[Project]:
+    def get_project(self, project_id: str, owner_user_id: Optional[str] = None) -> Optional[Project]:
         """Get a project by ID."""
         with self.get_session() as session:
-            return session.query(Project).filter_by(id=project_id).first()
+            query = session.query(Project).filter(Project.id == project_id)
+            if owner_user_id:
+                query = query.filter(Project.owner_user_id == owner_user_id)
+            return query.first()
 
-    def update_project(self, project_id: str, **fields: Any) -> Optional[Project]:
+    def update_project(self, project_id: str, owner_user_id: Optional[str] = None, **fields: Any) -> Optional[Project]:
         """Update a project's editable fields."""
         with self.get_session() as session:
-            project = session.query(Project).filter_by(id=project_id).first()
+            query = session.query(Project).filter(Project.id == project_id)
+            if owner_user_id:
+                query = query.filter(Project.owner_user_id == owner_user_id)
+            project = query.first()
             if not project:
                 return None
 
@@ -663,10 +743,13 @@ class DatabaseManager:
             session.refresh(project)
             return project
 
-    def delete_project(self, project_id: str) -> None:
+    def delete_project(self, project_id: str, owner_user_id: Optional[str] = None) -> None:
         """Delete a project and all of its source mappings."""
         with self.get_session() as session:
-            project = session.query(Project).filter_by(id=project_id).first()
+            query = session.query(Project).filter(Project.id == project_id)
+            if owner_user_id:
+                query = query.filter(Project.owner_user_id == owner_user_id)
+            project = query.first()
             if project:
                 session.delete(project)
                 session.commit()

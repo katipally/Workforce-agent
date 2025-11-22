@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
+import { API_BASE_URL } from '../../lib/api'
 
 interface ProjectSummary {
   id: string
@@ -54,9 +55,13 @@ interface ChatMessage {
   content: string
 }
 
-async function fetchJSON<T>(url: string, options?: RequestInit): Promise<T> {
+async function fetchJSON<T>(url: string, options: RequestInit = {}): Promise<T> {
   const res = await fetch(url, {
-    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(options.headers || {}),
+    },
     ...options,
   })
   if (!res.ok) {
@@ -183,7 +188,7 @@ export default function ProjectsInterface() {
   const loadSlackChannels = async () => {
     try {
       const data = await fetchJSON<{ channels: SlackChannelOption[] }>(
-        'http://localhost:8000/api/pipelines/slack/data',
+        `${API_BASE_URL}/api/pipelines/slack/data`,
       )
       setSlackChannels(data.channels || [])
     } catch (e) {
@@ -194,7 +199,7 @@ export default function ProjectsInterface() {
   const loadGmailLabels = async () => {
     try {
       const data = await fetchJSON<{ labels: GmailLabelOption[] }>(
-        'http://localhost:8000/api/pipelines/gmail/labels',
+        `${API_BASE_URL}/api/pipelines/gmail/labels`,
       )
       setGmailLabels(data.labels || [])
     } catch (e) {
@@ -205,7 +210,7 @@ export default function ProjectsInterface() {
   const loadNotionPages = async () => {
     try {
       const data = await fetchJSON<{ workspace_name: string; pages: NotionPageOption[] }>(
-        'http://localhost:8000/api/notion/hierarchy',
+        `${API_BASE_URL}/api/notion/hierarchy`,
       )
       setNotionPages(flattenNotionPages(data.pages || []))
     } catch (e) {

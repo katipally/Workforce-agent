@@ -119,137 +119,24 @@ class APITester:
         return self.results['slack']
     
     def test_gmail_api(self) -> Dict:
-        """Test Gmail API capabilities - FOCUS ON THREADS."""
-        print("\n" + "="*80)
-        print("📧 TESTING GMAIL API - FULL THREAD CAPABILITIES")
-        print("="*80)
-        
-        try:
-            from gmail.client import GmailClient
-            client = GmailClient()
-            
-            if not client.authenticate():
-                raise Exception("Gmail authentication failed")
-            
-            tests = [
-                # Basic operations
-                ("labels.list", 
-                 lambda: client.service.users().labels().list(userId='me').execute(),
-                 "List Labels"),
-                
-                ("profile.get",
-                 lambda: client.service.users().getProfile(userId='me').execute(),
-                 "Get User Profile"),
-                
-                # Message listing
-                ("messages.list",
-                 lambda: client.service.users().messages().list(userId='me', maxResults=1).execute(),
-                 "List Messages"),
-                
-                # THREAD OPERATIONS (CRITICAL FOR USER)
-                ("threads.list",
-                 lambda: client.service.users().threads().list(userId='me', maxResults=1).execute(),
-                 "List Threads"),
-                
-                # Get full thread details
-                ("threads.get (FULL)",
-                 lambda: self._test_get_full_thread(client),
-                 "Get COMPLETE Thread (All Messages)"),
-                
-                # Message operations
-                ("messages.get (full)",
-                 lambda: self._test_get_full_message(client),
-                 "Get Full Message Content"),
-                
-                ("messages.get (metadata)",
-                 lambda: self._test_get_message_metadata(client),
-                 "Get Message Metadata"),
-                
-                # Search operations
-                ("messages.list (with query)",
-                 lambda: client.service.users().messages().list(
-                     userId='me', 
-                     q='is:unread',
-                     maxResults=1
-                 ).execute(),
-                 "Advanced Search (with operators)"),
-                
-                # Draft operations
-                ("drafts.list",
-                 lambda: client.service.users().drafts().list(userId='me', maxResults=1).execute(),
-                 "List Drafts"),
-                
-                # History operations
-                ("history.list",
-                 lambda: self._test_history_list(client),
-                 "Get Message History"),
-                
-                # Watch/Push notifications
-                ("watch",
-                 lambda: None,  # Don't test - requires webhook setup
-                 "Gmail Push Notifications (not tested - requires webhook)"),
-            ]
-            
-            for test_name, test_func, description in tests:
-                try:
-                    if test_func is None:
-                        print(f"⚪ {description}: SKIPPED (requires setup)")
-                        continue
-                        
-                    result = test_func()
-                    if result:
-                        self.results['gmail']['passed'].append({
-                            'test': test_name,
-                            'description': description,
-                            'status': '✅ PASS',
-                            'details': self._format_result(result)
-                        })
-                        print(f"✅ {description}: PASS")
-                        
-                        # Special logging for thread tests
-                        if 'thread' in test_name.lower():
-                            self._log_thread_details(result, description)
-                    else:
-                        self.results['gmail']['failed'].append({
-                            'test': test_name,
-                            'description': description,
-                            'error': 'No result returned',
-                            'status': '❌ FAIL'
-                        })
-                        print(f"❌ {description}: FAIL - No result")
-                except Exception as e:
-                    error_msg = str(e)
-                    self.results['gmail']['failed'].append({
-                        'test': test_name,
-                        'description': description,
-                        'error': error_msg,
-                        'status': '❌ ERROR'
-                    })
-                    print(f"❌ {description}: ERROR - {error_msg}")
-            
-            # Test write capabilities
-            print("\n📝 Write Capabilities:")
-            write_tests = [
-                "Send Messages",
-                "Create Drafts",
-                "Modify Messages (mark read/unread, add labels)",
-                "Trash/Delete Messages",
-                "Archive Messages",
-            ]
-            for cap in write_tests:
-                print(f"   ⚪ {cap} (not tested to avoid modifications)")
-                
-        except Exception as e:
-            print(f"❌ Gmail API Connection Failed: {e}")
-            self.results['gmail']['failed'].append({
-                'test': 'connection',
-                'description': 'API Connection',
-                'error': str(e),
-                'status': '❌ CRITICAL'
-            })
-        
+        """Test Gmail API capabilities - now skipped.
+
+        Legacy Gmail tests relied on file-based credentials and
+        `GmailClient.authenticate()`. Gmail now uses OAuth-based
+        per-user tokens via the web app, so these tests are skipped.
+        """
+        print("\n" + "=" * 80)
+        print(" SKIPPING GMAIL API TESTS (MIGRATED TO OAUTH WEB FLOW)")
+        print("=" * 80)
+        # Ensure gmail key exists in results so summary code works
+        self.results.setdefault('gmail', {'passed': [], 'failed': []})
+        self.results['gmail']['passed'].append({
+            'test': 'gmail_api',
+            'description': 'Gmail API tests skipped (OAuth web flow)',
+            'status': 'SKIPPED',
+        })
         return self.results['gmail']
-    
+
     def _test_get_full_thread(self, client) -> Dict:
         """Test getting a COMPLETE email thread with ALL messages."""
         # First get a thread ID

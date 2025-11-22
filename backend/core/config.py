@@ -43,13 +43,16 @@ class Config:
     LOGS_DIR = PROJECT_ROOT / "logs"
     PROJECT_REGISTRY_FILE = PROJECT_ROOT / os.getenv("PROJECT_REGISTRY_FILE", "data/project_registry.json")
     
-    # Gmail credentials paths (relative to project root)
-    GMAIL_CREDENTIALS_FILE = os.getenv("GMAIL_CREDENTIALS_FILE", "credentials/gmail_credentials.json")
-    GMAIL_TOKEN_FILE = os.getenv("GMAIL_TOKEN_FILE", "data/gmail_token.pickle")
-    
     # Notion credentials
     NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
     NOTION_PARENT_PAGE_ID = os.getenv("NOTION_PARENT_PAGE_ID", "")
+
+    # Google OAuth (app-level)
+    GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+    GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+    GOOGLE_OAUTH_REDIRECT_BASE = os.getenv("GOOGLE_OAUTH_REDIRECT_BASE", "")
+    FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:5173")
+    SESSION_SECRET = os.getenv("SESSION_SECRET", "")
 
     # Safety & permissions configuration
     SLACK_MODE = os.getenv("SLACK_MODE", "standard").lower()

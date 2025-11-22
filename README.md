@@ -285,11 +285,16 @@ OPENAI_API_KEY=sk-your-openai-key-here
 SLACK_BOT_TOKEN=xoxb-your-slack-bot-token
 SLACK_APP_TOKEN=xapp-your-slack-app-token
 
-# Optional (add if you want Gmail/Notion)
-GMAIL_CREDENTIALS_FILE=credentials/gmail_credentials.json
-GMAIL_TOKEN_FILE=data/gmail_token.pickle
+# Notion (optional)
 NOTION_TOKEN=secret_your-notion-key
 NOTION_PARENT_PAGE_ID=your-page-id
+
+# Google OAuth (for login + per-user Gmail access)
+GOOGLE_CLIENT_ID=your-google-oauth-client-id.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=your-google-oauth-client-secret
+GOOGLE_OAUTH_REDIRECT_BASE=http://localhost:8000
+FRONTEND_BASE_URL=http://localhost:5173
+SESSION_SECRET=change-me-to-a-long-random-string
 
 # Database
 DATABASE_URL=postgresql://localhost:5432/workforce_agent
@@ -320,15 +325,18 @@ DATABASE_URL=postgresql://localhost:5432/workforce_agent
 
 **Full setup guide:** See `Documentation/api_guide.md`
 
-### **Gmail (Optional)**
+### **Gmail (Optional, via Google OAuth)**
 1. Go to https://console.cloud.google.com/
-2. Create new project
-3. Enable Gmail API
-4. Create OAuth credentials (Desktop app)
-5. Download `credentials.json`
-6. Place in `backend/core/credentials/gmail/`
+2. Create a project (or use an existing one)
+3. Enable **Gmail API**
+4. Create OAuth 2.0 **Web application** client
+5. Add authorized redirect URI: `http://localhost:8000/auth/google/callback`
+6. Copy the client ID and secret into `.env` as `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`
 
-**Full setup guide:** See `Documentation/api_guide.md`
+After configuring, start the backend and frontend, open the app, and
+click "Continue with Google" to sign in and grant Gmail access.
+
+**Full setup guide:** See `Documentation/Auth_plan.md`
 
 ### **Notion (Optional)**
 1. Go to https://www.notion.so/my-integrations
