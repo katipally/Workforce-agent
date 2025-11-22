@@ -41,6 +41,8 @@ from .models import (
     AppUser,
     UserOAuthToken,
     AppSession,
+    UserSettings,
+    AppSettings,
 )
 from utils.logger import get_logger
 
@@ -493,6 +495,75 @@ class DatabaseManager:
                 "threads": session.query(func.count(func.distinct(GmailMessage.thread_id))).scalar(),
                 "attachments": session.query(func.count(GmailAttachment.id)).scalar(),
             }
+
+    # =========================================================================
+    # Settings Operations (per-user and workspace-wide)
+    # =========================================================================
+
+    def get_user_settings(self, user_id: str) -> Optional[UserSettings]:
+        """Return UserSettings row for the given AppUser, if any."""
+        if not user_id:
+            return None
+
+        with self.get_session() as session:
+            return session.query(UserSettings).filter_by(user_id=user_id).first()
+
+    def upsert_user_settings(self, user_id: str, settings_patch: Dict[str, Any]) -> UserSettings:
+        """Create or update per-user settings.
+
+        The patch is merged into the existing JSON document. Keys with value
+        None are removed from the settings dict; all other keys overwrite
+        previous values.
+        """
+        if not user_id:
+            raise ValueError("user_id is required for upsert_user_settings")
+
+        with self.get_session() as session:
+            row = session.query(UserSettings).filter_by(user_id=user_id).first()
+            if not row:
+                row = UserSettings(user_id=user_id, settings={})
+                session.add(row)
+
+            current = dict(row.settings or {})
+            for key, value in (settings_patch or {}).items():
+                if value is None:
+                    current.pop(key, None)
+                else:
+                    current[key] = value
+            row.settings = current
+            row.updated_at = datetime.utcnow()
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def get_app_settings(self, scope: str = "global") -> Optional[AppSettings]:
+        """Return AppSettings for the given scope (default: 'global')."""
+        with self.get_session() as session:
+            return session.query(AppSettings).filter_by(scope=scope).first()
+
+    def upsert_app_settings(self, settings_patch: Dict[str, Any], scope: str = "global") -> AppSettings:
+        """Create or update workspace-wide application settings.
+
+        Like user settings, this merges the patch into the existing JSON
+        document, removing keys whose value is None.
+        """
+        with self.get_session() as session:
+            row = session.query(AppSettings).filter_by(scope=scope).first()
+            if not row:
+                row = AppSettings(scope=scope, settings={})
+                session.add(row)
+
+            current = dict(row.settings or {})
+            for key, value in (settings_patch or {}).items():
+                if value is None:
+                    current.pop(key, None)
+                else:
+                    current[key] = value
+            row.settings = current
+            row.updated_at = datetime.utcnow()
+            session.commit()
+            session.refresh(row)
+            return row
     
     # ============================================================================
     # Chat Session Operations

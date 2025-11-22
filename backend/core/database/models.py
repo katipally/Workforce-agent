@@ -680,3 +680,36 @@ class AppSession(Base):
         Index("idx_app_session_user", "user_id"),
         Index("idx_app_session_expires", "expires_at"),
     )
+
+
+class UserSettings(Base):
+    """Per-user settings (e.g., personal API keys, preferences).
+
+    Stored as a JSON document so we can evolve settings without schema
+    migrations. There is at most one row per AppUser.
+    """
+
+    __tablename__ = "user_settings"
+
+    user_id = Column(String(50), ForeignKey("app_users.id"), primary_key=True)
+    settings = Column(JSON, default=dict)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AppSettings(Base):
+    """Application / workspace-wide settings.
+
+    For now we treat a single row with scope="global" as the shared settings
+    document for this deployment.
+    """
+
+    __tablename__ = "app_settings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    scope = Column(String(50), unique=True, default="global")
+    settings = Column(JSON, default=dict)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("idx_app_settings_scope", "scope"),
+    )
