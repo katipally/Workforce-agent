@@ -313,22 +313,34 @@ async def get_rag_engine() -> HybridRAGEngine:
         loop = asyncio.get_running_loop()
         logger.info("Initializing RAG engine...")
 
+        # Resolve AI infrastructure and OpenAI key from workspace settings where possible,
+        # falling back to Config for defaults.
+        settings_view = get_workspace_settings_view(db_manager, include_secrets=False)
+        ai_infra = settings_view.get("ai_infra") or {}
+
+        embedding_model_name = ai_infra.get("embedding_model") or Config.EMBEDDING_MODEL
+        reranker_model_name = ai_infra.get("reranker_model") or Config.RERANKER_MODEL
+        use_gpu = ai_infra.get("use_gpu") if "use_gpu" in ai_infra else Config.USE_GPU
+
+        # Workspace-global OpenAI key (from system section or Config fallback)
+        openai_key = get_effective_openai_key(db_manager, user_id="")
+
         embedding, reranker = await loop.run_in_executor(
             None,
             lambda: (
                 SentenceTransformerEmbedding(
-                    model_name=Config.EMBEDDING_MODEL,
-                    use_gpu=Config.USE_GPU,
+                    model_name=embedding_model_name,
+                    use_gpu=use_gpu,
                 ),
                 SentenceTransformerReranker(
-                    model_name=Config.RERANKER_MODEL,
-                    use_gpu=Config.USE_GPU,
+                    model_name=reranker_model_name,
+                    use_gpu=use_gpu,
                 ),
             ),
         )
 
         rag_engine = HybridRAGEngine(
-            openai_api_key=Config.OPENAI_API_KEY,
+            openai_api_key=openai_key or Config.OPENAI_API_KEY,
             embedding_model=embedding,
             reranker_model=reranker,
         )
@@ -353,7 +365,7 @@ async def _build_ai_brain_for_user(current_user: AppUser) -> WorkforceAIBrain:
     if not api_key:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="OpenAI API key not configured. Please set your key in Personal Settings.",
+            detail="OpenAI API key not configured. Please set the global key in Workspace settings.",
         )
 
     model = get_effective_llm_model(db_manager, current_user.id)
@@ -706,12 +718,14 @@ class WorkspaceSettingsUpdate(BaseModel):
     the underlying AppSettings JSON document.
     """
 
+    system: Optional[Dict[str, Any]] = None
     slack: Optional[Dict[str, Any]] = None
     notion: Optional[Dict[str, Any]] = None
     gmail: Optional[Dict[str, Any]] = None
     workspace: Optional[Dict[str, Any]] = None
     runtime: Optional[Dict[str, Any]] = None
     database: Optional[Dict[str, Any]] = None
+    ai_infra: Optional[Dict[str, Any]] = None
     
 
 class ProjectSourcePayload(BaseModel):
@@ -843,8 +857,16 @@ async def update_workspace_settings_endpoint(
 ):
     """Update workspace-wide settings."""
 
+    global rag_engine, ai_brain
+
     data = payload.dict(exclude_unset=True)
-    return update_workspace_settings(db_manager, data)
+    result = update_workspace_settings(db_manager, data)
+
+    # Clear cached AI engines so they are rebuilt with new settings on next use.
+    rag_engine = None
+    ai_brain = None
+
+    return result
 
 
 @app.get("/api/settings/options/timezones")

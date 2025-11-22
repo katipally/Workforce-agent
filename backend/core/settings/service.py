@@ -168,30 +168,33 @@ def update_personal_settings(
 
 
 def get_effective_openai_key(db: DatabaseManager, user_id: str) -> Optional[str]:
-    """Resolve the OpenAI API key for a given user.
+    """Resolve the OpenAI API key for the workspace.
 
-    Order:
-    1. Personal key in UserSettings (encrypted).
-    2. Config.OPENAI_API_KEY from environment as optional global backup.
+    New behavior: use a single workspace-level key that applies to all users,
+    falling back to Config.OPENAI_API_KEY from the environment if unset.
     """
 
-    row = db.get_user_settings(user_id)
-    raw = row.settings if row and row.settings else {}
-    enc_key = raw.get("openai_api_key")
+    raw_app = _get_raw_app_settings(db)
+    system_raw = raw_app.get("system") or {}
+
+    enc_key = system_raw.get("openai_api_key")
     if enc_key:
-        key = decrypt_secret(enc_key)
-        if key:
-            return key
+        try:
+            key = decrypt_secret(enc_key)
+            if key:
+                return key
+        except Exception:
+            logger.error("Failed to decrypt global OpenAI API key from settings", exc_info=True)
 
     return Config.OPENAI_API_KEY or None
 
 
 def get_effective_llm_model(db: DatabaseManager, user_id: str) -> str:
-    """Resolve the default LLM model for a given user."""
+    """Resolve the default LLM model for the workspace."""
 
-    row = db.get_user_settings(user_id)
-    raw = row.settings if row and row.settings else {}
-    model = raw.get("llm_model") or Config.LLM_MODEL
+    raw_app = _get_raw_app_settings(db)
+    system_raw = raw_app.get("system") or {}
+    model = system_raw.get("llm_model") or Config.LLM_MODEL
     return model
 
 
@@ -219,6 +222,7 @@ def get_workspace_settings_view(
 
     raw = _get_raw_app_settings(db)
 
+    system_raw = raw.get("system") or {}
     slack_raw = raw.get("slack") or {}
     notion_raw = raw.get("notion") or {}
     gmail_raw = raw.get("gmail") or {}
@@ -227,23 +231,75 @@ def get_workspace_settings_view(
     database_raw = raw.get("database") or {}
     ai_infra_raw = raw.get("ai_infra") or {}
 
+    # System / global config
+    openai_view = _secret_view(system_raw.get("openai_api_key"), Config.OPENAI_API_KEY)
+    google_secret_view = _secret_view(system_raw.get("google_client_secret"), Config.GOOGLE_CLIENT_SECRET)
+    session_secret_view = _secret_view(None, Config.SESSION_SECRET)
+
+    system_section: Dict[str, Any] = {
+        "openai_api_key_set": openai_view["set"],
+        "openai_api_key_last4": openai_view["last4"],
+        "llm_model": system_raw.get("llm_model") or Config.LLM_MODEL,
+        "timezone": system_raw.get("timezone"),
+        "google_client_id": system_raw.get("google_client_id") or Config.GOOGLE_CLIENT_ID,
+        "google_client_secret_set": google_secret_view["set"],
+        "google_client_secret_last4": google_secret_view["last4"],
+        "google_oauth_redirect_base": system_raw.get("google_oauth_redirect_base")
+        or Config.GOOGLE_OAUTH_REDIRECT_BASE,
+        "session_secret_set": session_secret_view["set"],
+        "session_secret_last4": session_secret_view["last4"],
+    }
+
     # Slack secrets
     slack_bot = _secret_view(slack_raw.get("bot_token"), Config.SLACK_BOT_TOKEN)
     slack_user = _secret_view(slack_raw.get("user_token"), Config.SLACK_USER_TOKEN)
+    slack_app = _secret_view(slack_raw.get("app_token"), Config.SLACK_APP_TOKEN)
 
     slack_section: Dict[str, Any] = {
         "bot_token_set": slack_bot["set"],
         "bot_token_last4": slack_bot["last4"],
         "user_token_set": slack_user["set"],
         "user_token_last4": slack_user["last4"],
+        "app_token_set": slack_app["set"],
+        "app_token_last4": slack_app["last4"],
         "mode": slack_raw.get("mode") or Config.SLACK_MODE,
         "readonly_channels": slack_raw.get("readonly_channels")
         or _split_csv(Config.SLACK_READONLY_CHANNELS),
         "blocked_channels": slack_raw.get("blocked_channels")
         or _split_csv(Config.SLACK_BLOCKED_CHANNELS),
+        "app_id": slack_raw.get("app_id") or Config.SLACK_APP_ID,
+        "client_id": slack_raw.get("client_id") or Config.SLACK_CLIENT_ID,
+        "client_secret": slack_raw.get("client_secret") or Config.SLACK_CLIENT_SECRET,
+        "signing_secret": slack_raw.get("signing_secret") or Config.SLACK_SIGNING_SECRET,
+        "verification_token": slack_raw.get("verification_token") or Config.SLACK_VERIFICATION_TOKEN,
     }
 
     if include_secrets:
+        # System secrets (global OpenAI key, Google client secret, session secret)
+        openai_value: Optional[str] = None
+        enc_openai = system_raw.get("openai_api_key")
+        if enc_openai:
+            try:
+                openai_value = decrypt_secret(enc_openai) or None
+            except Exception:
+                logger.error("Failed to decrypt global OpenAI API key from settings", exc_info=True)
+        if not openai_value and Config.OPENAI_API_KEY:
+            openai_value = Config.OPENAI_API_KEY
+        system_section["openai_api_key_value"] = openai_value
+
+        google_secret_value: Optional[str] = None
+        enc_google = system_raw.get("google_client_secret")
+        if enc_google:
+            try:
+                google_secret_value = decrypt_secret(enc_google) or None
+            except Exception:
+                logger.error("Failed to decrypt Google client secret from settings", exc_info=True)
+        if not google_secret_value and Config.GOOGLE_CLIENT_SECRET:
+            google_secret_value = Config.GOOGLE_CLIENT_SECRET
+        system_section["google_client_secret_value"] = google_secret_value
+
+        system_section["session_secret_value"] = Config.SESSION_SECRET or None
+
         bot_value: Optional[str] = None
         enc_bot = slack_raw.get("bot_token")
         if enc_bot:
@@ -265,6 +321,17 @@ def get_workspace_settings_view(
         if not user_value and Config.SLACK_USER_TOKEN:
             user_value = Config.SLACK_USER_TOKEN
         slack_section["user_token_value"] = user_value
+
+        app_value: Optional[str] = None
+        enc_app = slack_raw.get("app_token")
+        if enc_app:
+            try:
+                app_value = decrypt_secret(enc_app) or None
+            except Exception:
+                logger.error("Failed to decrypt Slack app token from settings", exc_info=True)
+        if not app_value and Config.SLACK_APP_TOKEN:
+            app_value = Config.SLACK_APP_TOKEN
+        slack_section["app_token_value"] = app_value
 
     # Notion
     notion_token_view = _secret_view(notion_raw.get("token"), Config.NOTION_TOKEN)
@@ -329,17 +396,18 @@ def get_workspace_settings_view(
         or str(Config.PROJECT_REGISTRY_FILE),
     }
 
-    # AI infrastructure (read-only in UI)
+    # AI infrastructure
     ai_infra_section = {
         "embedding_model": ai_infra_raw.get("embedding_model") or Config.EMBEDDING_MODEL,
         "reranker_model": ai_infra_raw.get("reranker_model") or Config.RERANKER_MODEL,
         "embedding_batch_size": ai_infra_raw.get("embedding_batch_size")
         or Config.EMBEDDING_BATCH_SIZE,
         "use_gpu": ai_infra_raw.get("use_gpu") if "use_gpu" in ai_infra_raw else Config.USE_GPU,
-        "editable": False,
+        "editable": True,
     }
 
     return {
+        "system": system_section,
         "slack": slack_section,
         "notion": notion_section,
         "gmail": gmail_section,
@@ -354,13 +422,51 @@ def update_workspace_settings(db: DatabaseManager, payload: Dict[str, Any]) -> D
     """Apply a partial update to workspace-wide settings.
 
     The payload is expected to be grouped by section (slack, notion, gmail,
-    workspace, runtime, database). The ai_infra section is intentionally
-    ignored for writes (read-only in UI).
+    workspace, runtime, database, ai_infra). Database and ai_infra sections
+    are written back to AppSettings and mirrored into the .env file.
     """
 
     raw = _get_raw_app_settings(db)
     patch: Dict[str, Any] = {}
     env_updates: Dict[str, str] = {}
+
+    # System / global section
+    system_update = payload.get("system")
+    if isinstance(system_update, dict):
+        current = dict(raw.get("system") or {})
+
+        if "openai_api_key" in system_update:
+            val = system_update.get("openai_api_key")
+            if val:
+                current["openai_api_key"] = encrypt_secret(str(val))
+                env_updates["OPENAI_API_KEY"] = str(val)
+            else:
+                current.pop("openai_api_key", None)
+                env_updates["OPENAI_API_KEY"] = ""
+
+        if "google_client_secret" in system_update:
+            val = system_update.get("google_client_secret")
+            if val:
+                current["google_client_secret"] = encrypt_secret(str(val))
+                env_updates["GOOGLE_CLIENT_SECRET"] = str(val)
+            else:
+                current.pop("google_client_secret", None)
+                env_updates["GOOGLE_CLIENT_SECRET"] = ""
+
+        for key in ["llm_model", "timezone", "google_client_id", "google_oauth_redirect_base"]:
+            if key in system_update:
+                value = system_update.get(key)
+                current[key] = value
+
+                if key == "llm_model":
+                    env_updates["LLM_MODEL"] = str(value or "")
+                elif key == "google_client_id":
+                    env_updates["GOOGLE_CLIENT_ID"] = str(value or "")
+                elif key == "google_oauth_redirect_base":
+                    env_updates["GOOGLE_OAUTH_REDIRECT_BASE"] = str(value or "")
+                # timezone is stored only in AppSettings; no env var today
+
+        patch["system"] = current
 
     # Slack section
     slack_update = payload.get("slack")
@@ -380,8 +486,10 @@ def update_workspace_settings(db: DatabaseManager, payload: Dict[str, Any]) -> D
             val = slack_update.get("app_token")
             if val:
                 current["app_token"] = encrypt_secret(str(val))
+                env_updates["SLACK_APP_TOKEN"] = str(val)
             else:
                 current.pop("app_token", None)
+                env_updates["SLACK_APP_TOKEN"] = ""
 
         # Non-secret fields
         for key in [
@@ -398,13 +506,25 @@ def update_workspace_settings(db: DatabaseManager, payload: Dict[str, Any]) -> D
 
                 if key == "mode" and value is not None:
                     env_updates["SLACK_MODE"] = str(value)
+                elif key == "app_id":
+                    env_updates["SLACK_APP_ID"] = str(value or "")
+                elif key == "client_id":
+                    env_updates["SLACK_CLIENT_ID"] = str(value or "")
+                elif key == "client_secret":
+                    env_updates["SLACK_CLIENT_SECRET"] = str(value or "")
+                elif key == "signing_secret":
+                    env_updates["SLACK_SIGNING_SECRET"] = str(value or "")
+                elif key == "verification_token":
+                    env_updates["SLACK_VERIFICATION_TOKEN"] = str(value or "")
 
         if "user_token" in slack_update:
             val = slack_update.get("user_token")
             if val:
                 current["user_token"] = encrypt_secret(str(val))
+                env_updates["SLACK_USER_TOKEN"] = str(val)
             else:
                 current.pop("user_token", None)
+                env_updates["SLACK_USER_TOKEN"] = ""
 
         if "readonly_channels" in slack_update:
             current["readonly_channels"] = slack_update.get("readonly_channels") or []
@@ -538,10 +658,46 @@ def update_workspace_settings(db: DatabaseManager, payload: Dict[str, Any]) -> D
             "project_registry_file",
         ]:
             if key in database_update:
-                current[key] = database_update.get(key)
+                value = database_update.get(key)
+                current[key] = value
+
+                if key == "database_url":
+                    env_updates["DATABASE_URL"] = str(value or "")
+                elif key == "data_dir":
+                    env_updates["DATA_DIR"] = str(value or "")
+                elif key == "files_dir":
+                    env_updates["FILES_DIR"] = str(value or "")
+                elif key == "export_dir":
+                    env_updates["EXPORT_DIR"] = str(value or "")
+                elif key == "project_registry_file":
+                    env_updates["PROJECT_REGISTRY_FILE"] = str(value or "")
+
         patch["database"] = current
 
-    # ai_infra is intentionally read-only; we ignore any updates
+    # AI infrastructure
+    ai_infra_update = payload.get("ai_infra")
+    if isinstance(ai_infra_update, dict):
+        current = dict(raw.get("ai_infra") or {})
+        for key in [
+            "embedding_model",
+            "reranker_model",
+            "embedding_batch_size",
+            "use_gpu",
+        ]:
+            if key in ai_infra_update:
+                value = ai_infra_update.get(key)
+                current[key] = value
+
+                if key == "embedding_model":
+                    env_updates["EMBEDDING_MODEL"] = str(value or "")
+                elif key == "reranker_model":
+                    env_updates["RERANKER_MODEL"] = str(value or "")
+                elif key == "embedding_batch_size":
+                    env_updates["EMBEDDING_BATCH_SIZE"] = "" if value is None else str(value)
+                elif key == "use_gpu":
+                    env_updates["USE_GPU"] = "true" if bool(value) else "false"
+
+        patch["ai_infra"] = current
 
     if patch:
         db.upsert_app_settings(patch)
@@ -602,13 +758,39 @@ def bootstrap_app_settings_from_config_if_empty(db: DatabaseManager) -> None:
 
     patch: Dict[str, Any] = {}
 
+    system_section: Dict[str, Any] = {}
+    if Config.OPENAI_API_KEY:
+        system_section["openai_api_key"] = encrypt_secret(Config.OPENAI_API_KEY)
+    if Config.LLM_MODEL:
+        system_section["llm_model"] = Config.LLM_MODEL
+    if Config.GOOGLE_CLIENT_ID:
+        system_section["google_client_id"] = Config.GOOGLE_CLIENT_ID
+    if Config.GOOGLE_CLIENT_SECRET:
+        system_section["google_client_secret"] = encrypt_secret(Config.GOOGLE_CLIENT_SECRET)
+    if Config.GOOGLE_OAUTH_REDIRECT_BASE:
+        system_section["google_oauth_redirect_base"] = Config.GOOGLE_OAUTH_REDIRECT_BASE
+    if system_section:
+        patch["system"] = system_section
+
     slack_section: Dict[str, Any] = {}
     if Config.SLACK_BOT_TOKEN:
         slack_section["bot_token"] = encrypt_secret(Config.SLACK_BOT_TOKEN)
     if Config.SLACK_APP_TOKEN:
         slack_section["app_token"] = encrypt_secret(Config.SLACK_APP_TOKEN)
+    if Config.SLACK_USER_TOKEN:
+        slack_section["user_token"] = encrypt_secret(Config.SLACK_USER_TOKEN)
     if Config.SLACK_MODE:
         slack_section["mode"] = Config.SLACK_MODE
+    if Config.SLACK_APP_ID:
+        slack_section["app_id"] = Config.SLACK_APP_ID
+    if Config.SLACK_CLIENT_ID:
+        slack_section["client_id"] = Config.SLACK_CLIENT_ID
+    if Config.SLACK_CLIENT_SECRET:
+        slack_section["client_secret"] = Config.SLACK_CLIENT_SECRET
+    if Config.SLACK_SIGNING_SECRET:
+        slack_section["signing_secret"] = Config.SLACK_SIGNING_SECRET
+    if Config.SLACK_VERIFICATION_TOKEN:
+        slack_section["verification_token"] = Config.SLACK_VERIFICATION_TOKEN
     readonly = _split_csv(Config.SLACK_READONLY_CHANNELS)
     if readonly:
         slack_section["readonly_channels"] = readonly
