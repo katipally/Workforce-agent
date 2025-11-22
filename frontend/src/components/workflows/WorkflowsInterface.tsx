@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { API_BASE_URL } from '../../lib/api'
 
 interface WorkflowChannel {
   slack_channel_id: string
@@ -82,7 +83,9 @@ export default function WorkflowsInterface() {
     try {
       setLoading(true)
       setError(null)
-      const res = await fetch('http://localhost:8000/api/workflows')
+      const res = await fetch(`${API_BASE_URL}/api/workflows`, {
+        credentials: 'include',
+      })
       if (!res.ok) {
         throw new Error(`Failed to load workflows: ${res.status}`)
       }
@@ -98,7 +101,9 @@ export default function WorkflowsInterface() {
 
   const loadSlackChannels = async () => {
     try {
-      const res = await fetch('http://localhost:8000/api/pipelines/slack/data')
+      const res = await fetch(`${API_BASE_URL}/api/pipelines/slack/data`, {
+        credentials: 'include',
+      })
       if (!res.ok) {
         throw new Error(`Failed to load Slack channels: ${res.status}`)
       }
@@ -171,9 +176,10 @@ export default function WorkflowsInterface() {
     try {
       setError(null)
       setLoading(true)
-      const res = await fetch('http://localhost:8000/api/workflows', {
+      const res = await fetch(`${API_BASE_URL}/api/workflows`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({
           name,
           type: 'slack_to_notion',
@@ -198,9 +204,10 @@ export default function WorkflowsInterface() {
   const handleUpdateInterval = async (workflow: Workflow, newInterval: number) => {
     try {
       setError(null)
-      const res = await fetch(`http://localhost:8000/api/workflows/${workflow.id}`, {
+      const res = await fetch(`${API_BASE_URL}/api/workflows/${workflow.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({ poll_interval_seconds: newInterval }),
       })
       if (!res.ok) {
@@ -218,8 +225,9 @@ export default function WorkflowsInterface() {
     try {
       setError(null)
       setRunOnceLoading(true)
-      const res = await fetch(`http://localhost:8000/api/workflows/${workflow.id}/run-once`, {
+      const res = await fetch(`${API_BASE_URL}/api/workflows/${workflow.id}/run-once`, {
         method: 'POST',
+        credentials: 'include',
       })
       if (!res.ok) {
         throw new Error(`Failed to run workflow once: ${res.status}`)
@@ -246,10 +254,11 @@ export default function WorkflowsInterface() {
     try {
       setError(null)
       const res = await fetch(
-        `http://localhost:8000/api/workflows/${selectedWorkflow.id}/channels`,
+        `${API_BASE_URL}/api/workflows/${selectedWorkflow.id}/channels`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
           body: JSON.stringify([
             {
               slack_channel_id: channel.channel_id,
@@ -273,11 +282,10 @@ export default function WorkflowsInterface() {
     try {
       setError(null)
       const res = await fetch(
-        `http://localhost:8000/api/workflows/${workflowId}/channels/${encodeURIComponent(
-          slackChannelId,
-        )}`,
+        `${API_BASE_URL}/api/workflows/${workflowId}/channels/${encodeURIComponent(slackChannelId)}`,
         {
           method: 'DELETE',
+          credentials: 'include',
         },
       )
       if (!res.ok) {

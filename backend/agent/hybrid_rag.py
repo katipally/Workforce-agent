@@ -294,7 +294,12 @@ class HybridRAGEngine:
         logger.info(f"Classified intent: {intent}")
         return intent
     
-    def _vector_search(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+    def _vector_search(
+        self,
+        query: str,
+        limit: int = 20,
+        gmail_account_email: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """Semantic search using Qwen3 embeddings.
         
         Args:
@@ -348,7 +353,11 @@ class HybridRAGEngine:
                     })
             
             # Search Gmail messages
-            gmail_messages = session.query(GmailMessage).limit(1000).all()
+            gmail_query = session.query(GmailMessage)
+            if gmail_account_email:
+                gmail_query = gmail_query.filter(GmailMessage.account_email == gmail_account_email)
+
+            gmail_messages = gmail_query.limit(1000).all()
             
             for email in gmail_messages:
                 # Use generic embedding column for semantic search
@@ -417,7 +426,12 @@ class HybridRAGEngine:
         logger.info(f"Vector search found {len(results[:limit])} results")
         return results[:limit]
     
-    def _keyword_search(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+    def _keyword_search(
+        self,
+        query: str,
+        limit: int = 20,
+        gmail_account_email: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """Keyword search using PostgreSQL full-text search.
         
         Args:
@@ -466,15 +480,15 @@ class HybridRAGEngine:
                 })
             
             # Search Gmail messages
-            gmail_messages = (
-                session.query(GmailMessage)
-                .filter(
-                    (GmailMessage.subject.ilike(f'%{query}%'))
-                    | (GmailMessage.body_text.ilike(f'%{query}%'))
-                )
-                .limit(limit)
-                .all()
+            gmail_query = session.query(GmailMessage).filter(
+                (GmailMessage.subject.ilike(f'%{query}%'))
+                | (GmailMessage.body_text.ilike(f'%{query}%'))
             )
+
+            if gmail_account_email:
+                gmail_query = gmail_query.filter(GmailMessage.account_email == gmail_account_email)
+
+            gmail_messages = gmail_query.limit(limit).all()
             
             for email in gmail_messages:
                 results.append({
@@ -566,6 +580,7 @@ class HybridRAGEngine:
         label_ids: Optional[List[str]] = None,
         notion_page_ids: Optional[List[str]] = None,
         limit: int = 20,
+        gmail_account_email: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Vector search restricted to specific Slack channels, Gmail labels, and Notion pages.
 
@@ -634,12 +649,12 @@ class HybridRAGEngine:
                     cast(GmailMessage.label_ids, JSONB).contains([lbl])
                     for lbl in label_ids
                 ]
-                gmail_messages = (
-                    session.query(GmailMessage)
-                    .filter(or_(*label_filters))
-                    .limit(500)
-                    .all()
-                )
+                gmail_query = session.query(GmailMessage).filter(or_(*label_filters))
+
+                if gmail_account_email:
+                    gmail_query = gmail_query.filter(GmailMessage.account_email == gmail_account_email)
+
+                gmail_messages = gmail_query.limit(500).all()
                 
                 for email in gmail_messages:
                     if email.embedding is not None:
@@ -708,6 +723,7 @@ class HybridRAGEngine:
         label_ids: Optional[List[str]] = None,
         notion_page_ids: Optional[List[str]] = None,
         limit: int = 20,
+        gmail_account_email: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Keyword search restricted to specific Slack channels, Gmail labels, and Notion pages.
         
@@ -765,7 +781,7 @@ class HybridRAGEngine:
                     cast(GmailMessage.label_ids, JSONB).contains([lbl])
                     for lbl in label_ids
                 ]
-                gmail_messages = (
+                gmail_query = (
                     session.query(GmailMessage)
                     .filter(or_(*label_filters))
                     .filter(
@@ -774,9 +790,12 @@ class HybridRAGEngine:
                             GmailMessage.body_text.ilike(f'%{query}%')
                         )
                     )
-                    .limit(limit)
-                    .all()
                 )
+
+                if gmail_account_email:
+                    gmail_query = gmail_query.filter(GmailMessage.account_email == gmail_account_email)
+
+                gmail_messages = gmail_query.limit(limit).all()
                 
                 for email in gmail_messages:
                     results.append({
@@ -832,6 +851,7 @@ class HybridRAGEngine:
         label_ids: Optional[List[str]] = None,
         notion_page_ids: Optional[List[str]] = None,
         top_k: int = 5,
+        gmail_account_email: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Hybrid retrieval with reranking, restricted to specific sources.
 
@@ -848,6 +868,7 @@ class HybridRAGEngine:
             label_ids=label_ids,
             notion_page_ids=notion_page_ids,
             limit=20,
+            gmail_account_email=gmail_account_email,
         )
 
         # Step 2: Keyword search (scoped)
@@ -857,6 +878,7 @@ class HybridRAGEngine:
             label_ids=label_ids,
             notion_page_ids=notion_page_ids,
             limit=20,
+            gmail_account_email=gmail_account_email,
         )
 
         # Step 3: RRF fusion
@@ -887,7 +909,12 @@ class HybridRAGEngine:
 
         return []
 
-    def _retrieve_context(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def _retrieve_context(
+        self,
+        query: str,
+        top_k: int = 5,
+        gmail_account_email: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """Hybrid retrieval with reranking.
         
         Args:
@@ -900,10 +927,18 @@ class HybridRAGEngine:
         logger.info(f"Retrieving context for: {query}")
         
         # Step 1: Vector search
-        vector_results = self._vector_search(query, limit=20)
+        vector_results = self._vector_search(
+            query,
+            limit=20,
+            gmail_account_email=gmail_account_email,
+        )
         
         # Step 2: Keyword search
-        keyword_results = self._keyword_search(query, limit=20)
+        keyword_results = self._keyword_search(
+            query,
+            limit=20,
+            gmail_account_email=gmail_account_email,
+        )
         
         # Step 3: RRF fusion
         fused_results = self._rrf_fusion(vector_results, keyword_results)
@@ -1061,6 +1096,7 @@ Answer the question based on the context above. Be concise and accurate."""
         project_name: Optional[str] = None,
         conversation_history: Optional[List[Dict[str, str]]] = None,
         force_search: bool = False,
+        gmail_account_email: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Project-scoped query that only uses data from mapped sources.
 
@@ -1083,6 +1119,7 @@ Answer the question based on the context above. Be concise and accurate."""
                 label_ids=label_ids or [],
                 notion_page_ids=notion_page_ids or [],
                 top_k=5,
+                gmail_account_email=gmail_account_email,
             )
 
             # ------------------------------------------------------------------
@@ -1135,6 +1172,13 @@ Answer the question based on the context above. Be concise and accurate."""
                     # Gmail: recent messages for mapped labels
                     if label_ids:
                         gmail_query = session.query(GmailMessage)
+
+                        # Scope by Gmail account for multi-tenant safety
+                        if gmail_account_email:
+                            gmail_query = gmail_query.filter(
+                                GmailMessage.account_email == gmail_account_email
+                            )
+
                         label_filters = [
                             cast(GmailMessage.label_ids, JSONB).contains([lbl])
                             for lbl in label_ids

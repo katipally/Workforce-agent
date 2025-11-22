@@ -160,7 +160,15 @@ class NotionClient:
             logger.info(f"Appended {len(blocks)} blocks to {block_id} (ids={len(created_ids)})")
             return created_ids
         except APIResponseError as error:
-            logger.error(f"Error appending blocks with ids: {error}")
+            msg = str(error).lower()
+            if "archived" in msg:
+                logger.warning(
+                    "Cannot append blocks to archived Notion block %s; skipping. Error: %s",
+                    block_id,
+                    error,
+                )
+            else:
+                logger.error(f"Error appending blocks with ids: {error}")
             return []
     
     def update_bulleted_list_item(self, block_id: str, text: str) -> bool:
@@ -183,7 +191,15 @@ class NotionClient:
             )
             return True
         except APIResponseError as error:
-            logger.error(f"Error updating bulleted list item: {error}")
+            msg = str(error).lower()
+            if "archived" in msg:
+                logger.warning(
+                    "Cannot update archived Notion block %s; skipping. Error: %s",
+                    block_id,
+                    error,
+                )
+            else:
+                logger.error(f"Error updating bulleted list item: {error}")
             return False
     
     def create_heading(self, text: str, level: int = 2) -> Dict[str, Any]:
@@ -269,3 +285,31 @@ class NotionClient:
             "type": "divider",
             "divider": {}
         }
+
+    def is_block_archived(self, block_id: str) -> Optional[bool]:
+        """Return True if the given block/page is archived in Notion.
+
+        Tries to retrieve the object first as a block, then as a page.
+        Returns None if it cannot be retrieved.
+        """
+        if not self.client:
+            logger.error("Notion client not initialized")
+            return None
+
+        # Try as a block first
+        try:
+            block = self.client.blocks.retrieve(block_id=block_id)
+            return bool(block.get("archived"))
+        except APIResponseError as block_error:
+            # If it isn't a block, try retrieving as a page
+            try:
+                page = self.client.pages.retrieve(page_id=block_id)
+                return bool(page.get("archived"))
+            except APIResponseError as page_error:
+                logger.error(
+                    "Failed to retrieve Notion block/page %s: %s / %s",
+                    block_id,
+                    block_error,
+                    page_error,
+                )
+                return None

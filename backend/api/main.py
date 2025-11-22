@@ -116,10 +116,12 @@ def _delete_app_session(session_id: str) -> None:
             session.commit()
 
 
-def get_current_user(request: Request) -> AppUser:
-    session_id = request.cookies.get(SESSION_COOKIE_NAME)
+def _get_user_from_session_id(session_id: Optional[str]) -> AppUser:
     if not session_id:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+        )
 
     with db_manager.get_session() as session:
         app_session = session.query(AppSession).filter_by(id=session_id).first()
@@ -127,17 +129,33 @@ def get_current_user(request: Request) -> AppUser:
             if app_session:
                 session.delete(app_session)
                 session.commit()
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session expired")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session expired",
+            )
 
         user = session.query(AppUser).filter_by(id=app_session.user_id).first()
         if not user:
             session.delete(app_session)
             session.commit()
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="User not found",
+            )
 
         app_session.last_seen_at = datetime.utcnow()
         session.commit()
         return user
+
+
+def get_current_user(request: Request) -> AppUser:
+    session_id = request.cookies.get(SESSION_COOKIE_NAME)
+    return _get_user_from_session_id(session_id)
+
+
+def get_current_user_from_websocket(websocket: WebSocket) -> AppUser:
+    session_id = websocket.cookies.get(SESSION_COOKIE_NAME)
+    return _get_user_from_session_id(session_id)
 
 
 def get_current_user_with_gmail(request: Request) -> AppUser:
@@ -738,7 +756,10 @@ async def health():
 
 
 @app.post("/api/chat/message", response_model=ChatResponse)
-async def chat_message(request: ChatRequest):
+async def chat_message(
+    request: ChatRequest,
+    current_user: AppUser = Depends(get_current_user),
+):
     """Non-streaming chat endpoint with AI Brain and tool calling.
     
     Routes through AI Brain for consistent behavior with WebSocket endpoint.
@@ -752,14 +773,15 @@ async def chat_message(request: ChatRequest):
     """
     try:
         brain = await get_ai_brain()
-        
+
         # Collect streaming response into single output
         full_response = ""
         sources = []
         
         async for event in brain.stream_query(
             request.query,
-            request.conversation_history or []
+            request.conversation_history or [],
+            user_email=current_user.email,
         ):
             if event.get('type') == 'token':
                 full_response += event.get('content', '')
@@ -811,8 +833,19 @@ async def websocket_chat(websocket: WebSocket):
     - Session management for multiple chats
     - Proper disconnect handling (1000, 1001, 1006)
     """
+    # Authenticate user via session cookie before accepting the connection
+    try:
+        current_user = get_current_user_from_websocket(websocket)
+    except HTTPException as e:
+        logger.warning("WebSocket authentication failed: %s", e.detail)
+        try:
+            await websocket.close(code=1008, reason=e.detail)
+        except Exception:
+            pass
+        return
+
     await websocket.accept()
-    logger.info("WebSocket connection accepted")
+    logger.info("WebSocket connection accepted for user %s", current_user.email)
     
     # Initialize AI Brain (self-aware agent)
     brain = None
@@ -868,14 +901,27 @@ async def websocket_chat(websocket: WebSocket):
                     })
                     continue
                 
-                logger.info(f"Query: {query[:80]}... (session: {session_id})")
+                logger.info(f"Query: {query[:80]}... (session: {session_id}, user: {current_user.email})")
                 
-                # Ensure session exists
+                # Ensure session exists and is owned by the current user
                 try:
-                    chat_session = await _run_in_executor(db_manager.get_chat_session, session_id)
+                    chat_session = await _run_in_executor(
+                        db_manager.get_chat_session,
+                        session_id,
+                        current_user.id,
+                    )
                     if not chat_session:
-                        await _run_in_executor(db_manager.create_chat_session, session_id)
-                        logger.debug(f"Created new chat session: {session_id}")
+                        await _run_in_executor(
+                            db_manager.create_chat_session,
+                            session_id,
+                            "New Chat",
+                            current_user.id,
+                        )
+                        logger.debug(
+                            "Created new chat session %s for user %s",
+                            session_id,
+                            current_user.id,
+                        )
                 except Exception as db_error:
                     logger.error(f"Database error: {db_error}", exc_info=True)
 
@@ -906,7 +952,11 @@ async def websocket_chat(websocket: WebSocket):
                 assistant_response = ""
                 assistant_sources = []
                 try:
-                    async for event in brain.stream_query(query, conversation_history):
+                    async for event in brain.stream_query(
+                        query,
+                        conversation_history,
+                        user_email=current_user.email,
+                    ):
                         try:
                             await websocket.send_json(event)
                             # Collect assistant response for database storage
@@ -1240,7 +1290,7 @@ async def delete_project(project_id: str, current_user: AppUser = Depends(get_cu
 async def add_project_sources(project_id: str, sources: List[ProjectSourcePayload], current_user: AppUser = Depends(get_current_user)):
     """Add one or more sources to a project."""
     try:
-        project = db_manager.get_project(project_id)
+        project = db_manager.get_project(project_id, owner_user_id=current_user.id)
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
 
@@ -1273,7 +1323,7 @@ async def add_project_sources(project_id: str, sources: List[ProjectSourcePayloa
 async def delete_project_source(project_id: str, source_type: str, source_id: str, current_user: AppUser = Depends(get_current_user)):
     """Remove a specific source mapping from a project."""
     try:
-        project = db_manager.get_project(project_id)
+        project = db_manager.get_project(project_id, owner_user_id=current_user.id)
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
 
@@ -1290,7 +1340,11 @@ async def delete_project_source(project_id: str, source_type: str, source_id: st
 
 
 @app.post("/api/projects/{project_id}/auto-summary")
-async def generate_project_summary(project_id: str, payload: ProjectSummaryRequest):
+async def generate_project_summary(
+    project_id: str,
+    payload: ProjectSummaryRequest,
+    current_user: AppUser = Depends(get_current_user),
+):
     """Use the AI brain to generate a short description and summary for a project.
 
     This uses the same RAG engine and ChatGPT backend as the main chat, but the
@@ -1359,9 +1413,11 @@ async def generate_project_summary(project_id: str, payload: ProjectSummaryReque
                         f"{user_name or 'Someone'}: {text}"
                     )
 
-            # Gmail: recent messages for mapped labels
+            # Gmail: recent messages for mapped labels (scoped to current user)
             if gmail_label_ids:
-                gmail_query = session.query(GmailMessage)
+                gmail_query = session.query(GmailMessage).filter(
+                    GmailMessage.account_email == current_user.email
+                )
                 label_filters = [
                     cast(GmailMessage.label_ids, JSONB).contains([lbl])
                     for lbl in gmail_label_ids
@@ -1806,7 +1862,11 @@ async def get_project_activity(project_id: str, limit: int = 50):
 
 
 @app.post("/api/chat/project/{project_id}", response_model=ChatResponse)
-async def chat_project(project_id: str, payload: ProjectChatRequest):
+async def chat_project(
+    project_id: str,
+    payload: ProjectChatRequest,
+    current_user: AppUser = Depends(get_current_user),
+):
     """Project-scoped chat using AI Brain with project context.
 
     The AI Brain will have access to project-specific data and can use
@@ -1843,6 +1903,7 @@ async def chat_project(project_id: str, payload: ProjectChatRequest):
             project_name=project.name,
             conversation_history=payload.conversation_history or [],
             force_search=True,
+            gmail_account_email=current_user.email,
         )
 
         return ChatResponse(
@@ -2347,7 +2408,11 @@ def _run_slack_pipeline(run_id: str, include_archived: bool = False, download_fi
 
 
 @app.post("/api/pipelines/slack/run")
-async def run_slack_pipeline(include_archived: bool = False, download_files: bool = False):
+async def run_slack_pipeline(
+    include_archived: bool = False,
+    download_files: bool = False,
+    current_user: AppUser = Depends(get_current_user),
+):
     """Trigger a Slack pipeline run in the background.
 
     Args:
@@ -2378,7 +2443,10 @@ async def run_slack_pipeline(include_archived: bool = False, download_files: boo
 
 
 @app.get("/api/pipelines/slack/status/{run_id}")
-async def get_slack_pipeline_status(run_id: str):
+async def get_slack_pipeline_status(
+    run_id: str,
+    current_user: AppUser = Depends(get_current_user),
+):
     """Get the status of a Slack pipeline run."""
 
     run = slack_pipeline_runs.get(run_id)
@@ -2388,7 +2456,10 @@ async def get_slack_pipeline_status(run_id: str):
 
 
 @app.post("/api/pipelines/slack/stop/{run_id}")
-async def stop_slack_pipeline(run_id: str):
+async def stop_slack_pipeline(
+    run_id: str,
+    current_user: AppUser = Depends(get_current_user),
+):
     """Request cancellation of a Slack pipeline run.
 
     Note: the underlying extraction cannot be force-stopped yet, but the
@@ -2408,7 +2479,9 @@ async def stop_slack_pipeline(run_id: str):
 
 
 @app.get("/api/pipelines/slack/data")
-async def get_slack_pipeline_data():
+async def get_slack_pipeline_data(
+    current_user: AppUser = Depends(get_current_user),
+):
     """Return structured Slack data for the Pipelines UI.
 
     For v1 this returns:
@@ -2445,7 +2518,11 @@ async def get_slack_pipeline_data():
 
 
 @app.get("/api/pipelines/slack/messages")
-async def get_slack_channel_messages(channel_id: str, limit: int = 200):
+async def get_slack_channel_messages(
+    channel_id: str,
+    limit: int = 200,
+    current_user: AppUser = Depends(get_current_user),
+):
     """Return recent messages for a Slack channel for the Pipelines UI.
 
     This endpoint reads from the existing Slack message tables populated by the
@@ -2724,8 +2801,32 @@ def _run_gmail_pipeline(run_id: str, label_id: str, user_id: str) -> None:
     # pipelines view can show Gmail stats similar to Slack.
     _ensure_gmail_account_profile(client)
 
-    state = _load_gmail_state()
-    last_ts_ms = int(state.get(label_id) or 0)
+    # Load incremental state, scoped per Gmail account email so multiple
+    # users with the same label IDs (e.g., "INBOX") do not share a single
+    # global cursor. For backward compatibility with the previous
+    # label-only JSON structure, we gracefully fall back.
+    state_all = _load_gmail_state() or {}
+    account_email = client.user_email
+
+    last_ts_ms = 0
+    if account_email:
+        user_state = state_all.get(account_email)
+        if isinstance(user_state, dict):
+            try:
+                last_ts_ms = int(user_state.get(label_id) or 0)
+            except Exception:
+                last_ts_ms = 0
+        else:
+            # Old format: top-level dict keyed by label_id
+            try:
+                last_ts_ms = int(state_all.get(label_id) or 0)
+            except Exception:
+                last_ts_ms = 0
+    else:
+        try:
+            last_ts_ms = int(state_all.get(label_id) or 0)
+        except Exception:
+            last_ts_ms = 0
 
     messages: List[Dict[str, Any]] = []
     max_new_messages = 500
@@ -2895,8 +2996,15 @@ def _run_gmail_pipeline(run_id: str, label_id: str, user_id: str) -> None:
         run_info["message_count"] = len(messages)
 
         if newest_ts_ms > last_ts_ms:
-            state[label_id] = newest_ts_ms
-            _save_gmail_state(state)
+            if account_email:
+                user_state = state_all.get(account_email)
+                if not isinstance(user_state, dict):
+                    user_state = {}
+                user_state[label_id] = newest_ts_ms
+                state_all[account_email] = user_state
+            else:
+                state_all[label_id] = newest_ts_ms
+            _save_gmail_state(state_all)
 
         logger.info(
             "Gmail pipeline run %s completed for label %s with %s messages",
@@ -2987,7 +3095,8 @@ async def get_gmail_pipeline_status(run_id: str, current_user: AppUser = Depends
     """Get the status of a Gmail pipeline run."""
 
     run = gmail_pipeline_runs.get(run_id)
-    if not run:
+    if not run or run.get("user_id") != current_user.id:
+        # Hide existence of other users' runs
         raise HTTPException(status_code=404, detail="Run not found")
     return run
 
@@ -2997,7 +3106,7 @@ async def stop_gmail_pipeline(run_id: str, current_user: AppUser = Depends(get_c
     """Request cancellation of a Gmail pipeline run."""
 
     run = gmail_pipeline_runs.get(run_id)
-    if not run:
+    if not run or run.get("user_id") != current_user.id:
         raise HTTPException(status_code=404, detail="Run not found")
 
     run["cancel_requested"] = True
