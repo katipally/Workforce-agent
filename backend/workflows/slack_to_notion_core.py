@@ -23,6 +23,7 @@ from core.database.db_manager import DatabaseManager
 from core.slack.client import SlackClient
 from core.notion_export.client import NotionClient
 from core.utils.logger import get_logger
+from settings.service import get_effective_slack_bot_token, get_effective_notion_token
 
 logger = get_logger(__name__)
 
@@ -141,7 +142,8 @@ def process_workflow_once(workflow_id: str) -> Dict[str, Any]:
         }
 
     try:
-        slack = SlackClient()
+        slack_token = get_effective_slack_bot_token(db)
+        slack = SlackClient(token=slack_token)
     except Exception as e:  # pragma: no cover - defensive
         logger.error("Failed to initialize Slack client: %s", e, exc_info=True)
         return {
@@ -153,7 +155,8 @@ def process_workflow_once(workflow_id: str) -> Dict[str, Any]:
             "reason": "slack_init_failed",
         }
 
-    notion = NotionClient()
+    notion_token = get_effective_notion_token(db)
+    notion = NotionClient(token=notion_token)
     if not notion.client:
         logger.error("Notion client not initialized (missing NOTION_TOKEN)")
         return {

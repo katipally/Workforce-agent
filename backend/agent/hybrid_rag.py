@@ -32,6 +32,7 @@ from .langchain_tools import WorkforceTools
 from database.db_manager import DatabaseManager
 from database.models import Message, GmailMessage, Channel, User, NotionPage
 from config import Config
+from settings.service import get_effective_notion_token
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -118,13 +119,13 @@ class HybridRAGEngine:
         Uses the Notion Search API at query time (no DB storage) so that
         Notion content can participate in hybrid RAG without schema changes.
         """
-        if not Config.NOTION_TOKEN:
-            # Notion is optional; just skip if not configured
-            logger.debug("NOTION_TOKEN not configured; skipping Notion search")
+        token = get_effective_notion_token(self.db)
+        if not token:
+            logger.debug("Notion token not configured; skipping Notion search")
             return []
 
         headers = {
-            "Authorization": f"Bearer {Config.NOTION_TOKEN}",
+            "Authorization": f"Bearer {token}",
             "Notion-Version": "2022-06-28",
             "Content-Type": "application/json",
         }
@@ -184,11 +185,12 @@ class HybridRAGEngine:
         token usage under control, while still giving the RAG engine a solid
         textual representation of the page.
         """
-        if not Config.NOTION_TOKEN or not page_id:
+        token = get_effective_notion_token(self.db)
+        if not token or not page_id:
             return ""
 
         headers = {
-            "Authorization": f"Bearer {Config.NOTION_TOKEN}",
+            "Authorization": f"Bearer {token}",
             "Notion-Version": "2022-06-28",
         }
 

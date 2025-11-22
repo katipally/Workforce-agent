@@ -270,6 +270,16 @@ from agent.sentence_transformer_engine import (
     SentenceTransformerEmbedding,
     SentenceTransformerReranker,
 )
+from settings.service import (
+    get_personal_settings_view,
+    update_personal_settings,
+    get_workspace_settings_view,
+    update_workspace_settings,
+    get_effective_openai_key,
+    get_effective_llm_model,
+    get_effective_notion_token,
+    bootstrap_app_settings_from_config_if_empty,
+)
 
 # Import embedding synchronizer for pipeline integration
 sys.path.insert(0, str(Path(__file__).parent.parent / 'core'))
@@ -277,7 +287,7 @@ from embeddings_sync import sync_embeddings_after_pipeline
 
 # Global variables
 rag_engine = None
-ai_brain = None
+ai_brain = None  # Kept for backward-compatible health reporting; brains are built per-user.
 rag_lock: asyncio.Lock | None = None
 ai_brain_lock: asyncio.Lock | None = None
 
@@ -327,37 +337,43 @@ async def get_rag_engine() -> HybridRAGEngine:
         return rag_engine
 
 
-async def get_ai_brain() -> WorkforceAIBrain:
-    """Lazy load and return the AI brain (self-aware agent with tools)."""
-    global ai_brain, ai_brain_lock
+async def _build_ai_brain_for_user(current_user: AppUser) -> WorkforceAIBrain:
+    """Construct an AI brain instance for the given user using personal settings.
 
-    if ai_brain:
-        return ai_brain
+    Each user can have their own OpenAI API key and preferred LLM model. We
+    reuse the shared RAG engine but create a per-user WorkforceAIBrain so
+    settings are respected across all tabs.
+    """
 
-    if ai_brain_lock is None:
-        ai_brain_lock = asyncio.Lock()
+    global ai_brain
 
-    async with ai_brain_lock:
-        if ai_brain:
-            return ai_brain
+    rag = await get_rag_engine()
 
-        logger.info("Initializing AI Brain (gpt-5-nano)...")
-        rag = await get_rag_engine()
-
-        loop = asyncio.get_running_loop()
-        ai_brain_instance = await loop.run_in_executor(
-            None,
-            lambda: WorkforceAIBrain(
-                openai_api_key=Config.OPENAI_API_KEY,
-                rag_engine=rag,
-                model=Config.LLM_MODEL,
-                temperature=0.7,
-            ),
+    api_key = get_effective_openai_key(db_manager, current_user.id)
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="OpenAI API key not configured. Please set your key in Personal Settings.",
         )
 
-        ai_brain = ai_brain_instance
-        logger.info("✓ AI Brain initialized with tool calling")
-        return ai_brain
+    model = get_effective_llm_model(db_manager, current_user.id)
+
+    loop = asyncio.get_running_loop()
+    brain = await loop.run_in_executor(
+        None,
+        lambda: WorkforceAIBrain(
+            openai_api_key=api_key,
+            rag_engine=rag,
+            model=model,
+            temperature=0.7,
+        ),
+    )
+
+    # Track the last-initialized brain globally so health endpoints can
+    # advertise capabilities without needing a specific user context.
+    ai_brain = brain
+
+    return brain
 
 
 # Initialize FastAPI app
@@ -600,6 +616,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.on_event("startup")
+async def bootstrap_workspace_settings() -> None:
+    try:
+        bootstrap_app_settings_from_config_if_empty(db_manager)
+    except Exception as e:
+        logger.error("Failed to bootstrap workspace settings from Config: %s", e, exc_info=True)
+
+
 @app.on_event("startup")
 async def start_workflow_worker() -> None:
     """Start the Slack → Notion workflow scheduler in a background thread.
@@ -664,6 +689,29 @@ class HealthResponse(BaseModel):
     models_loaded: bool
     ai_brain_loaded: bool
     capabilities: List[str]
+
+
+class UserSettingsUpdate(BaseModel):
+    """Payload for updating per-user settings."""
+
+    openai_api_key: Optional[str] = None
+    llm_model: Optional[str] = None
+    timezone: Optional[str] = None
+
+
+class WorkspaceSettingsUpdate(BaseModel):
+    """Payload for updating workspace-wide settings.
+
+    Each section is optional; when provided it replaces/updates that section in
+    the underlying AppSettings JSON document.
+    """
+
+    slack: Optional[Dict[str, Any]] = None
+    notion: Optional[Dict[str, Any]] = None
+    gmail: Optional[Dict[str, Any]] = None
+    workspace: Optional[Dict[str, Any]] = None
+    runtime: Optional[Dict[str, Any]] = None
+    database: Optional[Dict[str, Any]] = None
     
 
 class ProjectSourcePayload(BaseModel):
@@ -744,6 +792,115 @@ async def root():
     }
 
 
+@app.get("/api/settings/me")
+async def get_my_settings(
+    include_secrets: bool = False,
+    current_user: AppUser = Depends(get_current_user),
+):
+    """Return the current user's personal settings (per-user).
+
+    When include_secrets is true, the full decrypted OpenAI API key is
+    returned under openai_api_key_full in addition to the usual metadata.
+    """
+
+    return get_personal_settings_view(db_manager, current_user.id, include_secret=include_secrets)
+
+
+@app.put("/api/settings/me")
+async def update_my_settings(
+    payload: UserSettingsUpdate,
+    current_user: AppUser = Depends(get_current_user),
+):
+    """Update the current user's personal settings.
+
+    Secrets (like the OpenAI API key) are encrypted at rest and only exposed via
+    flags and last-4 digits in responses.
+    """
+
+    data = payload.dict(exclude_unset=True)
+    return update_personal_settings(db_manager, current_user.id, data)
+
+
+@app.get("/api/settings/workspace")
+async def get_workspace_settings(
+    include_secrets: bool = False,
+    current_user: AppUser = Depends(get_current_user),
+):
+    """Return workspace-wide settings.
+
+    For now all authenticated users are treated as admins and can view/edit
+    workspace settings. When include_secrets is true, decrypted Slack and
+    Notion tokens are included alongside their metadata.
+    """
+
+    return get_workspace_settings_view(db_manager, include_secrets=include_secrets)
+
+
+@app.put("/api/settings/workspace")
+async def update_workspace_settings_endpoint(
+    payload: WorkspaceSettingsUpdate,
+    current_user: AppUser = Depends(get_current_user),
+):
+    """Update workspace-wide settings."""
+
+    data = payload.dict(exclude_unset=True)
+    return update_workspace_settings(db_manager, data)
+
+
+@app.get("/api/settings/options/timezones")
+async def get_timezone_options(current_user: AppUser = Depends(get_current_user)):
+    """Return a curated list of common timezones for autocomplete."""
+
+    timezones = [
+        "UTC",
+        "America/Los_Angeles",
+        "America/New_York",
+        "Europe/London",
+        "Europe/Berlin",
+        "Asia/Kolkata",
+        "Asia/Tokyo",
+    ]
+    return {"timezones": timezones}
+
+
+@app.get("/api/settings/options/slack-channels")
+async def get_slack_channel_options(current_user: AppUser = Depends(get_current_user)):
+    """Return Slack channels from the database for autocomplete inputs."""
+
+    with db_manager.get_session() as session:
+        channels = (
+            session.query(Channel)
+            .order_by(Channel.name.asc())
+            .limit(500)
+            .all()
+        )
+
+    items = [
+        {"id": ch.channel_id, "name": ch.name}
+        for ch in channels
+        if getattr(ch, "name", None)
+    ]
+    return {"channels": items}
+
+
+@app.get("/api/settings/options/gmail-labels")
+async def get_gmail_label_options(current_user: AppUser = Depends(get_current_user)):
+    """Return Gmail label names from the database for autocomplete inputs."""
+
+    from database.models import GmailLabel
+
+    with db_manager.get_session() as session:
+        labels = session.query(GmailLabel).limit(500).all()
+
+    names = []
+    for lbl in labels:
+        name = getattr(lbl, "name", None)
+        if name:
+            names.append(name)
+
+    return {"labels": names}
+
+
 @app.get("/health")
 async def health():
     """Detailed health check."""
@@ -772,7 +929,7 @@ async def chat_message(
         Chat response with answer and sources
     """
     try:
-        brain = await get_ai_brain()
+        brain = await _build_ai_brain_for_user(current_user)
 
         # Collect streaming response into single output
         full_response = ""
@@ -847,11 +1004,11 @@ async def websocket_chat(websocket: WebSocket):
     await websocket.accept()
     logger.info("WebSocket connection accepted for user %s", current_user.email)
     
-    # Initialize AI Brain (self-aware agent)
+    # Initialize AI Brain (self-aware agent) for this user
     brain = None
     try:
-        brain = await get_ai_brain()
-        logger.debug("AI Brain ready (GPT-4 + tools)")
+        brain = await _build_ai_brain_for_user(current_user)
+        logger.debug("AI Brain ready for user %s", current_user.email)
     except Exception as e:
         logger.error(f"Failed to initialize AI Brain: {e}", exc_info=True)
         try:
@@ -860,7 +1017,7 @@ async def websocket_chat(websocket: WebSocket):
                 "content": f"Server initialization failed: {str(e)}"
             })
             await websocket.close(code=1011, reason="Server error")
-        except:
+        except Exception:
             pass
         return
     

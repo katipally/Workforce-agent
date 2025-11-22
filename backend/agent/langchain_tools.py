@@ -28,6 +28,7 @@ from slack.sender.file_sender import FileSender
 from gmail.client import GmailClient
 from notion_export.client import NotionClient
 from database.db_manager import DatabaseManager
+from settings.service import get_workspace_settings_view, get_effective_slack_bot_token
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -187,10 +188,13 @@ class WorkforceTools:
         # Initialize API clients
         try:
             from slack_sdk import WebClient
-            self.slack_client = WebClient(token=Config.SLACK_BOT_TOKEN)
-        except:
+            token = get_effective_slack_bot_token(self.db)
+            if not token:
+                raise ValueError("Slack bot token not configured")
+            self.slack_client = WebClient(token=token)
+        except Exception as e:
             self.slack_client = None
-            logger.warning("Slack client not initialized")
+            logger.warning("Slack client not initialized: %s", e)
         
         try:
             from gmail.client import GmailClient
@@ -226,30 +230,41 @@ class WorkforceTools:
             return ""
         return channel.strip().lstrip("#")
 
+    def _get_slack_policies(self) -> Dict[str, Any]:
+        try:
+            settings = get_workspace_settings_view(self.db)
+            slack = settings.get("slack") or {}
+            return slack
+        except Exception as e:
+            logger.error("Failed to load Slack policies from settings: %s", e)
+            return {}
+
     def _check_slack_read_allowed(self, channel: Optional[str]) -> Optional[str]:
         """Return error message if reading from a Slack channel is blocked."""
         normalized = self._normalize_slack_channel(channel)
         if not normalized:
             return None
-        blocked_raw = Config.SLACK_BLOCKED_CHANNELS or ""
-        blocked = {c.strip().lstrip("#") for c in blocked_raw.split(",") if c.strip()}
+        policies = self._get_slack_policies()
+        blocked_list = policies.get("blocked_channels") or []
+        blocked = {c.strip().lstrip("#") for c in blocked_list if isinstance(c, str) and c.strip()}
         if normalized in blocked:
             return f"Slack channel '{channel}' is blocked by configuration; read actions are not allowed."
         return None
 
     def _check_slack_write_allowed(self, channel: Optional[str] = None) -> Optional[str]:
         """Return error message if writing to Slack is disallowed by configuration."""
-        mode = (Config.SLACK_MODE or "standard").lower()
+        policies = self._get_slack_policies()
+        mode = (policies.get("mode") or "standard").lower()
         if mode == "read_only":
             return "Slack is configured in read_only mode; write actions are disabled by configuration."
         normalized = self._normalize_slack_channel(channel)
         if normalized:
-            blocked_raw = Config.SLACK_BLOCKED_CHANNELS or ""
-            blocked = {c.strip().lstrip("#") for c in blocked_raw.split(",") if c.strip()}
+            blocked_list = policies.get("blocked_channels") or []
+            blocked = {c.strip().lstrip("#") for c in blocked_list if isinstance(c, str) and c.strip()}
             if normalized in blocked:
                 return f"Slack channel '{channel}' is blocked by configuration; this action is not allowed."
-            readonly_raw = Config.SLACK_READONLY_CHANNELS or ""
-            readonly = {c.strip().lstrip("#") for c in readonly_raw.split(",") if c.strip()}
+            readonly_list = policies.get("readonly_channels") or []
+            readonly = {c.strip().lstrip("#") for c in readonly_list if isinstance(c, str) and c.strip()}
             if normalized in readonly:
                 return f"Slack channel '{channel}' is read-only by configuration; write actions are not allowed."
         return None
@@ -261,13 +276,10 @@ class WorkforceTools:
             return "Notion is configured in read_only mode; write actions are disabled by configuration."
         return None
 
-    def _parse_domain_list(self, raw: str) -> List[str]:
-        """Parse a comma-separated list of domains from configuration."""
-        return [d.strip() for d in (raw or "").split(",") if d.strip()]
-
     def _is_domain_allowed_for_send(self, email: str) -> bool:
         """Check if an email's domain is allowed for sending."""
-        allowed = self._parse_domain_list(Config.GMAIL_ALLOWED_SEND_DOMAINS)
+        gmail = self._get_gmail_policies()
+        allowed = gmail.get("allowed_send_domains") or []
         if not allowed or not email:
             return True
         lower_email = email.lower()
@@ -275,11 +287,21 @@ class WorkforceTools:
 
     def _is_sender_allowed_for_read(self, sender: str) -> bool:
         """Check if a sender/address is allowed to be read based on domain filters."""
-        allowed = self._parse_domain_list(Config.GMAIL_ALLOWED_READ_DOMAINS)
+        gmail = self._get_gmail_policies()
+        allowed = gmail.get("allowed_read_domains") or []
         if not allowed or not sender:
             return True
         lower_sender = sender.lower()
         return any(dom.lower() in lower_sender for dom in allowed)
+
+    def _get_gmail_policies(self) -> Dict[str, Any]:
+        try:
+            settings = get_workspace_settings_view(self.db)
+            gmail = settings.get("gmail") or {}
+            return gmail
+        except Exception as e:
+            logger.error("Failed to load Gmail policies from settings: %s", e)
+            return {}
 
     def _cache_channels_to_db(self, channels: list):
         """Cache Slack channels to database."""
@@ -697,7 +719,8 @@ class WorkforceTools:
                     )
 
                 # Apply global Gmail read-domain restriction if configured
-                allowed_domains = self._parse_domain_list(Config.GMAIL_ALLOWED_READ_DOMAINS)
+                gmail = self._get_gmail_policies()
+                allowed_domains = gmail.get("allowed_read_domains") or []
                 if allowed_domains:
                     domain_filters = [
                         GmailMessage.from_address.ilike(f"%{dom}%")
@@ -755,7 +778,8 @@ class WorkforceTools:
                     "Update GMAIL_ALLOWED_SEND_DOMAINS if you want to send to this address."
                 )
 
-            mode = (Config.GMAIL_SEND_MODE or "confirm").lower()
+            gmail = self._get_gmail_policies()
+            mode = (gmail.get("send_mode") or "confirm").lower()
 
             # Create message
             message = MIMEText(body)
