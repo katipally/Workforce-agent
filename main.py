@@ -1,4 +1,4 @@
-"""Main entry point for Workforce Agent.
+"""Main entry point for Workforce Agent CLI.
 
 A comprehensive agent for managing and extracting data from:
 - Slack (messages, users, channels, files, reactions)
@@ -19,6 +19,12 @@ For full command list:
     python main.py --help
 """
 import sys
+from pathlib import Path
+
+# Add backend/core to path so imports resolve
+core_path = Path(__file__).parent / 'backend' / 'core'
+sys.path.insert(0, str(core_path))
+
 from cli.main import cli
 
 if __name__ == "__main__":
