@@ -99,6 +99,26 @@ export default function WorkflowsInterface() {
     }
   }
 
+  const handleUpdateStatus = async (workflow: Workflow, newStatus: 'active' | 'paused') => {
+    try {
+      setError(null)
+      const res = await fetch(`${API_BASE_URL}/api/workflows/${workflow.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ status: newStatus }),
+      })
+      if (!res.ok) {
+        throw new Error(`Failed to update status: ${res.status}`)
+      }
+      const updated = (await res.json()) as Workflow
+      setWorkflows((prev) => prev.map((w) => (w.id === updated.id ? updated : w)))
+    } catch (e: any) {
+      console.error('Error updating workflow status', e)
+      setError(e.message || 'Failed to update workflow status')
+    }
+  }
+
   const loadSlackChannels = async () => {
     try {
       const res = await fetch(`${API_BASE_URL}/api/pipelines/slack/data`, {
@@ -131,7 +151,7 @@ export default function WorkflowsInterface() {
   // This is intentionally decoupled from the actual worker scheduling and is
   // just a visual indicator of the chosen interval.
   useEffect(() => {
-    if (!selectedWorkflow) {
+    if (!selectedWorkflow || selectedWorkflow.status !== 'active') {
       setRemainingSeconds(null)
       return
     }
@@ -165,7 +185,12 @@ export default function WorkflowsInterface() {
     }, 1000)
 
     return () => window.clearInterval(id)
-  }, [selectedWorkflow?.id, selectedWorkflow?.poll_interval_seconds, selectedWorkflow?.last_run_at])
+  }, [
+    selectedWorkflow?.id,
+    selectedWorkflow?.poll_interval_seconds,
+    selectedWorkflow?.last_run_at,
+    selectedWorkflow?.status,
+  ])
 
   const handleCreateWorkflow = async () => {
     const name = window.prompt('Workflow name (e.g., "Slack → Notion: Zephyr")')
@@ -393,6 +418,27 @@ export default function WorkflowsInterface() {
                     )}
                   </div>
                   <div className="flex flex-col items-end gap-1">
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground capitalize">
+                        {selectedWorkflow.status || 'active'}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          handleUpdateStatus(
+                            selectedWorkflow,
+                            selectedWorkflow.status === 'active' ? 'paused' : 'active',
+                          )
+                        }
+                        className={`text-[11px] px-2 py-0.5 rounded-md border ${
+                          selectedWorkflow.status === 'active'
+                            ? 'border-red-500 text-red-500 hover:bg-red-500/10'
+                            : 'border-green-600 text-green-600 hover:bg-green-600/10'
+                        }`}
+                      >
+                        {selectedWorkflow.status === 'active' ? 'Stop' : 'Start'}
+                      </button>
+                    </div>
                     <label className="text-[10px] text-muted-foreground">Interval</label>
                     <select
                       className="text-[11px] rounded-md border border-border bg-background px-1.5 py-0.5"
@@ -411,7 +457,9 @@ export default function WorkflowsInterface() {
                     <p className="text-[10px] text-muted-foreground">
                       Next run in{' '}
                       <span className="font-semibold">
-                        {formatRemaining(remainingSeconds)}
+                        {selectedWorkflow.status === 'active'
+                          ? formatRemaining(remainingSeconds)
+                          : 'paused'}
                       </span>
                     </p>
                     <button

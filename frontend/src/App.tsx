@@ -5,15 +5,23 @@ import ProjectsInterface from './components/projects/ProjectsInterface'
 import WorkflowsInterface from './components/workflows/WorkflowsInterface'
 import SignInView from './components/auth/SignInView'
 import ProfileInterface from './components/auth/ProfileInterface'
+import CalendarInterface from './components/calendar/CalendarInterface'
 import { useAuthStore } from './store/authStore'
 
 function App() {
-  type Tab = 'chat' | 'pipelines' | 'projects' | 'workflows' | 'profile'
+  type Tab = 'chat' | 'pipelines' | 'projects' | 'workflows' | 'calendar' | 'profile'
 
   const [activeTab, setActiveTab] = useState<Tab>(() => {
     if (typeof window === 'undefined') return 'chat'
     const stored = window.localStorage.getItem('workforce-active-tab')
-    if (stored === 'pipelines' || stored === 'projects' || stored === 'chat' || stored === 'workflows') {
+    if (
+      stored === 'pipelines' ||
+      stored === 'projects' ||
+      stored === 'chat' ||
+      stored === 'workflows' ||
+      stored === 'calendar' ||
+      stored === 'profile'
+    ) {
       return stored as Tab
     }
     return 'chat'
@@ -98,6 +106,17 @@ function App() {
           </button>
           <button
             type="button"
+            onClick={() => setActiveTab('calendar')}
+            className={`rounded-md px-3 py-1 font-medium border text-xs ${
+              activeTab === 'calendar'
+                ? 'bg-blue-600 text-white border-blue-600'
+                : 'bg-background text-foreground border-border hover:bg-muted'
+            }`}
+          >
+            Calendar
+          </button>
+          <button
+            type="button"
             onClick={() => setActiveTab('profile')}
             className={`rounded-md px-3 py-1 font-medium border text-xs ${
               activeTab === 'profile'
@@ -122,6 +141,9 @@ function App() {
         </div>
         <div className={activeTab === 'workflows' ? 'h-full block' : 'h-full hidden'}>
           <WorkflowsInterface />
+        </div>
+        <div className={activeTab === 'calendar' ? 'h-full block' : 'h-full hidden'}>
+          <CalendarInterface />
         </div>
         <div className={activeTab === 'profile' ? 'h-full block' : 'h-full hidden'}>
           <ProfileInterface />

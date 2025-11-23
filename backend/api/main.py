@@ -48,6 +48,8 @@ from google.oauth2 import id_token as google_id_token
 from google.auth.transport import requests as google_requests
 from google.oauth2.credentials import Credentials
 from google.auth.exceptions import RefreshError
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 # LLM message types for summary generation
 from langchain.schema import SystemMessage, HumanMessage
@@ -218,7 +220,24 @@ def _build_google_credentials_for_user_id(user_id: str) -> Optional[Credentials]
                 return None
 
         return creds
- 
+
+
+def _get_google_calendar_service_for_user(user_id: str):
+    """Build a Google Calendar service for the given user, if authorized.
+
+    Returns None if the user does not have a valid Google token or if the
+    token cannot be used to construct a Calendar service.
+    """
+
+    creds = _build_google_credentials_for_user_id(user_id)
+    if not creds:
+        return None
+
+    try:
+        return build("calendar", "v3", credentials=creds)
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error("Failed to build Google Calendar service for user %s: %s", user_id, e)
+        return None
 
 def _build_oauth_state(redirect_path: Optional[str] = "/") -> str:
     payload = {
@@ -413,6 +432,7 @@ async def google_login(request: Request, redirect_path: Optional[str] = "/"):
         "openid",
         "email",
         "profile",
+        "https://www.googleapis.com/auth/calendar",
     ] + GmailClient.SCOPES
 
     params = {
@@ -921,6 +941,128 @@ async def get_gmail_label_options(current_user: AppUser = Depends(get_current_us
             names.append(name)
 
     return {"labels": names}
+
+
+@app.get("/api/calendar/events")
+async def list_calendar_events(
+    view: str = "day",
+    date: Optional[str] = None,
+    current_user: AppUser = Depends(get_current_user),
+):
+    """List Google Calendar events for the current user.
+
+    View can be one of: day, week, month. Date is interpreted as YYYY-MM-DD
+    in server time; for now we treat times as UTC when building Calendar
+    timeMin/timeMax bounds.
+    """
+
+    view = view.lower()
+    if view not in {"day", "week", "month"}:
+        raise HTTPException(status_code=400, detail="Invalid view; expected day, week, or month")
+
+    # Parse date or default to today (UTC)
+    try:
+        if date:
+            base_date = datetime.fromisoformat(date)
+        else:
+            base_date = datetime.utcnow()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid date format; expected YYYY-MM-DD")
+
+    # Compute time window
+    if view == "month":
+        # Always cover the full calendar month that contains base_date,
+        # so the Calendar UI sees all events for that month regardless of
+        # which specific day is selected.
+        start = datetime(base_date.year, base_date.month, 1)
+        if base_date.month == 12:
+            end = datetime(base_date.year + 1, 1, 1)
+        else:
+            end = datetime(base_date.year, base_date.month + 1, 1)
+    else:
+        start = datetime(base_date.year, base_date.month, base_date.day)
+        if view == "day":
+            end = start + timedelta(days=1)
+        else:  # week
+            # Assume week starts on Monday
+            weekday = start.weekday()
+            start = start - timedelta(days=weekday)
+            end = start + timedelta(days=7)
+
+    service = _get_google_calendar_service_for_user(current_user.id)
+    if not service:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Google Calendar not authorized")
+
+    try:
+        events_result = (
+            service.events()
+            .list(
+                calendarId="primary",
+                timeMin=start.isoformat() + "Z",
+                timeMax=end.isoformat() + "Z",
+                singleEvents=True,
+                orderBy="startTime",
+            )
+            .execute()
+        )
+    except HttpError as e:
+        logger.error("Google Calendar API error for user %s: %s", current_user.id, e)
+        raise HTTPException(status_code=502, detail="Error fetching calendar events from Google")
+
+    items = events_result.get("items", [])
+
+    def _normalize_event(ev: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": ev.get("id"),
+            "status": ev.get("status"),
+            "htmlLink": ev.get("htmlLink"),
+            "summary": ev.get("summary"),
+            "description": ev.get("description"),
+            "location": ev.get("location"),
+            "start": ev.get("start"),
+            "end": ev.get("end"),
+            "organizer": ev.get("organizer"),
+            "attendees": ev.get("attendees", []),
+            "hangoutLink": ev.get("hangoutLink"),
+            "conferenceData": ev.get("conferenceData"),
+        }
+
+    return {"events": [_normalize_event(ev) for ev in items]}
+
+
+@app.get("/api/calendar/events/{event_id}")
+async def get_calendar_event(event_id: str, current_user: AppUser = Depends(get_current_user)):
+    """Return details for a single Google Calendar event for the current user."""
+
+    if not event_id:
+        raise HTTPException(status_code=400, detail="event_id is required")
+
+    service = _get_google_calendar_service_for_user(current_user.id)
+    if not service:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Google Calendar not authorized")
+
+    try:
+        ev = service.events().get(calendarId="primary", eventId=event_id).execute()
+    except HttpError as e:
+        if getattr(e, "status_code", None) == 404:
+            raise HTTPException(status_code=404, detail="Event not found")
+        logger.error("Google Calendar get event error for user %s: %s", current_user.id, e)
+        raise HTTPException(status_code=502, detail="Error fetching calendar event from Google")
+
+    return {
+        "id": ev.get("id"),
+        "status": ev.get("status"),
+        "htmlLink": ev.get("htmlLink"),
+        "summary": ev.get("summary"),
+        "description": ev.get("description"),
+        "location": ev.get("location"),
+        "start": ev.get("start"),
+        "end": ev.get("end"),
+        "organizer": ev.get("organizer"),
+        "attendees": ev.get("attendees", []),
+        "hangoutLink": ev.get("hangoutLink"),
+        "conferenceData": ev.get("conferenceData"),
+    }
 
 
 @app.get("/health")
