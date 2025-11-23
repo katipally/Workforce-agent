@@ -4,8 +4,7 @@ uvicorn[standard]==0.27.0
 python-multipart==0.0.7
 websockets==12.0
 
-# AI/RAG Framework
-lightrag-hku==0.1.0
+# AI/RAG Framework (LangChain + LangGraph only in current codebase)
 langchain==0.1.20
 langgraph==0.0.40
 langchain-openai==0.0.8
