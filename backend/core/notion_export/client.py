@@ -1,8 +1,10 @@
 """Notion API client."""
 
 from typing import List, Dict, Any, Optional
+import time
+
 from notion_client import Client
-from notion_client.errors import APIResponseError
+from notion_client.errors import APIResponseError, RequestTimeoutError
 
 from config import Config
 from utils.logger import get_logger
@@ -95,6 +97,16 @@ class NotionClient:
         except APIResponseError as error:
             logger.error(f"Error creating page: {error}")
             return None
+        except Exception as error:
+            # Catch network / timeout errors from the underlying HTTP client so
+            # callers never see unhandled exceptions.
+            logger.error(
+                "Unexpected error creating Notion page %s: %s",
+                title,
+                error,
+                exc_info=True,
+            )
+            return None
     
     def append_blocks(
         self,
@@ -128,6 +140,14 @@ class NotionClient:
         
         except APIResponseError as error:
             logger.error(f"Error appending blocks: {error}")
+            return False
+        except Exception as error:
+            logger.error(
+                "Unexpected error appending blocks to page %s: %s",
+                page_id,
+                error,
+                exc_info=True,
+            )
             return False
     
     def append_blocks_and_get_ids(
@@ -170,6 +190,14 @@ class NotionClient:
             else:
                 logger.error(f"Error appending blocks with ids: {error}")
             return []
+        except Exception as error:
+            logger.error(
+                "Unexpected error appending blocks with ids for %s: %s",
+                block_id,
+                error,
+                exc_info=True,
+            )
+            return []
     
     def update_bulleted_list_item(self, block_id: str, text: str) -> bool:
         """Update the text content of an existing bulleted list item block."""
@@ -177,30 +205,73 @@ class NotionClient:
             logger.error("Notion client not initialized")
             return False
 
-        try:
-            self.client.blocks.update(
-                block_id=block_id,
-                bulleted_list_item={
-                    "rich_text": [
-                        {
-                            "type": "text",
-                            "text": {"content": text},
-                        }
-                    ]
-                },
-            )
-            return True
-        except APIResponseError as error:
-            msg = str(error).lower()
-            if "archived" in msg:
-                logger.warning(
-                    "Cannot update archived Notion block %s; skipping. Error: %s",
-                    block_id,
-                    error,
+        # Retry a few times on transient network issues (timeouts, disconnects)
+        # so that short-lived Notion API problems do not cause noisy errors.
+        max_attempts = 3
+        delay_seconds = 1.0
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self.client.blocks.update(
+                    block_id=block_id,
+                    bulleted_list_item={
+                        "rich_text": [
+                            {
+                                "type": "text",
+                                "text": {"content": text},
+                            }
+                        ]
+                    },
                 )
-            else:
-                logger.error(f"Error updating bulleted list item: {error}")
-            return False
+                return True
+            except APIResponseError as error:
+                # API errors (4xx/5xx with structured response) are not
+                # generally recoverable by retrying the same request, so we
+                # log once and stop.
+                msg = str(error).lower()
+                if "archived" in msg:
+                    logger.warning(
+                        "Cannot update archived Notion block %s; skipping. Error: %s",
+                        block_id,
+                        error,
+                    )
+                else:
+                    logger.error(
+                        "Error updating bulleted list item %s (API error): %s",
+                        block_id,
+                        error,
+                    )
+                return False
+            except Exception as error:
+                # Handle transport-level issues like timeouts and remote
+                # disconnects from the underlying HTTP client.
+                if isinstance(error, RequestTimeoutError):
+                    logger.warning(
+                        "Timeout updating Notion block %s (attempt %d/%d): %s",
+                        block_id,
+                        attempt,
+                        max_attempts,
+                        error,
+                    )
+                else:
+                    logger.warning(
+                        "Network error updating Notion block %s (attempt %d/%d): %s",
+                        block_id,
+                        attempt,
+                        max_attempts,
+                        error,
+                    )
+
+                if attempt == max_attempts:
+                    logger.error(
+                        "Giving up updating Notion block %s after %d attempts due to repeated errors",
+                        block_id,
+                        max_attempts,
+                    )
+                    return False
+
+                time.sleep(delay_seconds)
+                delay_seconds *= 2
     
     def create_heading(self, text: str, level: int = 2) -> Dict[str, Any]:
         """Create heading block.
@@ -313,3 +384,12 @@ class NotionClient:
                     page_error,
                 )
                 return None
+        except Exception as error:
+            # Network / timeout issues when checking archive state should never
+            # crash callers; treat as unknown (None) and log once.
+            logger.warning(
+                "Error retrieving archive state for Notion block/page %s: %s",
+                block_id,
+                error,
+            )
+            return None
