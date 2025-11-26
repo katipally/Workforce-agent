@@ -315,6 +315,79 @@ workflow_worker_thread: threading.Thread | None = None
 workflow_worker_stop_event: threading.Event | None = None
 
 
+def _has_active_slack_to_notion_workflows() -> bool:
+    """Return True if there is at least one active Slack → Notion workflow."""
+
+    try:
+        workflows = db_manager.list_workflows(limit=500)
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error("Failed to list workflows when checking active status: %s", e, exc_info=True)
+        return False
+
+    for wf in workflows:
+        if getattr(wf, "type", None) == "slack_to_notion" and getattr(wf, "status", None) == "active":
+            return True
+    return False
+
+
+def _start_workflow_worker_if_needed() -> None:
+    """Start the Slack → Notion worker thread only when there are active workflows."""
+
+    global workflow_worker_thread, workflow_worker_stop_event
+
+    if workflow_worker_thread is not None and workflow_worker_thread.is_alive():
+        return
+
+    if not _has_active_slack_to_notion_workflows():
+        logger.info("No active Slack → Notion workflows; scheduler thread not started")
+        return
+
+    # Import here to avoid circular imports at module load time
+    from workflows.slack_to_notion_worker import run_scheduler
+
+    workflow_worker_stop_event = threading.Event()
+
+    def _runner() -> None:
+        run_scheduler(stop_event=workflow_worker_stop_event)
+
+    workflow_worker_thread = threading.Thread(
+        target=_runner,
+        name="slack_to_notion_worker",
+        daemon=True,
+    )
+    workflow_worker_thread.start()
+    logger.info("Started Slack → Notion workflow scheduler background thread")
+
+
+def _stop_workflow_worker_internal() -> None:
+    """Stop the background Slack → Notion workflow scheduler thread if running."""
+
+    global workflow_worker_thread, workflow_worker_stop_event
+
+    if workflow_worker_stop_event is not None:
+        workflow_worker_stop_event.set()
+
+    if workflow_worker_thread is not None and workflow_worker_thread.is_alive():
+        workflow_worker_thread.join(timeout=10)
+
+    workflow_worker_thread = None
+    workflow_worker_stop_event = None
+
+
+def _reconcile_workflow_worker_state() -> None:
+    """Ensure the worker thread state matches DB workflow state.
+
+    If there is at least one active Slack → Notion workflow, the scheduler
+    thread is started (if not already running). If there are none, the thread
+    is stopped.
+    """
+
+    if _has_active_slack_to_notion_workflows():
+        _start_workflow_worker_if_needed()
+    else:
+        _stop_workflow_worker_internal()
+
+
 async def get_rag_engine() -> HybridRAGEngine:
     """Lazy load and return the RAG engine with concurrency guard."""
     global rag_engine, rag_lock
@@ -664,42 +737,13 @@ async def start_workflow_worker() -> None:
     This avoids requiring a separate `python workflows/slack_to_notion_worker.py`
     process. The thread is stopped cleanly on application shutdown.
     """
-    global workflow_worker_thread, workflow_worker_stop_event
-
-    # Already running
-    if workflow_worker_thread is not None and workflow_worker_thread.is_alive():
-        return
-
-    # Import here to avoid circular imports at module load time
-    from workflows.slack_to_notion_worker import run_scheduler
-
-    workflow_worker_stop_event = threading.Event()
-
-    def _runner() -> None:
-        run_scheduler(stop_event=workflow_worker_stop_event)
-
-    workflow_worker_thread = threading.Thread(
-        target=_runner,
-        name="slack_to_notion_worker",
-        daemon=True,
-    )
-    workflow_worker_thread.start()
-    logger.info("Started Slack → Notion workflow scheduler background thread")
+    _start_workflow_worker_if_needed()
 
 
 @app.on_event("shutdown")
 async def stop_workflow_worker() -> None:
     """Stop the background Slack → Notion workflow scheduler thread."""
-    global workflow_worker_thread, workflow_worker_stop_event
-
-    if workflow_worker_stop_event is not None:
-        workflow_worker_stop_event.set()
-
-    if workflow_worker_thread is not None and workflow_worker_thread.is_alive():
-        workflow_worker_thread.join(timeout=10)
-
-    workflow_worker_thread = None
-    workflow_worker_stop_event = None
+    _stop_workflow_worker_internal()
 
 # Request/Response models
 class ChatRequest(BaseModel):
@@ -2246,17 +2290,32 @@ async def list_workflows():
     try:
         workflows = db_manager.list_workflows(limit=100)
         result: List[Dict[str, Any]] = []
+        now = datetime.utcnow()
         for wf in workflows:
             channels = db_manager.get_workflow_channels(wf.id)
+            is_active = wf.status == "active"
+            next_run_at: Optional[str] = None
+            due_now = False
+
+            if wf.type == "slack_to_notion" and is_active:
+                interval = wf.poll_interval_seconds or 30
+                last_run = wf.last_run_at or (now - timedelta(seconds=interval * 2))
+                next_due = last_run + timedelta(seconds=interval)
+                next_run_at = next_due.isoformat()
+                due_now = now >= next_due
+
             result.append(
                 {
                     "id": wf.id,
                     "name": wf.name,
                     "type": wf.type,
                     "status": wf.status,
+                    "is_active": is_active,
                     "notion_master_page_id": wf.notion_master_page_id,
                     "poll_interval_seconds": wf.poll_interval_seconds,
                     "last_run_at": wf.last_run_at.isoformat() if wf.last_run_at else None,
+                    "next_run_at": next_run_at,
+                    "due_now": due_now,
                     "created_at": wf.created_at.isoformat() if wf.created_at else None,
                     "updated_at": wf.updated_at.isoformat() if wf.updated_at else None,
                     "channels": [
@@ -2305,7 +2364,7 @@ async def create_workflow(payload: WorkflowCreateRequest):
             poll_interval_seconds=interval,
         )
 
-        return {
+        response = {
             "id": workflow.id,
             "name": workflow.name,
             "type": workflow.type,
@@ -2317,6 +2376,9 @@ async def create_workflow(payload: WorkflowCreateRequest):
             "updated_at": workflow.updated_at.isoformat() if workflow.updated_at else None,
             "channels": [],
         }
+
+        _reconcile_workflow_worker_state()
+        return response
     except HTTPException:
         raise
     except Exception as e:  # pragma: no cover - defensive logging
@@ -2380,7 +2442,7 @@ async def update_workflow_endpoint(workflow_id: str, payload: WorkflowUpdateRequ
             raise HTTPException(status_code=404, detail="Workflow not found")
 
         channels = db_manager.get_workflow_channels(workflow_id)
-        return {
+        response = {
             "id": workflow.id,
             "name": workflow.name,
             "type": workflow.type,
@@ -2402,6 +2464,9 @@ async def update_workflow_endpoint(workflow_id: str, payload: WorkflowUpdateRequ
                 for c in channels
             ],
         }
+
+        _reconcile_workflow_worker_state()
+        return response
     except HTTPException:
         raise
     except Exception as e:  # pragma: no cover - defensive logging
@@ -2414,6 +2479,7 @@ async def delete_workflow_endpoint(workflow_id: str):
     """Delete a workflow and its mappings."""
     try:
         db_manager.delete_workflow(workflow_id)
+        _reconcile_workflow_worker_state()
         return {"status": "ok"}
     except Exception as e:  # pragma: no cover - defensive logging
         logger.error(f"Error deleting workflow {workflow_id}: {e}", exc_info=True)

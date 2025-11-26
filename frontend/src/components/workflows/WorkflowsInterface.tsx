@@ -140,12 +140,17 @@ export default function WorkflowsInterface() {
   }, [])
 
   useEffect(() => {
+    const hasActive = workflows.some((w) => w.status === 'active')
+    if (!hasActive) {
+      return
+    }
+
     const id = window.setInterval(() => {
       loadWorkflows()
     }, 5000)
 
     return () => window.clearInterval(id)
-  }, [])
+  }, [workflows])
 
   // Timer effect: simple UX countdown that loops from the selected interval to 0.
   // This is intentionally decoupled from the actual worker scheduling and is

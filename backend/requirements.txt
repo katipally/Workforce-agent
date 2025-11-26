@@ -12,7 +12,7 @@ sentence-transformers==2.2.2
 
 # Transformer stack (used by sentence-transformers and related models)
 transformers==4.38.2
-torch==2.2.1
+#torch==2.2.1
 accelerate==0.27.2
 sentencepiece==0.2.0
 
@@ -28,6 +28,7 @@ alembic==1.13.1
 
 # Existing APIs
 slack-sdk==3.27.0
+slack-bolt
 google-api-python-client==2.118.0
 google-auth-httplib2==0.2.0
 google-auth-oauthlib==1.2.0
@@ -41,8 +42,5 @@ tqdm==4.66.1
 pydantic==2.6.1
 pydantic-settings==2.1.0
 aiofiles>=24.1.0
-
-# Testing (optional)
-pytest==8.0.0
-pytest-asyncio==0.23.4
-httpx==0.26.0
+colorlog
+requests

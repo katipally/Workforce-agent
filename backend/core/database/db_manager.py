@@ -1087,3 +1087,23 @@ class DatabaseManager:
                 )
                 .all()
             )
+
+    def delete_slack_notion_mapping(
+        self,
+        workflow_id: str,
+        slack_channel_id: str,
+        slack_ts: float,
+    ) -> None:
+        with self.get_session() as session:
+            mapping = (
+                session.query(SlackNotionMessageMapping)
+                .filter_by(
+                    workflow_id=workflow_id,
+                    slack_channel_id=slack_channel_id,
+                    slack_ts=slack_ts,
+                )
+                .first()
+            )
+            if mapping:
+                session.delete(mapping)
+                session.commit()
