@@ -26,6 +26,38 @@ export const useAuthStore = create<AuthState>((set) => ({
   async fetchMe() {
     try {
       set({ loading: true, error: null })
+      
+      // Check for session token in URL (Mobile Safari ITP workaround)
+      const urlParams = new URLSearchParams(window.location.search)
+      const sessionToken = urlParams.get('_session_token')
+      
+      if (sessionToken) {
+        console.log('[Auth] Found session token in URL, exchanging for cookie...')
+        try {
+          // Exchange token for cookie
+          const exchangeRes = await fetch(`${API_BASE_URL}/auth/session-exchange`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ token: sessionToken }),
+          })
+          
+          if (exchangeRes.ok) {
+            console.log('[Auth] Session cookie set successfully')
+            // Remove token from URL
+            urlParams.delete('_session_token')
+            const newUrl = urlParams.toString()
+              ? `${window.location.pathname}?${urlParams.toString()}`
+              : window.location.pathname
+            window.history.replaceState({}, '', newUrl)
+          } else {
+            console.error('[Auth] Failed to exchange session token:', exchangeRes.status)
+          }
+        } catch (e) {
+          console.error('[Auth] Error exchanging session token:', e)
+        }
+      }
+      
       const res = await fetch(`${API_BASE_URL}/auth/me`, {
         credentials: 'include',
       })

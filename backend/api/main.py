@@ -177,6 +177,13 @@ def _get_user_from_session_id(session_id: Optional[str]) -> AppUser:
 
 def get_current_user(request: Request) -> AppUser:
     session_id = request.cookies.get(SESSION_COOKIE_NAME)
+    if not session_id:
+        user_agent = request.headers.get("user-agent", "unknown")
+        logger.warning(
+            "No session cookie found - UserAgent: %s, Cookies: %s",
+            user_agent[:100] if user_agent else "none",
+            list(request.cookies.keys())
+        )
     return _get_user_from_session_id(session_id)
 
 
@@ -696,15 +703,96 @@ async def google_callback(request: Request, code: Optional[str] = None, state: O
         session.add(app_session)
         session.commit()
 
-    redirect_url = f"{default_redirect}{redirect_path}"
+    # Log successful session creation
+    user_agent = request.headers.get("user-agent", "unknown")
+    logger.info(
+        "OAuth callback successful - User: %s, SessionID: %s, UserAgent: %s",
+        email,
+        session_id,
+        user_agent[:100] if user_agent else "none"
+    )
+
+    # Add session token to URL as fallback for mobile Safari (ITP workaround)
+    # The frontend will call /auth/session-exchange to set the cookie
+    redirect_separator = "&" if "?" in redirect_path else "?"
+    redirect_url = f"{default_redirect}{redirect_path}{redirect_separator}_session_token={session_id}"
+    
     response = RedirectResponse(url=redirect_url, status_code=status.HTTP_302_FOUND)
     if session_id:
+        cookie_settings = _cookie_settings()
+        logger.info(
+            "Setting session cookie - SessionID: %s, Settings: %s",
+            session_id[:8] + "...",
+            cookie_settings
+        )
         response.set_cookie(
             key=SESSION_COOKIE_NAME,
             value=session_id,
             max_age=SESSION_TTL_SECONDS,
-            **_cookie_settings(),
+            **cookie_settings,
         )
+    return response
+
+
+@app.post("/auth/session-exchange")
+async def session_exchange(request: Request):
+    """Exchange a session token from URL for a proper session cookie.
+    
+    This is a workaround for mobile Safari's Intelligent Tracking Prevention (ITP)
+    which blocks cross-site cookies even with SameSite=None. The frontend calls
+    this endpoint with the token from the URL to set the cookie via a same-site request.
+    """
+    try:
+        body = await request.json()
+        token = body.get("token")
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid request body"
+        )
+    
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing token"
+        )
+    
+    # Validate the token is a valid session
+    with db_manager.get_session() as session:
+        app_session = session.query(AppSession).filter_by(id=token).first()
+        if not app_session:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired token"
+            )
+        
+        # Check if session is expired
+        if app_session.expires_at and app_session.expires_at < datetime.utcnow():
+            session.delete(app_session)
+            session.commit()
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session expired"
+            )
+        
+        # Update last_seen
+        app_session.last_seen_at = datetime.utcnow()
+        session.commit()
+    
+    # Set the cookie via a same-site response
+    response = JSONResponse({"detail": "session_set"})
+    cookie_settings = _cookie_settings()
+    logger.info(
+        "Session exchange successful - SessionID: %s, Settings: %s",
+        token[:8] + "...",
+        cookie_settings
+    )
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=token,
+        max_age=SESSION_TTL_SECONDS,
+        **cookie_settings,
+    )
     return response
 
 
@@ -722,8 +810,18 @@ async def logout(request: Request):
 
 
 @app.get("/auth/me")
-async def auth_me(current_user: AppUser = Depends(get_current_user)):
+async def auth_me(request: Request, current_user: AppUser = Depends(get_current_user)):
     """Return the current authenticated user's profile."""
+
+    # Log successful authentication
+    user_agent = request.headers.get("user-agent", "unknown")
+    session_id = request.cookies.get(SESSION_COOKIE_NAME, "none")
+    logger.info(
+        "Auth check successful - User: %s, SessionID: %s, UserAgent: %s",
+        current_user.email,
+        session_id[:8] + "..." if session_id != "none" else "none",
+        user_agent[:100] if user_agent else "none"
+    )
 
     return {
         "id": current_user.id,
