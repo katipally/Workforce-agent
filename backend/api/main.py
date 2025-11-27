@@ -4,6 +4,21 @@ Main application with WebSocket streaming support.
 """
 
 import asyncio
+import importlib.metadata as _importlib_metadata
+
+# Compatibility shim for Python 3.9: some dependencies expect
+# importlib.metadata.packages_distributions to exist.
+try:
+    _ = _importlib_metadata.packages_distributions
+except AttributeError:  # pragma: no cover - best-effort shim
+    try:
+        import importlib_metadata as _importlib_metadata_backport  # type: ignore[import]
+
+        _importlib_metadata.packages_distributions = (  # type: ignore[attr-defined]
+            _importlib_metadata_backport.packages_distributions
+        )
+    except Exception:
+        pass
 
 from fastapi import (
     FastAPI,
@@ -97,14 +112,24 @@ SESSION_TTL_SECONDS = 60 * 60 * 24 * 7
 
 
 def _cookie_settings() -> Dict[str, Any]:
-    secure = not (
+    is_local = (
         Config.FRONTEND_BASE_URL.startswith("http://localhost")
         or Config.FRONTEND_BASE_URL.startswith("http://127.0.0.1")
     )
+
+    if is_local:
+        return {
+            "path": "/",
+            "httponly": True,
+            "secure": False,
+            "samesite": "lax",
+        }
+
     return {
+        "path": "/",
         "httponly": True,
-        "secure": secure,
-        "samesite": "lax",
+        "secure": True,
+        "samesite": "none",
     }
 
 
@@ -307,12 +332,12 @@ from embeddings_sync import sync_embeddings_after_pipeline
 # Global variables
 rag_engine = None
 ai_brain = None  # Kept for backward-compatible health reporting; brains are built per-user.
-rag_lock: asyncio.Lock | None = None
-ai_brain_lock: asyncio.Lock | None = None
+rag_lock: Optional[asyncio.Lock] = None
+ai_brain_lock: Optional[asyncio.Lock] = None
 
 # Background workflow worker (Slack → Notion) state
-workflow_worker_thread: threading.Thread | None = None
-workflow_worker_stop_event: threading.Event | None = None
+workflow_worker_thread: Optional[threading.Thread] = None
+workflow_worker_stop_event: Optional[threading.Event] = None
 
 
 def _has_active_slack_to_notion_workflows() -> bool:
@@ -692,7 +717,7 @@ async def logout(request: Request):
         _delete_app_session(session_id)
 
     response = JSONResponse({"detail": "logged_out"})
-    response.delete_cookie(SESSION_COOKIE_NAME)
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/")
     return response
 
 
@@ -712,6 +737,8 @@ async def auth_me(current_user: AppUser = Depends(get_current_user)):
 _frontend_origins = ["http://localhost:5173", "http://localhost:3000"]
 if Config.FRONTEND_BASE_URL and Config.FRONTEND_BASE_URL not in _frontend_origins:
     _frontend_origins.append(Config.FRONTEND_BASE_URL)
+
+logger.info("Configured CORS allowed origins: %s", _frontend_origins)
 
 app.add_middleware(
     CORSMiddleware,
