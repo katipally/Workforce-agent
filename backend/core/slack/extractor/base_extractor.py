@@ -21,7 +21,8 @@ class BaseExtractor:
         db_manager: Optional[DatabaseManager] = None
     ):
         """Initialize base extractor."""
-        self.client = client or WebClient(token=Config.SLACK_BOT_TOKEN)
+        # Use 60-second timeout to prevent indefinite hangs on EC2
+        self.client = client or WebClient(token=Config.SLACK_BOT_TOKEN, timeout=60)
         self.db_manager = db_manager or DatabaseManager()
         self.rate_limiter = get_rate_limiter()
         self.workspace_id = None

@@ -31,8 +31,8 @@ class Config:
     SLACK_VERIFICATION_TOKEN = os.getenv("SLACK_VERIFICATION_TOKEN", "")
     
     # Database
-    # PostgreSQL for production, SQLite for dev
-    DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://localhost/workforce_agent")
+    # Connection string must be provided via environment (see .env.example)
+    DATABASE_URL = os.getenv("DATABASE_URL", "")
     
     # Data directories (relative to project root)
     BASE_DIR = Path(__file__).parent  # backend/core
@@ -51,8 +51,14 @@ class Config:
     GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
     GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
     GOOGLE_OAUTH_REDIRECT_BASE = os.getenv("GOOGLE_OAUTH_REDIRECT_BASE", "")
-    FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:5173")
+    # Base URL of the frontend application (must be set explicitly in .env)
+    FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "")
     SESSION_SECRET = os.getenv("SESSION_SECRET", "")
+    
+    # Cookie domain for cross-subdomain sharing in production
+    # Set to ".yourdomain.com" (with leading dot) to share cookies across subdomains
+    # e.g., ".dinoagent.com" allows cookies between app.dinoagent.com and api.dinoagent.com
+    COOKIE_DOMAIN = os.getenv("COOKIE_DOMAIN", "")
 
     # Safety & permissions configuration
     SLACK_MODE = os.getenv("SLACK_MODE", "standard").lower()
@@ -84,12 +90,12 @@ class Config:
     API_HOST = os.getenv("API_HOST", "0.0.0.0")
     
     # Rate limiting (requests per minute)
-    TIER_1_RATE_LIMIT = 1
-    TIER_2_RATE_LIMIT = 20
-    TIER_3_RATE_LIMIT = 50
+    TIER_1_RATE_LIMIT = int(os.getenv("TIER_1_RATE_LIMIT", "1"))
+    TIER_2_RATE_LIMIT = int(os.getenv("TIER_2_RATE_LIMIT", "20"))
+    TIER_3_RATE_LIMIT = int(os.getenv("TIER_3_RATE_LIMIT", "50"))
     TIER_4_RATE_LIMIT = int(os.getenv("TIER_4_RATE_LIMIT", "100"))
     DEFAULT_RATE_LIMIT = int(os.getenv("DEFAULT_RATE_LIMIT", "50"))
-    SPECIAL_RATE_LIMIT = 1  # For conversations.history on non-Marketplace apps
+    SPECIAL_RATE_LIMIT = int(os.getenv("SPECIAL_RATE_LIMIT", "1"))  # For conversations.history on non-Marketplace apps
     
     # Burst limiting
     MAX_BURST_REQUESTS = 5
@@ -106,7 +112,7 @@ class Config:
     
     # Logging
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-    LOG_FILE = os.getenv("LOG_FILE", "logs/slack_agent.log")
+    LOG_FILE = os.getenv("LOG_FILE", str(LOGS_DIR / "slack_agent.log"))
     
     # Workspace
     WORKSPACE_NAME = os.getenv("WORKSPACE_NAME", "")

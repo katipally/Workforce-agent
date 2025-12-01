@@ -43,6 +43,7 @@ from .models import (
     AppSession,
     UserSettings,
     AppSettings,
+    PipelineRun,
 )
 from utils.logger import get_logger
 
@@ -67,11 +68,16 @@ class DatabaseManager:
                          Format: postgresql://user:pass@host:port/dbname
         """
         self.database_url = database_url or Config.DATABASE_URL
+        if not self.database_url:
+            raise ValueError("DATABASE_URL is not configured. Set it in your .env file.")
+
         self.engine = create_engine(
             self.database_url,
             echo=False,  # Set to True for SQL query debugging
             pool_pre_ping=True,  # Verify connections before using
-            pool_recycle=3600  # Recycle connections after 1 hour
+            pool_recycle=3600,  # Recycle connections after 1 hour
+            pool_size=5,  # Base pool size
+            max_overflow=10,  # Allow up to 15 total connections
         )
         # expire_on_commit=False so objects (e.g., AppUser) remain usable after commits
         # in helper functions like get_current_user, where the session is closed
@@ -473,6 +479,16 @@ class DatabaseManager:
             if channel_id:
                 query = query.filter(Message.channel_id == channel_id)
             return query.scalar()
+
+    def get_messages_count_by_channel(self) -> Dict[str, int]:
+        """Get message counts for all channels in a single query (avoids N+1)."""
+        with self.get_session() as session:
+            results = (
+                session.query(Message.channel_id, func.count(Message.message_id))
+                .group_by(Message.channel_id)
+                .all()
+            )
+            return {channel_id: count for channel_id, count in results}
     
     def get_statistics(self) -> Dict[str, Any]:
         """Get database statistics."""

@@ -713,3 +713,29 @@ class AppSettings(Base):
     __table_args__ = (
         Index("idx_app_settings_scope", "scope"),
     )
+
+
+class PipelineRun(Base):
+    """Track pipeline run status across multiple workers.
+    
+    Stores status for Slack, Notion, Gmail pipelines so that
+    status can be queried from any Uvicorn worker.
+    """
+    
+    __tablename__ = "pipeline_runs"
+    
+    run_id = Column(String(64), primary_key=True)
+    pipeline_type = Column(String(50), nullable=False)  # 'slack', 'notion', 'gmail'
+    status = Column(String(50), default="pending")  # pending, running, completed, failed, cancelled
+    created_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    stats = Column(JSON, default=dict)
+    error = Column(Text, nullable=True)
+    config = Column(JSON, default=dict)  # Store include_archived, download_files, etc.
+    cancel_requested = Column(Boolean, default=False)
+    
+    __table_args__ = (
+        Index("idx_pipeline_runs_type_status", "pipeline_type", "status"),
+        Index("idx_pipeline_runs_created", "created_at"),
+    )
