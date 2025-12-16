@@ -18,7 +18,7 @@ const MAX_RECONNECT_ATTEMPTS = 5
 
 export function useWebSocket(): WebSocketHook {
   const wsRef = useRef<WebSocket | null>(null)
-  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const reconnectAttemptsRef = useRef(0)
   const [isConnected, setIsConnected] = useState(false)
   const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected' | 'error'>('connecting')
@@ -137,14 +137,20 @@ export function useWebSocket(): WebSocketHook {
       setIsStreaming(true)
       clearReasoningSteps()
       
-      // Get current session ID from store
-      const { currentSessionId } = useChatStore.getState()
+      // Get current session ID and source preferences from store
+      const { currentSessionId, sessionSourcePrefs } = useChatStore.getState()
+      const prefs = sessionSourcePrefs[currentSessionId] || {
+        slack: true,
+        gmail: true,
+        notion: true,
+      }
       
-      // Send query with session ID
+      // Send query with session ID and source preferences
       try {
         wsRef.current.send(JSON.stringify({ 
           query,
-          session_id: currentSessionId
+          session_id: currentSessionId,
+          source_prefs: prefs,
         }))
         console.log('Query sent:', query.substring(0, 50) + '... (session:', currentSessionId + ')')
       } catch (error) {

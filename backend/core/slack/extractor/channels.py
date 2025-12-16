@@ -15,7 +15,9 @@ class ChannelExtractor(BaseExtractor):
     def extract_all_channels(
         self,
         types: str = "public_channel,private_channel,mpim,im",
-        exclude_archived: bool = False
+        exclude_archived: bool = False,
+        progress_callback=None,
+        cancel_check=None,
     ) -> int:
         """Extract all channels from workspace."""
         logger.info(f"Starting channel extraction (types: {types})")
@@ -35,17 +37,39 @@ class ChannelExtractor(BaseExtractor):
             channels_list.append(channel)
         
         logger.info(f"Fetched {len(channels_list)} channels. Saving to database...")
+
+        total = len(channels_list)
+        if progress_callback:
+            try:
+                progress_callback({"stage": "fetched", "progress": 0.1 if total else 1.0, "total": total})
+            except Exception:
+                logger.debug("progress_callback failed at fetched stage", exc_info=True)
         
         # Save to database with progress bar
-        with tqdm(total=len(channels_list), desc="Saving channels") as pbar:
-            for channel in channels_list:
+        with tqdm(total=total, desc="Saving channels") as pbar:
+            for idx, channel in enumerate(channels_list, 1):
                 try:
+                    if cancel_check and cancel_check():
+                        logger.info("Channel extraction cancelled")
+                        raise KeyboardInterrupt()
                     self.db_manager.save_channel(channel, self.workspace_id)
                     count += 1
                     pbar.update(1)
+                    if progress_callback and (idx % max(1, total // 20) == 0 or idx == total):
+                        try:
+                            frac = idx / total if total else 1.0
+                            progress_callback({"stage": "saving", "progress": 0.1 + 0.85 * frac, "saved": idx, "total": total})
+                        except Exception:
+                            logger.debug("progress_callback failed during saving stage", exc_info=True)
                 except Exception as e:
                     logger.error(f"Failed to save channel {channel.get('id')}: {e}")
         
+        if progress_callback:
+            try:
+                progress_callback({"stage": "completed", "progress": 1.0, "saved": count, "total": total})
+            except Exception:
+                logger.debug("progress_callback failed at completed stage", exc_info=True)
+
         logger.info(f"Channel extraction complete. Saved {count} channels")
         return count
     

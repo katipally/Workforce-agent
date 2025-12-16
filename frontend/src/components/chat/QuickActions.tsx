@@ -99,10 +99,10 @@ interface QuickActionsProps {
 
 export default function QuickActions({ onActionClick, className = '' }: QuickActionsProps) {
   const categoryColors = {
-    slack: 'bg-purple-50 text-purple-600 hover:bg-purple-100',
-    gmail: 'bg-red-50 text-red-600 hover:bg-red-100',
-    notion: 'bg-blue-50 text-blue-600 hover:bg-blue-100',
-    search: 'bg-green-50 text-green-600 hover:bg-green-100'
+    slack: 'bg-purple-500/10 text-purple-600 hover:bg-purple-500/20 dark:text-purple-400 dark:bg-purple-500/20 dark:hover:bg-purple-500/30',
+    gmail: 'bg-red-500/10 text-red-600 hover:bg-red-500/20 dark:text-red-400 dark:bg-red-500/20 dark:hover:bg-red-500/30',
+    notion: 'bg-blue-500/10 text-blue-600 hover:bg-blue-500/20 dark:text-blue-400 dark:bg-blue-500/20 dark:hover:bg-blue-500/30',
+    search: 'bg-green-500/10 text-green-600 hover:bg-green-500/20 dark:text-green-400 dark:bg-green-500/20 dark:hover:bg-green-500/30'
   }
 
   return (
@@ -111,7 +111,7 @@ export default function QuickActions({ onActionClick, className = '' }: QuickAct
       <div>
         <div className="flex items-center gap-2 mb-3">
           <Zap className="h-5 w-5 text-yellow-500" />
-          <h3 className="text-sm font-semibold text-gray-700">Quick Actions</h3>
+          <h3 className="text-sm font-semibold text-foreground">Quick Actions</h3>
         </div>
         <div className="grid grid-cols-2 gap-2">
           {quickActions.map((action) => (
@@ -138,7 +138,7 @@ export default function QuickActions({ onActionClick, className = '' }: QuickAct
       <div>
         <div className="flex items-center gap-2 mb-3">
           <ArrowRight className="h-5 w-5 text-blue-500" />
-          <h3 className="text-sm font-semibold text-gray-700">Workflow Templates</h3>
+          <h3 className="text-sm font-semibold text-foreground">Workflow Templates</h3>
         </div>
         <div className="space-y-2">
           {workflowTemplates.map((workflow) => (
@@ -146,27 +146,27 @@ export default function QuickActions({ onActionClick, className = '' }: QuickAct
               key={workflow.id}
               onClick={() => onActionClick(workflow.prompt)}
               className="
-                w-full flex items-start gap-3 p-3 rounded-lg border border-gray-200
-                bg-white hover:bg-gray-50 hover:border-gray-300 transition-all text-left
+                w-full flex items-start gap-3 p-3 rounded-lg border border-border
+                bg-card hover:bg-muted transition-all text-left
               "
             >
               <div className="flex-1">
-                <div className="text-sm font-medium text-gray-900 mb-1">{workflow.title}</div>
-                <div className="text-xs text-gray-500 mb-2">{workflow.description}</div>
+                <div className="text-sm font-medium text-foreground mb-1">{workflow.title}</div>
+                <div className="text-xs text-muted-foreground mb-2">{workflow.description}</div>
                 <div className="flex flex-wrap gap-1">
                   {workflow.steps.map((step, idx) => (
                     <span key={idx}>
-                      <span className="text-xs bg-gray-100 px-2 py-0.5 rounded text-gray-600">
+                      <span className="text-xs bg-muted px-2 py-0.5 rounded text-muted-foreground">
                         {step}
                       </span>
                       {idx < workflow.steps.length - 1 && (
-                        <span className="text-xs text-gray-400 mx-1">→</span>
+                        <span className="text-xs text-muted-foreground mx-1">→</span>
                       )}
                     </span>
                   ))}
                 </div>
               </div>
-              <ArrowRight className="h-4 w-4 text-gray-400 mt-1 flex-shrink-0" />
+              <ArrowRight className="h-4 w-4 text-muted-foreground mt-1 flex-shrink-0" />
             </button>
           ))}
         </div>

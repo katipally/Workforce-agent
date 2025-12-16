@@ -17,7 +17,7 @@ this function.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Set, Optional
 
 from core.database.db_manager import DatabaseManager
 from core.slack.client import SlackClient
@@ -181,7 +181,7 @@ def process_workflow_once(workflow_id: str) -> Dict[str, Any]:
     # users.info once per user per run.
     user_name_cache: Dict[str, str] = {}
 
-    def _resolve_user_name(user_id: str | None) -> str:
+    def _resolve_user_name(user_id: Optional[str]) -> str:
         if not user_id:
             return "someone"
         if user_id in user_name_cache:

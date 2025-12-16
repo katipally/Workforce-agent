@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, memo } from 'react'
 import { Message as MessageType, useChatStore } from '../../store/chatStore'
 import { Bot, Copy, ThumbsUp, ThumbsDown } from 'lucide-react'
 import { cn } from '../../lib/utils'
@@ -22,6 +22,15 @@ export default function MessageList({
   onSendMessage,
 }: MessageListProps) {
   const { currentReasoningSteps } = useChatStore()
+  const MAX_VISIBLE_MESSAGES = 60
+
+  const totalMessages = messages.length
+  const [showAllMessages, setShowAllMessages] = useState(false)
+
+  const visibleMessages =
+    showAllMessages || totalMessages <= MAX_VISIBLE_MESSAGES
+      ? messages
+      : messages.slice(totalMessages - MAX_VISIBLE_MESSAGES)
   
   if (messages.length === 0 && !streamingMessage) {
     return (
@@ -44,7 +53,19 @@ export default function MessageList({
   return (
     <ChatContainerRoot className="flex-1">
       <ChatContainerContent className="mx-auto w-full max-w-3xl space-y-12 px-4 py-12">
-        {messages.map((message) => (
+        {!showAllMessages && totalMessages > MAX_VISIBLE_MESSAGES && (
+          <div className="flex justify-center">
+            <button
+              type="button"
+              className="rounded-full border border-border bg-background/60 px-4 py-1 text-xs text-muted-foreground hover:bg-background"
+              onClick={() => setShowAllMessages(true)}
+            >
+              Show older messages ({totalMessages - visibleMessages.length} hidden)
+            </button>
+          </div>
+        )}
+
+        {visibleMessages.map((message) => (
           <MessageBubble
             key={message.id}
             message={message}
@@ -104,7 +125,7 @@ export default function MessageList({
   )
 }
 
-function MessageBubble({
+const MessageBubble = memo(function MessageBubble({
   message,
   onSendMessage,
 }: {
@@ -204,6 +225,11 @@ function MessageBubble({
                         labelParts.push('Gmail')
                         if (source.metadata.from) labelParts.push(source.metadata.from)
                         if (source.metadata.subject) labelParts.push(source.metadata.subject)
+                      } else if (source.type === 'notion') {
+                        labelParts.push('Notion')
+                        if ((source.metadata as any).title) {
+                          labelParts.push((source.metadata as any).title as string)
+                        }
                       }
                       const label = labelParts.join(' · ') || source.type
 
@@ -266,4 +292,4 @@ function MessageBubble({
       {isUser && <MessageAvatar fallback="You" className="bg-gray-600" />}
     </Message>
   )
-}
+})

@@ -12,6 +12,7 @@ from typing import Optional, List, Dict, Any
 from sqlalchemy import create_engine, func, text, inspect
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from config import Config
 from .models import (
@@ -44,6 +45,9 @@ from .models import (
     UserSettings,
     AppSettings,
     PipelineRun,
+    ProjectSyncCursor,
+    UserWorkflow,
+    WorkflowRun,
 )
 from utils.logger import get_logger
 
@@ -75,9 +79,10 @@ class DatabaseManager:
             self.database_url,
             echo=False,  # Set to True for SQL query debugging
             pool_pre_ping=True,  # Verify connections before using
-            pool_recycle=3600,  # Recycle connections after 1 hour
-            pool_size=5,  # Base pool size
-            max_overflow=10,  # Allow up to 15 total connections
+            pool_recycle=1800,  # Recycle connections after 30 min (reduce memory)
+            pool_size=2,  # Reduced for t3.small (2GB RAM, 2 workers = 4 base connections)
+            max_overflow=3,  # Allow up to 5 per worker = 10 total connections max
+            pool_timeout=30,  # Wait max 30s for a connection
         )
         # expire_on_commit=False so objects (e.g., AppUser) remain usable after commits
         # in helper functions like get_current_user, where the session is closed
@@ -104,8 +109,9 @@ class DatabaseManager:
                 needs_object_type = "object_type" not in columns
                 needs_url = "url" not in columns
                 needs_raw = "raw_data" not in columns
+                needs_embedding = "embedding" not in columns
 
-                if needs_object_type or needs_url or needs_raw:
+                if needs_object_type or needs_url or needs_raw or needs_embedding:
                     dialect = self.engine.dialect.name
                     json_type = "JSON" if dialect == "postgresql" else "TEXT"
 
@@ -121,6 +127,10 @@ class DatabaseManager:
                         if needs_raw:
                             conn.execute(
                                 text(f"ALTER TABLE notion_pages ADD COLUMN raw_data {json_type}")
+                            )
+                        if needs_embedding:
+                            conn.execute(
+                                text(f"ALTER TABLE notion_pages ADD COLUMN embedding {json_type}")
                             )
 
                 # Older schemas had a self-referential foreign key on parent_id
@@ -180,12 +190,95 @@ class DatabaseManager:
                                 )
                             )
 
+            # Best-effort indexes for project sync / embedding scans (Postgres only)
+            if self.engine.dialect.name == "postgresql":
+                with self.engine.begin() as conn:
+                    try:
+                        conn.execute(
+                            text(
+                                "CREATE INDEX IF NOT EXISTS idx_messages_channel_ts_unembedded "
+                                "ON messages (channel_id, timestamp DESC) WHERE embedding IS NULL"
+                            )
+                        )
+                    except Exception:
+                        pass
+
+                    try:
+                        conn.execute(
+                            text(
+                                "CREATE INDEX IF NOT EXISTS idx_gmail_account_date_unembedded "
+                                "ON gmail_messages (account_email, date DESC) WHERE embedding IS NULL"
+                            )
+                        )
+                    except Exception:
+                        pass
+
+                    try:
+                        conn.execute(
+                            text(
+                                "CREATE INDEX IF NOT EXISTS idx_gmail_label_ids_gin "
+                                "ON gmail_messages USING GIN ((label_ids::jsonb))"
+                            )
+                        )
+                    except Exception:
+                        pass
+
+                    try:
+                        conn.execute(
+                            text(
+                                "CREATE INDEX IF NOT EXISTS idx_notion_workspace_last_edited_unembedded "
+                                "ON notion_pages (workspace_id, last_edited_time DESC) WHERE embedding IS NULL"
+                            )
+                        )
+                    except Exception:
+                        pass
+
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error(f"Schema upgrade error: {e}", exc_info=True)
     
     def get_session(self) -> Session:
         """Get database session."""
         return self.SessionLocal()
+
+    def get_project_sync_cursor(
+        self,
+        project_id: str,
+        source_type: str,
+        source_id: str,
+    ) -> Optional[float]:
+        with self.get_session() as session:
+            row = (
+                session.query(ProjectSyncCursor)
+                .filter_by(project_id=project_id, source_type=source_type, source_id=source_id)
+                .first()
+            )
+            return row.cursor_value if row else None
+
+    def upsert_project_sync_cursor(
+        self,
+        project_id: str,
+        source_type: str,
+        source_id: str,
+        cursor_value: Optional[float],
+    ) -> None:
+        with self.get_session() as session:
+            row = (
+                session.query(ProjectSyncCursor)
+                .filter_by(project_id=project_id, source_type=source_type, source_id=source_id)
+                .first()
+            )
+            if row:
+                row.cursor_value = cursor_value
+                row.updated_at = datetime.utcnow()
+            else:
+                row = ProjectSyncCursor(
+                    project_id=project_id,
+                    source_type=source_type,
+                    source_id=source_id,
+                    cursor_value=cursor_value,
+                )
+                session.add(row)
+            session.commit()
     
     # Workspace operations
     def save_workspace(self, workspace_data: Dict[str, Any]) -> Workspace:
@@ -322,14 +415,34 @@ class DatabaseManager:
             return channel
     
     # Message operations
-    def save_message(self, message_data: Dict[str, Any], channel_id: str) -> Message:
-        """Save or update message."""
-        with self.get_session() as session:
+    def save_message(
+        self,
+        message_data: Dict[str, Any],
+        channel_id: str,
+        session: Optional[Session] = None,
+        commit: bool = True,
+    ) -> Message:
+        """Save or update message.
+
+        Args:
+            message_data: Slack message JSON.
+            channel_id: Channel ID for scoping message_id.
+            session: Optional existing SQLAlchemy session for batched writes.
+            commit: When using an external session, set commit=False and commit in batches.
+        """
+
+        owns_session = session is None
+        if owns_session:
+            session = self.get_session()
+
+        assert session is not None
+
+        try:
             ts = float(message_data.get("ts", 0))
             message_id = f"{channel_id}_{ts}"
-            
+
             message = session.query(Message).filter_by(message_id=message_id).first()
-            
+
             if message:
                 message.text = message_data.get("text", "")
                 message.message_type = message_data.get("type", "message")
@@ -337,11 +450,11 @@ class DatabaseManager:
                 message.blocks = message_data.get("blocks")
                 message.attachments = message_data.get("attachments")
                 message.raw_data = message_data
-                
+
                 if "edited" in message_data:
                     message.is_edited = True
                     message.edited_ts = float(message_data["edited"].get("ts", 0))
-                
+
                 message.updated_at = datetime.utcnow()
             else:
                 message = Message(
@@ -358,18 +471,24 @@ class DatabaseManager:
                     reply_users_count=message_data.get("reply_users_count", 0),
                     blocks=message_data.get("blocks"),
                     attachments=message_data.get("attachments"),
-                    raw_data=message_data
+                    raw_data=message_data,
                 )
                 session.add(message)
-            
+
             # Handle reactions
             if "reactions" in message_data:
                 for reaction_data in message_data["reactions"]:
                     self._save_reactions(session, message_id, reaction_data)
-            
-            session.commit()
-            session.refresh(message)
+
+            if commit:
+                session.commit()
+                session.refresh(message)
+
             return message
+
+        finally:
+            if owns_session:
+                session.close()
     
     def _save_reactions(self, session: Session, message_id: str, reaction_data: Dict[str, Any]):
         """Save reactions for a message."""
@@ -377,11 +496,29 @@ class DatabaseManager:
         users = reaction_data.get("users", [])
         
         for user_id in users:
+            if self.engine.dialect.name == "postgresql":
+                stmt = (
+                    pg_insert(Reaction.__table__)
+                    .values(message_id=message_id, user_id=user_id, emoji_name=emoji)
+                    .on_conflict_do_nothing(index_elements=["message_id", "user_id", "emoji_name"])
+                )
+                session.execute(stmt)
+                continue
+
+            # Fallback for non-Postgres backends (e.g. tests)
             try:
+                existing = (
+                    session.query(Reaction)
+                    .filter_by(message_id=message_id, user_id=user_id, emoji_name=emoji)
+                    .first()
+                )
+                if existing:
+                    continue
+
                 reaction = Reaction(
                     message_id=message_id,
                     user_id=user_id,
-                    emoji_name=emoji
+                    emoji_name=emoji,
                 )
                 session.add(reaction)
             except IntegrityError:
@@ -1123,3 +1260,237 @@ class DatabaseManager:
             if mapping:
                 session.delete(mapping)
                 session.commit()
+
+    # ========================================================================
+    # User Workflow Operations (v2 Modular Workflows)
+    # ========================================================================
+
+    def create_user_workflow(
+        self,
+        owner_user_id: str,
+        name: str,
+        description: Optional[str] = None,
+        source_config: Optional[Dict[str, Any]] = None,
+        prompt_config: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
+        schedule_type: str = "manual",
+        schedule_config: Optional[Dict[str, Any]] = None,
+    ) -> UserWorkflow:
+        """Create a new user workflow."""
+        with self.get_session() as session:
+            workflow = UserWorkflow(
+                owner_user_id=owner_user_id,
+                name=name,
+                description=description,
+                source_config=source_config or {},
+                prompt_config=prompt_config or {},
+                output_config=output_config or {},
+                schedule_type=schedule_type,
+                schedule_config=schedule_config or {},
+                status="draft",
+            )
+            session.add(workflow)
+            session.commit()
+            session.refresh(workflow)
+            return workflow
+
+    def list_user_workflows(
+        self, owner_user_id: str, limit: int = 100
+    ) -> List[UserWorkflow]:
+        """List user workflows ordered by most recently updated."""
+        with self.get_session() as session:
+            return (
+                session.query(UserWorkflow)
+                .filter(UserWorkflow.owner_user_id == owner_user_id)
+                .order_by(UserWorkflow.updated_at.desc())
+                .limit(limit)
+                .all()
+            )
+
+    def get_user_workflow(
+        self, workflow_id: str, owner_user_id: Optional[str] = None
+    ) -> Optional[UserWorkflow]:
+        """Get a user workflow by ID."""
+        with self.get_session() as session:
+            query = session.query(UserWorkflow).filter(UserWorkflow.id == workflow_id)
+            if owner_user_id:
+                query = query.filter(UserWorkflow.owner_user_id == owner_user_id)
+            return query.first()
+
+    def update_user_workflow(
+        self, workflow_id: str, owner_user_id: Optional[str] = None, **fields: Any
+    ) -> Optional[UserWorkflow]:
+        """Update a user workflow's fields."""
+        with self.get_session() as session:
+            query = session.query(UserWorkflow).filter(UserWorkflow.id == workflow_id)
+            if owner_user_id:
+                query = query.filter(UserWorkflow.owner_user_id == owner_user_id)
+            workflow = query.first()
+            if not workflow:
+                return None
+
+            for key, value in fields.items():
+                if hasattr(workflow, key):
+                    setattr(workflow, key, value)
+
+            workflow.updated_at = datetime.utcnow()
+            session.commit()
+            session.refresh(workflow)
+            return workflow
+
+    def delete_user_workflow(
+        self, workflow_id: str, owner_user_id: Optional[str] = None
+    ) -> bool:
+        """Delete a user workflow and all its runs."""
+        with self.get_session() as session:
+            query = session.query(UserWorkflow).filter(UserWorkflow.id == workflow_id)
+            if owner_user_id:
+                query = query.filter(UserWorkflow.owner_user_id == owner_user_id)
+            workflow = query.first()
+            if workflow:
+                session.delete(workflow)
+                session.commit()
+                return True
+            return False
+
+    def get_active_scheduled_workflows(self) -> List[UserWorkflow]:
+        """Get all active workflows that have scheduling enabled."""
+        with self.get_session() as session:
+            return (
+                session.query(UserWorkflow)
+                .filter(
+                    UserWorkflow.status == "active",
+                    UserWorkflow.schedule_type != "manual",
+                )
+                .all()
+            )
+
+    # ========================================================================
+    # Workflow Run Operations
+    # ========================================================================
+
+    def create_workflow_run(self, workflow_id: str) -> WorkflowRun:
+        """Create a new workflow run."""
+        with self.get_session() as session:
+            run = WorkflowRun(
+                workflow_id=workflow_id,
+                status="pending",
+                current_step="initializing",
+                progress_percent=0,
+                logs=[],
+            )
+            session.add(run)
+            session.commit()
+            session.refresh(run)
+            return run
+
+    def get_workflow_run(self, run_id: str) -> Optional[WorkflowRun]:
+        """Get a workflow run by ID."""
+        with self.get_session() as session:
+            return session.query(WorkflowRun).filter(WorkflowRun.id == run_id).first()
+
+    def list_workflow_runs(
+        self, workflow_id: str, limit: int = 20
+    ) -> List[WorkflowRun]:
+        """List runs for a workflow ordered by most recent."""
+        with self.get_session() as session:
+            return (
+                session.query(WorkflowRun)
+                .filter(WorkflowRun.workflow_id == workflow_id)
+                .order_by(WorkflowRun.created_at.desc())
+                .limit(limit)
+                .all()
+            )
+
+    def update_workflow_run(self, run_id: str, **fields: Any) -> Optional[WorkflowRun]:
+        """Update a workflow run's fields."""
+        with self.get_session() as session:
+            run = session.query(WorkflowRun).filter(WorkflowRun.id == run_id).first()
+            if not run:
+                return None
+
+            for key, value in fields.items():
+                if hasattr(run, key):
+                    setattr(run, key, value)
+
+            session.commit()
+            session.refresh(run)
+            return run
+
+    def add_workflow_run_log(
+        self, run_id: str, level: str, message: str
+    ) -> Optional[WorkflowRun]:
+        """Add a log entry to a workflow run."""
+        with self.get_session() as session:
+            run = session.query(WorkflowRun).filter(WorkflowRun.id == run_id).first()
+            if not run:
+                return None
+
+            logs = list(run.logs or [])
+            logs.append({
+                "timestamp": datetime.utcnow().isoformat(),
+                "level": level,
+                "message": message,
+            })
+            run.logs = logs
+            session.commit()
+            session.refresh(run)
+            return run
+
+    # ========================================================================
+    # Source Data Helpers (for workflow source block)
+    # ========================================================================
+
+    def get_slack_messages_for_workflow(
+        self,
+        channel_ids: List[str],
+        since_timestamp: Optional[float] = None,
+        limit: int = 500,
+    ) -> List[Message]:
+        """Get Slack messages from specified channels for workflow processing."""
+        with self.get_session() as session:
+            query = session.query(Message).filter(Message.channel_id.in_(channel_ids))
+            if since_timestamp:
+                query = query.filter(Message.timestamp >= since_timestamp)
+            return (
+                query.order_by(Message.timestamp.desc())
+                .limit(limit)
+                .all()
+            )
+
+    def get_gmail_messages_for_workflow(
+        self,
+        label_ids: Optional[List[str]] = None,
+        since_date: Optional[datetime] = None,
+        limit: int = 500,
+    ) -> List[GmailMessage]:
+        """Get Gmail messages for workflow processing."""
+        with self.get_session() as session:
+            query = session.query(GmailMessage)
+            if since_date:
+                query = query.filter(GmailMessage.date >= since_date)
+            # Filter by labels if specified (labels are stored as JSON array)
+            messages = query.order_by(GmailMessage.date.desc()).limit(limit * 2).all()
+            
+            if label_ids:
+                # Filter in Python since label_ids is JSON
+                filtered = []
+                for msg in messages:
+                    msg_labels = msg.label_ids or []
+                    if any(lid in msg_labels for lid in label_ids):
+                        filtered.append(msg)
+                        if len(filtered) >= limit:
+                            break
+                return filtered
+            return messages[:limit]
+
+    def get_notion_pages_for_workflow(
+        self, page_ids: List[str]
+    ) -> List[NotionPage]:
+        """Get Notion pages for workflow processing."""
+        with self.get_session() as session:
+            return (
+                session.query(NotionPage)
+                .filter(NotionPage.page_id.in_(page_ids))
+                .all()
+            )

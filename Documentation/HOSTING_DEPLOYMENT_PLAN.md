@@ -119,6 +119,15 @@ FRONTEND_BASE_URL=http://localhost:5173
 # Strong random string for signing session cookies and OAuth state
 SESSION_SECRET=change-me-to-a-long-random-string
 
+# Cookie domain for cross-subdomain auth (CRITICAL for production)
+# If frontend is app.yourdomain.com and backend is api.yourdomain.com,
+# set COOKIE_DOMAIN=.yourdomain.com (with leading dot)
+# This allows the session cookie to be shared across subdomains
+COOKIE_DOMAIN=.yourdomain.com
+
+# Additional CORS origins (comma-separated, usually same as FRONTEND_BASE_URL)
+CORS_ALLOWED_ORIGINS=https://app.yourdomain.com
+
 # ============================================================================
 # DATABASE CONFIGURATION (Supabase in production)
 # ============================================================================
@@ -362,6 +371,11 @@ uvicorn api.main:app --host 0.0.0.0 --port 8000
 
 If this works, your backend + Supabase + Slack/Notion tokens are correctly wired.
 
+```bash
+git status
+
+git pull
+```
 ### 4.9 Create a systemd service for the backend
 
 Stop the manual `uvicorn` process (`Ctrl+C`), then create a systemd unit:
@@ -524,6 +538,91 @@ sudo systemctl restart workforce-backend
 ```
 
 This ensures CORS allows the frontend origin, and cookies/websockets work correctly.
+
+Clean up the stopped jobs
+```bash
+# Show background/suspended jobs
+jobs
+
+# If you see things like [1] and [2], kill them:
+kill %1
+kill %2
+```
+
+```bash
+How to keep uvicorn running in the background
+
+Step 1: Create the service file
+On EC2:
+
+sudo nano /etc/systemd/system/workforce-backend.service
+
+Paste this (adjust only if your paths differ):
+
+[Unit]
+Description=Workforce Backend (Uvicorn)
+After=network.target
+
+[Service]
+User=ec2-user
+WorkingDirectory=/home/ec2-user/Agent-Hosting/backend
+Environment="PATH=/home/ec2-user/Agent-Hosting/.venv/bin"
+ExecStart=/home/ec2-user/Agent-Hosting/.venv/bin/uvicorn api.main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+
+Save and exit.
+
+Step 2: Enable and start the service
+
+sudo systemctl daemon-reload
+sudo systemctl enable workforce-backend
+sudo systemctl start workforce-backend
+sudo systemctl status workforce-backend
+
+status should show active (running).
+
+Now uvicorn runs in the background, managed by systemd.
+
+Step 3: How to control it later
+Restart after code or .env changes:
+sudo systemctl restart workforce-backend
+
+View recent logs:
+sudo journalctl -u workforce-backend -n 100 -f
+
+Stop it (if you ever need to):
+sudo systemctl stop workforce-backend
+```
+
+```bash
+Commands to safely inspect and change workers (systemd)
+
+1) View the exact service file (you tried with <service> placeholder)
+
+sudo systemctl status workforce-backend.service --no-pager -l
+sudo systemctl cat workforce-backend.service --no-pager
+
+2) Edit the service (recommended method)
+This opens the full unit in an editor:
+
+sudo systemctl edit --full workforce-backend.service
+Find the ExecStart=... line and adjust workers.
+
+3) Apply changes
+
+sudo systemctl daemon-reload
+sudo systemctl restart workforce-backend.service
+sudo systemctl status workforce-backend.service --no-pager -l
+
+4) Verify the new worker count is actually running
+
+ps auxww | grep uvicorn | grep -v grep
+ss -lntp | grep :8000
+```
 
 ---
 
@@ -760,3 +859,35 @@ If you created **additional** VPCs, subnets, route tables, or Network ACLs speci
 Do **not** delete the default VPC or its default subnets/route tables/NACLs unless you are sure you understand the consequences.
 
 After this cleanup, you can follow this document again from Section 4 to create a fresh EC2 backend and reconnect your domain cleanly.
+
+---
+
+## 11. Troubleshooting Common Issues
+
+For detailed troubleshooting of OAuth login loops, SSL errors, and cookie issues, see:
+
+**[HOSTING_TROUBLESHOOTING.md](./HOSTING_TROUBLESHOOTING.md)**
+
+### Quick Reference: OAuth Loop Fix
+
+If users experience login loops (sign in → OAuth → sign in again), the most common cause is **third-party cookie blocking**. The solution is to use the **same root domain** for frontend and backend:
+
+```
+❌ WRONG (different domains, cookies blocked):
+   Frontend: dinoagent.vercel.app
+   Backend:  api.dinoagent.run.place
+
+✅ CORRECT (same root domain, cookies work):
+   Frontend: app.dinoagent.com
+   Backend:  api.dinoagent.com
+```
+
+**Required `.env` settings for same-domain setup:**
+```env
+FRONTEND_BASE_URL=https://app.yourdomain.com
+GOOGLE_OAUTH_REDIRECT_BASE=https://api.yourdomain.com
+COOKIE_DOMAIN=.yourdomain.com
+CORS_ALLOWED_ORIGINS=https://app.yourdomain.com
+```
+
+See the troubleshooting guide for complete details.

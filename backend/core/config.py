@@ -29,6 +29,8 @@ class Config:
     SLACK_CLIENT_SECRET = os.getenv("SLACK_CLIENT_SECRET", "")
     SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "")
     SLACK_VERIFICATION_TOKEN = os.getenv("SLACK_VERIFICATION_TOKEN", "")
+
+    SLACK_CONVERSATIONS_HISTORY_LIMIT = int(os.getenv("SLACK_CONVERSATIONS_HISTORY_LIMIT", "15"))
     
     # Database
     # Connection string must be provided via environment (see .env.example)
@@ -40,7 +42,8 @@ class Config:
     DATA_DIR = PROJECT_ROOT / os.getenv("DATA_DIR", "data")
     FILES_DIR = PROJECT_ROOT / os.getenv("FILES_DIR", "data/files")
     EXPORT_DIR = PROJECT_ROOT / os.getenv("EXPORT_DIR", "data/raw_exports")
-    LOGS_DIR = PROJECT_ROOT / "logs"
+    # LOGS_DIR uses backend directory for consistency (logs written here on both local and EC2)
+    LOGS_DIR = BASE_DIR.parent / "logs"
     PROJECT_REGISTRY_FILE = PROJECT_ROOT / os.getenv("PROJECT_REGISTRY_FILE", "data/project_registry.json")
     
     # Notion credentials
@@ -121,6 +124,10 @@ class Config:
     # Performance
     BATCH_SIZE = 100
     WORKER_THREADS = 4
+
+    AUTO_SYNC_EMBEDDINGS_AFTER_PIPELINE = (
+        os.getenv("AUTO_SYNC_EMBEDDINGS_AFTER_PIPELINE", "false").lower() == "true"
+    )
     
     @classmethod
     def create_directories(cls):

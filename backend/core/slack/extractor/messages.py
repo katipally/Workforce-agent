@@ -1,5 +1,5 @@
 """Message extractor."""
-from typing import Optional, List
+from typing import Optional, List, Callable, Dict
 from tqdm import tqdm
 import time
 
@@ -18,7 +18,9 @@ class MessageExtractor(BaseExtractor):
         channel_id: str,
         oldest: Optional[float] = None,
         latest: Optional[float] = None,
-        include_threads: bool = True
+        include_threads: bool = True,
+        progress_callback: Optional[Callable[[Dict[str, float]], None]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> int:
         """Extract message history for a channel."""
         logger.info(f"Extracting messages from channel: {channel_id}")
@@ -50,7 +52,7 @@ class MessageExtractor(BaseExtractor):
         # Paginate through messages
         params = {
             "channel": channel_id,
-            "limit": 200,  # Max for conversations.history
+            "limit": max(1, min(int(getattr(Config, "SLACK_CONVERSATIONS_HISTORY_LIMIT", 15)), 200)),
         }
         
         if oldest:
@@ -64,33 +66,76 @@ class MessageExtractor(BaseExtractor):
             "messages",
             **params
         ):
+            if cancel_check and cancel_check():
+                logger.info("Message extraction cancelled during pagination")
+                raise KeyboardInterrupt()
             messages_list.append(message)
             ts = float(message.get("ts", 0))
             if not latest_ts or ts > latest_ts:
                 latest_ts = ts
         
         logger.info(f"Fetched {len(messages_list)} messages. Saving to database...")
+
+        if progress_callback:
+            progress_callback(
+                {
+                    "stage": "fetched",
+                    "total_messages": len(messages_list),
+                    "progress": 0.4 if messages_list else 0.6,
+                }
+            )
         
         # Save messages with progress bar
-        with tqdm(total=len(messages_list), desc=f"Saving messages") as pbar:
-            for message in messages_list:
-                try:
-                    self.db_manager.save_message(message, channel_id)
-                    count += 1
-                    pbar.update(1)
-                    
-                    # Extract threads if present
-                    if include_threads and message.get("reply_count", 0) > 0:
-                        thread_ts = message.get("ts")
-                        thread_count = self.extract_thread_replies(channel_id, thread_ts)
-                        logger.debug(f"Extracted {thread_count} thread replies")
-                
-                except Exception as e:
-                    logger.error(f"Failed to save message: {e}")
+        commit_batch_size = max(1, int(getattr(Config, "BATCH_SIZE", 100)))
+        progress_step = max(1, len(messages_list) // 20) if messages_list else 1
+        with self.db_manager.get_session() as session:
+            with tqdm(total=len(messages_list), desc=f"Saving messages") as pbar:
+                for i, message in enumerate(messages_list, 1):
+                    try:
+                        if cancel_check and cancel_check():
+                            logger.info("Message extraction cancelled during save loop")
+                            raise KeyboardInterrupt()
+                        self.db_manager.save_message(message, channel_id, session=session, commit=False)
+                        count += 1
+                        pbar.update(1)
+
+                        # Extract threads if present
+                        if include_threads and message.get("reply_count", 0) > 0:
+                            thread_ts = message.get("ts")
+                            thread_count = self.extract_thread_replies(channel_id, thread_ts)
+                            logger.debug(f"Extracted {thread_count} thread replies")
+
+                        if i % commit_batch_size == 0:
+                            session.commit()
+
+                        if progress_callback and (i % progress_step == 0 or i == len(messages_list)):
+                            frac = i / len(messages_list) if len(messages_list) else 1.0
+                            progress_callback(
+                                {
+                                    "stage": "saving",
+                                    "processed_messages": i,
+                                    "total_messages": len(messages_list),
+                                    "progress": 0.4 + 0.55 * frac,
+                                }
+                            )
+                    except Exception as e:
+                        logger.error(f"Failed to save message: {e}")
+
+                session.commit()
         
         # Update sync status
         if latest_ts:
             self.db_manager.update_sync_status(channel_id, latest_ts, is_complete=True)
+
+        if progress_callback:
+            progress_callback(
+                {
+                    "stage": "completed",
+                    "processed_messages": len(messages_list),
+                    "total_messages": len(messages_list),
+                    "progress": 1.0,
+                }
+            )
         
         logger.info(f"Message extraction complete for {channel_id}. Saved {count} messages")
         return count
@@ -128,7 +173,8 @@ class MessageExtractor(BaseExtractor):
     def extract_all_channels_history(
         self,
         channel_ids: Optional[List[str]] = None,
-        include_archived: bool = False
+        include_archived: bool = False,
+        include_threads: bool = False
     ) -> dict:
         """Extract history from all channels."""
         logger.info("Starting extraction of all channel histories")
@@ -147,7 +193,7 @@ class MessageExtractor(BaseExtractor):
             logger.info(f"[{i}/{len(channel_ids)}] Processing channel: {channel_id}")
             
             try:
-                count = self.extract_channel_history(channel_id)
+                count = self.extract_channel_history(channel_id, include_threads=include_threads)
                 results[channel_id] = {"status": "success", "count": count}
                 total_messages += count
                 

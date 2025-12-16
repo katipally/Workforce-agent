@@ -6,7 +6,7 @@ Implements action tools for Slack, Gmail, and Notion operations.
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 from langchain_core.tools import Tool, StructuredTool
-from langchain_core.pydantic_v1 import BaseModel, Field
+from pydantic.v1 import BaseModel, Field
 import sys
 import os
 import base64
@@ -17,6 +17,7 @@ from email.mime.base import MIMEBase
 from email import encoders
 from pathlib import Path
 from sqlalchemy import or_
+import re
 
 # Google OAuth imports for building credentials from stored tokens
 from google.oauth2.credentials import Credentials
@@ -461,7 +462,7 @@ class WorkforceTools:
             logger.error(f"Error caching messages: {e}")
 
     def _get_slack_channels_cached(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
-        """Get Slack channels with in-memory caching to avoid repeated API pagination."""
+        """Get Slack channels with in-memory caching. Falls back to DB if API is slow/unavailable."""
         import time
         global _slack_channel_cache
 
@@ -472,24 +473,49 @@ class WorkforceTools:
             logger.debug(f"Using cached channel list ({len(_slack_channel_cache['channels'])} channels)")
             return _slack_channel_cache["channels"]
 
+        # Try to load from database first (fast and reliable)
+        try:
+            from database.models import Channel
+            with self.db.get_session() as session:
+                db_channels = session.query(Channel).filter(Channel.is_archived == False).all()
+                if db_channels:
+                    channels = [
+                        {"id": ch.channel_id, "name": ch.name, "is_private": ch.is_private}
+                        for ch in db_channels
+                    ]
+                    by_name = {ch["name"]: ch for ch in channels}
+                    by_id = {ch["id"]: ch for ch in channels}
+                    _slack_channel_cache = {
+                        "channels": channels,
+                        "by_name": by_name,
+                        "by_id": by_id,
+                        "fetched_at": now,
+                    }
+                    logger.debug(f"Loaded {len(channels)} channels from database")
+                    return channels
+        except Exception as db_err:
+            logger.warning(f"Could not load channels from DB: {db_err}")
+
+        # Fallback: Try Slack API (with timeout protection from WebClient)
         if not self.slack_client:
             logger.warning("No Slack client available for channel fetch")
-            return []
+            return _slack_channel_cache["channels"]
 
         channels: List[Dict[str, Any]] = []
         cursor: Optional[str] = None
 
         try:
-            logger.info("Fetching Slack channels from API...")
+            logger.info("Fetching Slack channels from API (fallback)...")
             page_count = 0
-            while True:
+            max_pages = 5  # Limit pages to prevent long waits
+            while page_count < max_pages:
                 page_count += 1
                 logger.debug(f"Fetching channel page {page_count}...")
                 result = self.slack_client.conversations_list(
                     exclude_archived=False,
                     types="public_channel,private_channel",
                     cursor=cursor,
-                    limit=200,  # Fetch more per page to reduce API calls
+                    limit=200,
                 )
                 batch = result.get("channels", [])
                 channels.extend(batch)
@@ -502,7 +528,6 @@ class WorkforceTools:
 
             logger.info(f"Fetched {len(channels)} total channels from Slack API")
 
-            # Build lookup dicts
             by_name = {ch.get("name", ""): ch for ch in channels}
             by_id = {ch.get("id", ""): ch for ch in channels}
 
@@ -513,7 +538,7 @@ class WorkforceTools:
                 "fetched_at": now,
             }
         except Exception as e:
-            logger.error(f"Error fetching Slack channels: {e}", exc_info=True)
+            logger.error(f"Error fetching Slack channels from API: {e}", exc_info=True)
 
         return _slack_channel_cache["channels"]
 
@@ -1045,6 +1070,121 @@ class WorkforceTools:
         except Exception as e:
             logger.error(f"Error sending email: {e}")
             return f"Error: {str(e)}"
+
+    def create_gmail_draft(self, to: str, subject: str, body: str) -> str:
+        """Create a Gmail draft preview (does not send).
+
+        This intentionally does not call the Gmail send endpoint. It returns a
+        preview payload that the UI/logs can display.
+        """
+        try:
+            if not self._ensure_gmail_authenticated():
+                return "✗ Gmail authentication failed. Please ensure you're logged in with Google OAuth."
+
+            if to and not self._is_domain_allowed_for_send(to):
+                return (
+                    "✗ Draft creation blocked by configuration: recipient domain is not allowed. "
+                    "Update GMAIL_ALLOWED_SEND_DOMAINS if you want to allow this address."
+                )
+
+            return (
+                "✉️ Draft email (NOT SENT):\n"
+                f"To: {to}\nSubject: {subject}\n\n{body}"
+            )
+        except Exception as e:
+            logger.error("Error creating Gmail draft: %s", e, exc_info=True)
+            return f"Error: {str(e)}"
+
+    def replace_notion_page_content(self, page_id: str, content: str) -> str:
+        """Replace the content of a Notion page by archiving existing child blocks and appending new ones."""
+        try:
+            import requests
+
+            if not Config.NOTION_TOKEN:
+                return "❌ NOTION_TOKEN is not configured. Please set it in your environment."
+
+            normalized_id = _normalize_notion_id(page_id)
+            if not normalized_id:
+                return "❌ Invalid Notion page_id. Please pass a Notion page ID or full Notion URL."
+
+            headers = {
+                "Authorization": f"Bearer {Config.NOTION_TOKEN}",
+                "Notion-Version": "2022-06-28",
+                "Content-Type": "application/json",
+            }
+
+            # 1) Archive existing children blocks
+            cursor: Optional[str] = None
+            archived = 0
+            while True:
+                params: Dict[str, Any] = {"page_size": 100}
+                if cursor:
+                    params["start_cursor"] = cursor
+
+                resp = requests.get(
+                    f"https://api.notion.com/v1/blocks/{normalized_id}/children",
+                    headers=headers,
+                    params=params,
+                )
+                if resp.status_code != 200:
+                    return f"❌ Notion API error {resp.status_code}: {resp.text[:200]}"
+
+                data = resp.json() or {}
+                blocks = data.get("results", []) or []
+
+                for block in blocks:
+                    bid = block.get("id")
+                    if not bid:
+                        continue
+                    patch = requests.patch(
+                        f"https://api.notion.com/v1/blocks/{bid}",
+                        headers=headers,
+                        json={"archived": True},
+                    )
+                    if patch.status_code == 200:
+                        archived += 1
+
+                if not data.get("has_more"):
+                    break
+                cursor = data.get("next_cursor")
+
+            # 2) Append new blocks
+            paragraphs = (content or "").split("\n\n")
+            new_blocks: List[Dict[str, Any]] = []
+            for para in paragraphs:
+                if not para.strip():
+                    continue
+                new_blocks.append(
+                    {
+                        "object": "block",
+                        "type": "paragraph",
+                        "paragraph": {
+                            "rich_text": [
+                                {"type": "text", "text": {"content": para.strip()}}
+                            ]
+                        },
+                    }
+                )
+
+            created = 0
+            for i in range(0, len(new_blocks), 100):
+                batch = new_blocks[i : i + 100]
+                if not batch:
+                    continue
+                put = requests.patch(
+                    f"https://api.notion.com/v1/blocks/{normalized_id}/children",
+                    headers=headers,
+                    json={"children": batch},
+                )
+                if put.status_code != 200:
+                    return f"❌ Failed to append new content ({put.status_code}): {put.text[:200]}"
+                created += len(batch)
+
+            return f"✅ Replaced Notion page content. Archived {archived} block(s), added {created} block(s)."
+
+        except Exception as e:
+            logger.error("Error replacing Notion page content: %s", e, exc_info=True)
+            return f"❌ Error replacing Notion page content: {str(e)}"
     
     def list_notion_pages(self, limit: int = 20) -> str:
         """List recent Notion pages.
@@ -2926,22 +3066,43 @@ class WorkforceTools:
             
             # Find matching entry by name
             matching_entry = None
-            entry_name_lower = entry_name.lower()
+            raw_name = (entry_name or "").strip()
+            entry_name_lower = raw_name.lower()
+            candidates: List[str] = []
+            if entry_name_lower:
+                candidates.append(entry_name_lower)
+                try:
+                    stripped = re.sub(r"^\[[^\]]+\]\s*", "", entry_name_lower).strip()
+                    if stripped and stripped not in candidates:
+                        candidates.append(stripped)
+                except Exception:
+                    pass
             for entry in entries:
                 formatted = self.notion_client.format_database_entry(entry)
-                props = formatted["properties"]
+                props = formatted.get("properties", {}) if isinstance(formatted, dict) else {}
                 
                 # Check title column
                 if title_col:
                     title_val = props.get(title_col, "")
-                    if title_val and entry_name_lower in str(title_val).lower():
-                        matching_entry = entry
-                        break
+                    title_lower = str(title_val).lower() if title_val else ""
+                    if title_lower:
+                        for c in candidates:
+                            if c and (c in title_lower or title_lower in c):
+                                matching_entry = entry
+                                break
+                        if matching_entry:
+                            break
                 
                 # Also check any text property that contains the name
-                for col, val in props.items():
-                    if val and entry_name_lower in str(val).lower():
-                        matching_entry = entry
+                for _, val in props.items():
+                    if not val:
+                        continue
+                    v_lower = str(val).lower()
+                    for c in candidates:
+                        if c and (c in v_lower or v_lower in c):
+                            matching_entry = entry
+                            break
+                    if matching_entry:
                         break
                 if matching_entry:
                     break
@@ -3041,6 +3202,94 @@ class WorkforceTools:
                 
         except Exception as e:
             logger.error(f"Error updating Notion entry: {e}", exc_info=True)
+            return f"❌ Error: {str(e)}"
+
+    def update_notion_database_row_content(
+        self,
+        database_id: str,
+        entry_name: str,
+        content: str,
+        mode: str = "replace",
+    ) -> str:
+        try:
+            if not self.notion_client or not self.notion_client.test_connection():
+                return "❌ Notion not connected"
+
+            normalized_id = _normalize_notion_id(database_id)
+            if not normalized_id:
+                return "❌ Invalid database_id."
+
+            db_meta = self.notion_client.get_database(normalized_id)
+            if not db_meta:
+                return f"❌ Could not find database {database_id}"
+
+            schema = db_meta.get("properties", {})
+
+            title_col = None
+            for col_name, col_schema in schema.items():
+                if col_schema.get("type") == "title":
+                    title_col = col_name
+                    break
+
+            entries = self.notion_client.query_database(normalized_id, max_results=500)
+            if not entries:
+                return "❌ No entries found in database"
+
+            raw_name = (entry_name or "").strip()
+            entry_name_lower = raw_name.lower()
+            candidates: List[str] = []
+            if entry_name_lower:
+                candidates.append(entry_name_lower)
+                # Common UX pattern: users prefix titles with workspace tags like "[Yash Exploration] Foo".
+                # Make matching resilient even if the row title is just "Foo".
+                try:
+                    stripped = re.sub(r"^\[[^\]]+\]\s*", "", entry_name_lower).strip()
+                    if stripped and stripped not in candidates:
+                        candidates.append(stripped)
+                except Exception:
+                    pass
+            matching_entry = None
+
+            for entry in entries:
+                formatted = self.notion_client.format_database_entry(entry)
+                props = formatted.get("properties", {}) if isinstance(formatted, dict) else {}
+
+                if title_col:
+                    title_val = props.get(title_col, "")
+                    if title_val and entry_name_lower in str(title_val).lower():
+                        matching_entry = entry
+                        break
+
+                for _, val in props.items():
+                    if not val:
+                        continue
+                    v_lower = str(val).lower()
+                    for c in candidates:
+                        if c and (c in v_lower or v_lower in c):
+                            matching_entry = entry
+                            break
+                    if matching_entry:
+                        break
+                if matching_entry:
+                    break
+
+            if not matching_entry:
+                return f"❌ Could not find entry '{entry_name}' in database"
+
+            entry_id = matching_entry.get("id")
+            if not entry_id:
+                return "❌ Entry found but has no ID"
+
+            mode_norm = (mode or "replace").strip().lower()
+            if mode_norm == "append":
+                result = self.append_to_notion_page(page_id=entry_id, content=content)
+                return f"✅ Appended content to database row '{entry_name}' (page_id: {entry_id})\n{result}"
+
+            result = self.replace_notion_page_content(page_id=entry_id, content=content)
+            return f"✅ Replaced content in database row '{entry_name}' (page_id: {entry_id})\n{result}"
+
+        except Exception as e:
+            logger.error(f"Error updating Notion database row content: {e}", exc_info=True)
             return f"❌ Error: {str(e)}"
     
     def add_notion_database_entry(

@@ -12,7 +12,7 @@ export interface Message {
 }
 
 export interface Source {
-  type: 'slack' | 'gmail'
+  type: 'slack' | 'gmail' | 'notion'
   text: string
   score?: number
   rerank_score?: number
@@ -23,7 +23,15 @@ export interface Source {
     from?: string
     subject?: string
     date?: Date | string
+    title?: string
+    page_id?: string
   }
+}
+
+export interface SourcePreferences {
+  slack: boolean
+  gmail: boolean
+  notion: boolean
 }
 
 export interface ChatSession {
@@ -52,6 +60,9 @@ interface ChatState {
   // Sessions list
   sessions: ChatSession[]
   
+  // Per-session source preferences
+  sessionSourcePrefs: Record<string, SourcePreferences>
+  
   // Computed messages for current session
   messages: Message[]
   
@@ -71,6 +82,8 @@ interface ChatState {
   createNewSession: () => void
   deleteSession: (sessionId: string) => void
   resetStore: () => void
+  setSourcePreferencesForSession: (sessionId: string, prefs: SourcePreferences) => void
+  toggleSourcePreference: (source: keyof SourcePreferences) => void
 }
 
 // Generate unique session ID
@@ -90,6 +103,7 @@ export const useChatStore = create<ChatState>()(
       isStreaming: false,
       currentReasoningSteps: [],
       sessions: [],
+      sessionSourcePrefs: {},
       
       setCurrentSessionId: (sessionId: string) => {
         const { sessionMessages } = get()
@@ -232,10 +246,12 @@ export const useChatStore = create<ChatState>()(
       },
       
       deleteSession: (sessionId: string) => {
-        const { sessions, sessionMessages, currentSessionId } = get()
+        const { sessions, sessionMessages, currentSessionId, sessionSourcePrefs } = get()
         const updatedSessions = sessions.filter(s => s.session_id !== sessionId)
         const updatedSessionMessages = { ...sessionMessages }
         delete updatedSessionMessages[sessionId]
+        const updatedSourcePrefs = { ...sessionSourcePrefs }
+        delete updatedSourcePrefs[sessionId]
         
         // If deleting current session, switch to another or create new
         let newCurrentSessionId = currentSessionId
@@ -256,7 +272,8 @@ export const useChatStore = create<ChatState>()(
           sessions: updatedSessions,
           sessionMessages: updatedSessionMessages,
           currentSessionId: newCurrentSessionId,
-          messages: newMessages
+          messages: newMessages,
+          sessionSourcePrefs: updatedSourcePrefs,
         })
         
         // Delete from backend
@@ -285,14 +302,44 @@ export const useChatStore = create<ChatState>()(
               updated_at: nowIso,
             },
           ],
+          sessionSourcePrefs: {},
+        })
+      },
+      setSourcePreferencesForSession: (sessionId, prefs) => {
+        set((state) => ({
+          sessionSourcePrefs: {
+            ...state.sessionSourcePrefs,
+            [sessionId]: prefs,
+          },
+        }))
+      },
+      toggleSourcePreference: (source) => {
+        const { currentSessionId, sessionSourcePrefs } = get()
+        const currentPrefs: SourcePreferences = sessionSourcePrefs[currentSessionId] || {
+          slack: true,
+          gmail: true,
+          notion: true,
+        }
+        const updated: SourcePreferences = {
+          ...currentPrefs,
+          [source]: !currentPrefs[source],
+        }
+        set({
+          sessionSourcePrefs: {
+            ...sessionSourcePrefs,
+            [currentSessionId]: updated,
+          },
         })
       },
     }),
     {
       name: 'chat-storage',
       partialize: (state) => ({
-        sessionMessages: state.sessionMessages,
+        // Persist only lightweight metadata; messages themselves are loaded
+        // on demand from the backend to keep startup fast even with many
+        // long conversations.
         sessions: state.sessions,
+        sessionSourcePrefs: state.sessionSourcePrefs,
       }),
     }
   )

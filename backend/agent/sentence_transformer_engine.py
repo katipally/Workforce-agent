@@ -4,7 +4,8 @@ CPU-friendly embedding and reranking using sentence-transformers library.
 Perfect for development and production without GPU requirements.
 """
 
-from sentence_transformers import SentenceTransformer, CrossEncoder
+from sentence_transformers.SentenceTransformer import SentenceTransformer
+from sentence_transformers.cross_encoder.CrossEncoder import CrossEncoder
 from typing import List, Tuple
 import numpy as np
 from tqdm import tqdm
@@ -57,7 +58,7 @@ class SentenceTransformerEmbedding:
     def encode(
         self,
         texts: List[str],
-        batch_size: int = 32,
+        batch_size: int = 16,  # Reduced from 32 for t3.small (2GB RAM)
         show_progress: bool = False,
         **kwargs
     ) -> np.ndarray:

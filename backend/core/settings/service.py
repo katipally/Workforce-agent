@@ -871,3 +871,170 @@ def bootstrap_app_settings_from_config_if_empty(db: DatabaseManager) -> None:
 
     if patch:
         db.upsert_app_settings(patch)
+
+    return get_workspace_settings_view(db)
+
+
+def sync_workspace_settings_from_config(db: DatabaseManager) -> Dict[str, Any]:
+    raw = _get_raw_app_settings(db)
+    patch: Dict[str, Any] = {}
+
+    system_section: Dict[str, Any] = dict(raw.get("system") or {})
+    if Config.OPENAI_API_KEY:
+        system_section["openai_api_key"] = encrypt_secret(Config.OPENAI_API_KEY)
+    if Config.LLM_MODEL:
+        system_section["llm_model"] = Config.LLM_MODEL
+    if Config.GOOGLE_CLIENT_ID:
+        system_section["google_client_id"] = Config.GOOGLE_CLIENT_ID
+    if Config.GOOGLE_CLIENT_SECRET:
+        system_section["google_client_secret"] = encrypt_secret(Config.GOOGLE_CLIENT_SECRET)
+    if Config.GOOGLE_OAUTH_REDIRECT_BASE:
+        system_section["google_oauth_redirect_base"] = Config.GOOGLE_OAUTH_REDIRECT_BASE
+    if system_section:
+        patch["system"] = system_section
+
+    slack_section: Dict[str, Any] = dict(raw.get("slack") or {})
+    if Config.SLACK_BOT_TOKEN:
+        slack_section["bot_token"] = encrypt_secret(Config.SLACK_BOT_TOKEN)
+    if Config.SLACK_APP_TOKEN:
+        slack_section["app_token"] = encrypt_secret(Config.SLACK_APP_TOKEN)
+    if Config.SLACK_USER_TOKEN:
+        slack_section["user_token"] = encrypt_secret(Config.SLACK_USER_TOKEN)
+    if Config.SLACK_MODE:
+        slack_section["mode"] = Config.SLACK_MODE
+    if Config.SLACK_APP_ID:
+        slack_section["app_id"] = Config.SLACK_APP_ID
+    if Config.SLACK_CLIENT_ID:
+        slack_section["client_id"] = Config.SLACK_CLIENT_ID
+    if Config.SLACK_CLIENT_SECRET:
+        slack_section["client_secret"] = Config.SLACK_CLIENT_SECRET
+    if Config.SLACK_SIGNING_SECRET:
+        slack_section["signing_secret"] = Config.SLACK_SIGNING_SECRET
+    if Config.SLACK_VERIFICATION_TOKEN:
+        slack_section["verification_token"] = Config.SLACK_VERIFICATION_TOKEN
+    readonly = _split_csv(Config.SLACK_READONLY_CHANNELS)
+    if readonly:
+        slack_section["readonly_channels"] = readonly
+    blocked = _split_csv(Config.SLACK_BLOCKED_CHANNELS)
+    if blocked:
+        slack_section["blocked_channels"] = blocked
+    if slack_section:
+        patch["slack"] = slack_section
+
+    notion_section: Dict[str, Any] = dict(raw.get("notion") or {})
+    if Config.NOTION_TOKEN:
+        notion_section["token"] = encrypt_secret(Config.NOTION_TOKEN)
+    if Config.NOTION_MODE:
+        notion_section["mode"] = Config.NOTION_MODE
+    if Config.NOTION_PARENT_PAGE_ID:
+        notion_section["parent_page_id"] = Config.NOTION_PARENT_PAGE_ID
+    if notion_section:
+        patch["notion"] = notion_section
+
+    gmail_section: Dict[str, Any] = dict(raw.get("gmail") or {})
+    if Config.GMAIL_SEND_MODE:
+        gmail_section["send_mode"] = Config.GMAIL_SEND_MODE
+    send_domains = _split_csv(Config.GMAIL_ALLOWED_SEND_DOMAINS)
+    if send_domains:
+        gmail_section["allowed_send_domains"] = send_domains
+    read_domains = _split_csv(Config.GMAIL_ALLOWED_READ_DOMAINS)
+    if read_domains:
+        gmail_section["allowed_read_domains"] = read_domains
+    if Config.GMAIL_DEFAULT_LABEL:
+        gmail_section["default_label"] = Config.GMAIL_DEFAULT_LABEL
+    if gmail_section:
+        patch["gmail"] = gmail_section
+
+    workspace_section: Dict[str, Any] = dict(raw.get("workspace") or {})
+    if Config.WORKSPACE_NAME:
+        workspace_section["name"] = Config.WORKSPACE_NAME
+    if Config.WORKSPACE_ID:
+        workspace_section["id"] = Config.WORKSPACE_ID
+    if workspace_section:
+        patch["workspace"] = workspace_section
+
+    runtime_section: Dict[str, Any] = dict(raw.get("runtime") or {})
+    if Config.FRONTEND_BASE_URL:
+        runtime_section["frontend_base_url"] = Config.FRONTEND_BASE_URL
+    if Config.API_HOST:
+        runtime_section["api_host"] = Config.API_HOST
+    runtime_section["api_port"] = Config.API_PORT
+    if Config.LOG_LEVEL:
+        runtime_section["log_level"] = Config.LOG_LEVEL
+    if Config.LOG_FILE:
+        runtime_section["log_file"] = Config.LOG_FILE
+    runtime_section["tier_4_rate_limit"] = Config.TIER_4_RATE_LIMIT
+    runtime_section["default_rate_limit"] = Config.DEFAULT_RATE_LIMIT
+    runtime_section["socket_mode_enabled"] = Config.SOCKET_MODE_ENABLED
+    runtime_section["max_reconnect_attempts"] = Config.MAX_RECONNECT_ATTEMPTS
+    if runtime_section:
+        patch["runtime"] = runtime_section
+
+    database_section: Dict[str, Any] = dict(raw.get("database") or {})
+    if Config.DATABASE_URL:
+        database_section["database_url"] = Config.DATABASE_URL
+    database_section["data_dir"] = str(Config.DATA_DIR)
+    database_section["files_dir"] = str(Config.FILES_DIR)
+    database_section["export_dir"] = str(Config.EXPORT_DIR)
+    database_section["project_registry_file"] = str(Config.PROJECT_REGISTRY_FILE)
+    if database_section:
+        patch["database"] = database_section
+
+    ai_infra_section: Dict[str, Any] = dict(raw.get("ai_infra") or {})
+    if Config.EMBEDDING_MODEL:
+        ai_infra_section["embedding_model"] = Config.EMBEDDING_MODEL
+    if Config.RERANKER_MODEL:
+        ai_infra_section["reranker_model"] = Config.RERANKER_MODEL
+    ai_infra_section["embedding_batch_size"] = Config.EMBEDDING_BATCH_SIZE
+    ai_infra_section["use_gpu"] = Config.USE_GPU
+    if ai_infra_section:
+        patch["ai_infra"] = ai_infra_section
+
+    if patch:
+        db.upsert_app_settings(patch)
+
+    return get_workspace_settings_view(db)
+
+
+# ---------------------------------------------------------------------------
+# Runtime helpers for Slack / Notion
+# ---------------------------------------------------------------------------
+
+
+def get_effective_slack_bot_token(db: DatabaseManager) -> Optional[str]:
+    """Return the Slack bot token from workspace settings or Config.
+
+    Order:
+    1. Decrypted bot_token from AppSettings.slack.bot_token
+    2. Config.SLACK_BOT_TOKEN
+    """
+
+    raw = _get_raw_app_settings(db)
+    slack_raw = raw.get("slack") or {}
+    enc = slack_raw.get("bot_token")
+    if enc:
+        try:
+            token = decrypt_secret(enc)
+            if token:
+                return token
+        except Exception:
+            logger.error("Failed to decrypt Slack bot token from settings", exc_info=True)
+
+    return Config.SLACK_BOT_TOKEN or None
+
+
+def get_effective_notion_token(db: DatabaseManager) -> Optional[str]:
+    """Return the Notion integration token from workspace settings or Config."""
+
+    raw = _get_raw_app_settings(db)
+    notion_raw = raw.get("notion") or {}
+    enc = notion_raw.get("token")
+    if enc:
+        try:
+            token = decrypt_secret(enc)
+            if token:
+                return token
+        except Exception:
+            logger.error("Failed to decrypt Notion token from settings", exc_info=True)
+
+    return Config.NOTION_TOKEN or None
