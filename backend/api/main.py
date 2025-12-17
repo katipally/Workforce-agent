@@ -2500,7 +2500,16 @@ def _run_project_sync(
     owner_user_id: str,
     account_email: str,
 ) -> None:
-    _update_pipeline_run(run_id, status="running", started_at=datetime.utcnow())
+    _update_pipeline_run(
+        run_id,
+        status="running",
+        started_at=datetime.utcnow(),
+        stats={
+            "project_id": project_id,
+            "progress": 0.0,
+            "heartbeat_at": datetime.utcnow().isoformat(),
+        },
+    )
 
     stats: Dict[str, Any] = {
         "project_id": project_id,
@@ -4316,7 +4325,16 @@ def _run_slack_channel_pipeline(
         lookback_hours,
     )
 
-    _update_pipeline_run(run_id, status="running", started_at=datetime.utcnow())
+    _update_pipeline_run(
+        run_id,
+        status="running",
+        started_at=datetime.utcnow(),
+        stats={
+            "channel_id": channel_id,
+            "progress": 0.0,
+            "heartbeat_at": datetime.utcnow().isoformat(),
+        },
+    )
 
     # Determine incremental window from SyncStatus
     sync_status = db_manager.get_sync_status(channel_id)
@@ -4362,6 +4380,7 @@ def _run_slack_channel_pipeline(
             last_persist_at = now
             last_persist_stage = stage
             last_persist_progress = float(progress) if isinstance(progress, (int, float)) else None
+            stats["heartbeat_at"] = datetime.utcnow().isoformat()
             _update_pipeline_run(run_id, stats=stats)
 
     try:
@@ -4482,6 +4501,18 @@ async def run_slack_channel_pipeline(
     if not channel_id:
         raise HTTPException(status_code=400, detail="channel_id is required")
 
+    now_dt = datetime.utcnow()
+    stale_pending_seconds = 15
+    stale_running_seconds = 10 * 60
+
+    def _parse_iso_ts(value: Any) -> Optional[datetime]:
+        if not value or not isinstance(value, str):
+            return None
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            return None
+
     with db_manager.get_session() as session:
         existing_runs = (
             session.query(PipelineRun)
@@ -4496,7 +4527,28 @@ async def run_slack_channel_pipeline(
         for run in existing_runs:
             cfg = run.config or {}
             if cfg.get("channel_id") == channel_id:
-                return {"run_id": run.run_id, "status": run.status}
+                stats = run.stats or {}
+                heartbeat_at = _parse_iso_ts(stats.get("heartbeat_at"))
+                created_at = run.created_at
+                started_at = run.started_at
+
+                is_stale = False
+                if run.status == "pending":
+                    ref = created_at
+                    if ref and (now_dt - ref).total_seconds() > stale_pending_seconds:
+                        is_stale = True
+                else:
+                    ref = heartbeat_at or started_at or created_at
+                    if ref and (now_dt - ref).total_seconds() > stale_running_seconds:
+                        is_stale = True
+
+                if is_stale:
+                    run.status = "failed"
+                    run.finished_at = now_dt
+                    run.error = "stale_run"
+                    session.commit()
+                else:
+                    return {"run_id": run.run_id, "status": run.status}
 
     run_id = uuid.uuid4().hex
 
@@ -4533,6 +4585,38 @@ async def get_slack_channel_pipeline_status(
     run = _get_pipeline_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
+
+    if run.get("pipeline_type") == "slack_channel" and run.get("status") in ("pending", "running"):
+        now_dt = datetime.utcnow()
+        stale_pending_seconds = 15
+        stale_running_seconds = 10 * 60
+
+        def _parse_iso_ts(value: Any) -> Optional[datetime]:
+            if not value or not isinstance(value, str):
+                return None
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+            except Exception:
+                return None
+
+        created_at = _parse_iso_ts(run.get("created_at"))
+        started_at = _parse_iso_ts(run.get("started_at"))
+        stats = run.get("stats") or {}
+        heartbeat_at = _parse_iso_ts(stats.get("heartbeat_at"))
+
+        is_stale = False
+        if run.get("status") == "pending":
+            ref = created_at
+            if ref and (now_dt - ref).total_seconds() > stale_pending_seconds:
+                is_stale = True
+        else:
+            ref = heartbeat_at or started_at or created_at
+            if ref and (now_dt - ref).total_seconds() > stale_running_seconds:
+                is_stale = True
+
+        if is_stale:
+            _update_pipeline_run(run_id, status="failed", finished_at=now_dt, error="stale_run")
+            run = _get_pipeline_run(run_id) or run
     return run
 
 
