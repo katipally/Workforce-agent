@@ -22,7 +22,8 @@ class ExtractionCoordinator:
         db_manager: Optional[DatabaseManager] = None
     ):
         """Initialize extraction coordinator."""
-        self.client = client or WebClient(token=Config.SLACK_BOT_TOKEN)
+        # Use 60-second timeout to prevent indefinite hangs on EC2
+        self.client = client or WebClient(token=Config.SLACK_BOT_TOKEN, timeout=60)
         self.db_manager = db_manager or DatabaseManager()
         
         # Initialize extractors
@@ -77,7 +78,7 @@ class ExtractionCoordinator:
     def extract_all_messages(
         self,
         include_archived: bool = False,
-        include_threads: bool = True
+        include_threads: bool = False
     ) -> Dict[str, Any]:
         """Extract all messages from all channels."""
         logger.info("=" * 60)
@@ -93,7 +94,8 @@ class ExtractionCoordinator:
         
         results = self.message_extractor.extract_all_channels_history(
             channel_ids=[ch.channel_id for ch in channels],
-            include_archived=include_archived
+            include_archived=include_archived,
+            include_threads=include_threads,
         )
         
         # Calculate totals
@@ -121,7 +123,8 @@ class ExtractionCoordinator:
     def extract_all(
         self,
         include_archived: bool = False,
-        download_files: bool = False
+        download_files: bool = False,
+        include_threads: bool = False
     ) -> Dict[str, Any]:
         """Extract all data from workspace."""
         logger.info("=" * 80)
@@ -146,7 +149,7 @@ class ExtractionCoordinator:
             # 4. Messages (This will take the longest due to rate limits)
             message_results = self.extract_all_messages(
                 include_archived=include_archived,
-                include_threads=True
+                include_threads=include_threads
             )
             results["messages"] = message_results
             

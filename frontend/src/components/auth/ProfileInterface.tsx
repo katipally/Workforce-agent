@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react'
 import { Eye, EyeOff } from 'lucide-react'
 import { useAuthStore } from '../../store/authStore'
 import { API_BASE_URL } from '../../lib/api'
+import { SearchableSelect } from '../common/SearchableSelect'
 
 type WorkspaceSettingsView = {
   system: {
@@ -134,6 +135,7 @@ const ProfileInterface: React.FC = () => {
   })
   const [workspaceDirty, setWorkspaceDirty] = useState(false)
   const [savingWorkspace, setSavingWorkspace] = useState(false)
+  const [syncingWorkspaceFromEnv, setSyncingWorkspaceFromEnv] = useState(false)
 
   const [showGlobalOpenaiKey, setShowGlobalOpenaiKey] = useState(false)
   const [showGoogleClientSecret, setShowGoogleClientSecret] = useState(false)
@@ -795,6 +797,84 @@ const ProfileInterface: React.FC = () => {
     }
   }
 
+  const handleSyncWorkspaceFromEnv = async () => {
+    if (!workspaceView) return
+    try {
+      setSyncingWorkspaceFromEnv(true)
+      setError(null)
+
+      const res = await fetch(`${API_BASE_URL}/api/settings/workspace/sync-from-env`, {
+        method: 'POST',
+        credentials: 'include',
+      })
+
+      if (!res.ok) {
+        throw new Error('Failed to sync workspace settings from env')
+      }
+
+      const updated = (await res.json()) as WorkspaceSettingsView
+      setWorkspaceView(updated)
+      setWorkspaceForm({
+        globalOpenaiKey: '',
+        globalLlmModel: updated.system.llm_model || '',
+        globalTimezone: updated.system.timezone || '',
+        googleClientId: updated.system.google_client_id || '',
+        googleClientSecret: '',
+        googleRedirectBase: updated.system.google_oauth_redirect_base || '',
+        slackBotToken: '',
+        slackAppToken: '',
+        slackUserToken: '',
+        slackMode: updated.slack.mode || 'standard',
+        slackReadonly: updated.slack.readonly_channels.join(', '),
+        slackBlocked: updated.slack.blocked_channels.join(', '),
+        slackAppId: updated.slack.app_id || '',
+        slackClientId: updated.slack.client_id || '',
+        slackClientSecret: updated.slack.client_secret || '',
+        slackSigningSecret: updated.slack.signing_secret || '',
+        slackVerificationToken: updated.slack.verification_token || '',
+        notionParentPageId: updated.notion.parent_page_id || '',
+        notionToken: '',
+        notionMode: updated.notion.mode || 'standard',
+        gmailSendMode: updated.gmail.send_mode || 'confirm',
+        gmailAllowedSend: updated.gmail.allowed_send_domains.join(', '),
+        gmailAllowedRead: updated.gmail.allowed_read_domains.join(', '),
+        gmailDefaultLabel: updated.gmail.default_label || '',
+        workspaceName: updated.workspace.name || '',
+        workspaceId: updated.workspace.id || '',
+        frontendBaseUrl: updated.runtime.frontend_base_url || '',
+        apiHost: updated.runtime.api_host || '',
+        apiPort: String(updated.runtime.api_port ?? ''),
+        logLevel: updated.runtime.log_level || '',
+        logFile: updated.runtime.log_file || '',
+        tier4RateLimit: String(updated.runtime.tier_4_rate_limit ?? ''),
+        defaultRateLimit: String(updated.runtime.default_rate_limit ?? ''),
+        socketModeEnabled: updated.runtime.socket_mode_enabled,
+        maxReconnectAttempts: String(updated.runtime.max_reconnect_attempts ?? ''),
+        databaseUrl: updated.database.database_url || '',
+        dataDir: updated.database.data_dir || '',
+        filesDir: updated.database.files_dir || '',
+        exportDir: updated.database.export_dir || '',
+        projectRegistryFile: updated.database.project_registry_file || '',
+        aiEmbeddingModel: updated.ai_infra.embedding_model || '',
+        aiRerankerModel: updated.ai_infra.reranker_model || '',
+        aiEmbeddingBatchSize: String(updated.ai_infra.embedding_batch_size ?? ''),
+        aiUseGpu: updated.ai_infra.use_gpu,
+      })
+      setWorkspaceDirty(false)
+      setShowSlackToken(false)
+      setShowNotionToken(false)
+      setShowSlackAppToken(false)
+      setShowSlackUserToken(false)
+      setShowGlobalOpenaiKey(false)
+      setShowGoogleClientSecret(false)
+      void reloadSuggestions()
+    } catch (e: any) {
+      setError(e?.message || 'Failed to sync workspace settings from env')
+    } finally {
+      setSyncingWorkspaceFromEnv(false)
+    }
+  }
+
   const handleCancelWorkspace = () => {
     if (!workspaceView) return
     setWorkspaceForm({
@@ -1195,16 +1275,19 @@ const ProfileInterface: React.FC = () => {
                     >
                       Mode
                     </label>
-                    <select
+                    <SearchableSelect
                       id="slack-mode"
-                      className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
                       value={workspaceForm.slackMode}
-                      onChange={(e) => handleWorkspaceChange('slackMode', e.target.value)}
-                    >
-                      <option value="read_only">read_only</option>
-                      <option value="standard">standard</option>
-                      <option value="admin">admin</option>
-                    </select>
+                      onChange={(next) => handleWorkspaceChange('slackMode', next)}
+                      options={[
+                        { value: 'read_only', label: 'read_only' },
+                        { value: 'standard', label: 'standard' },
+                        { value: 'admin', label: 'admin' },
+                      ]}
+                      searchPlaceholder="Search Slack modes…"
+                      fullWidth
+                      triggerClassName="px-3 py-1.5 text-sm"
+                    />
                   </div>
                   <div>
                     <label
@@ -1548,15 +1631,18 @@ const ProfileInterface: React.FC = () => {
                     >
                       Mode
                     </label>
-                    <select
+                    <SearchableSelect
                       id="notion-mode"
-                      className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
                       value={workspaceForm.notionMode}
-                      onChange={(e) => handleWorkspaceChange('notionMode', e.target.value)}
-                    >
-                      <option value="standard">standard</option>
-                      <option value="read_only">read_only</option>
-                    </select>
+                      onChange={(next) => handleWorkspaceChange('notionMode', next)}
+                      options={[
+                        { value: 'standard', label: 'standard' },
+                        { value: 'read_only', label: 'read_only' },
+                      ]}
+                      searchPlaceholder="Search Notion modes…"
+                      fullWidth
+                      triggerClassName="px-3 py-1.5 text-sm"
+                    />
                     <p className="mt-1 text-[11px] text-muted-foreground">
                       Controls how the agent interacts with Notion (read-only vs standard).
                     </p>
@@ -1587,16 +1673,19 @@ const ProfileInterface: React.FC = () => {
                     >
                       Send mode
                     </label>
-                    <select
+                    <SearchableSelect
                       id="gmail-send-mode"
-                      className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
                       value={workspaceForm.gmailSendMode}
-                      onChange={(e) => handleWorkspaceChange('gmailSendMode', e.target.value)}
-                    >
-                      <option value="draft">draft (never send)</option>
-                      <option value="confirm">confirm (default)</option>
-                      <option value="auto_limited">auto_limited</option>
-                    </select>
+                      onChange={(next) => handleWorkspaceChange('gmailSendMode', next)}
+                      options={[
+                        { value: 'draft', label: 'draft (never send)' },
+                        { value: 'confirm', label: 'confirm (default)' },
+                        { value: 'auto_limited', label: 'auto_limited' },
+                      ]}
+                      searchPlaceholder="Search Gmail send modes…"
+                      fullWidth
+                      triggerClassName="px-3 py-1.5 text-sm"
+                    />
                   </div>
                   <div>
                     <label
@@ -1983,6 +2072,14 @@ const ProfileInterface: React.FC = () => {
               </section>
 
               <div className="flex justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={handleSyncWorkspaceFromEnv}
+                  disabled={savingWorkspace || syncingWorkspaceFromEnv}
+                  className="inline-flex items-center justify-center rounded-md border border-border bg-background px-3 py-1.5 text-xs font-medium text-foreground disabled:opacity-50"
+                >
+                  {syncingWorkspaceFromEnv ? 'Syncing…' : 'Sync from env'}
+                </button>
                 <button
                   type="button"
                   onClick={handleCancelWorkspace}

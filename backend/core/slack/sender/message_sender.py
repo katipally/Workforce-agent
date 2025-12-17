@@ -16,7 +16,8 @@ class MessageSender:
     
     def __init__(self, client: Optional[WebClient] = None):
         """Initialize message sender."""
-        self.client = client or WebClient(token=Config.SLACK_BOT_TOKEN)
+        # Use 30-second timeout to prevent hangs on slow/blocked network
+        self.client = client or WebClient(token=Config.SLACK_BOT_TOKEN, timeout=30)
         self.rate_limiter = get_rate_limiter()
     
     def send_message(

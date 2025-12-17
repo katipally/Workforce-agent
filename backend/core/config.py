@@ -29,10 +29,12 @@ class Config:
     SLACK_CLIENT_SECRET = os.getenv("SLACK_CLIENT_SECRET", "")
     SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "")
     SLACK_VERIFICATION_TOKEN = os.getenv("SLACK_VERIFICATION_TOKEN", "")
+
+    SLACK_CONVERSATIONS_HISTORY_LIMIT = int(os.getenv("SLACK_CONVERSATIONS_HISTORY_LIMIT", "15"))
     
     # Database
-    # PostgreSQL for production, SQLite for dev
-    DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://localhost/workforce_agent")
+    # Connection string must be provided via environment (see .env.example)
+    DATABASE_URL = os.getenv("DATABASE_URL", "")
     
     # Data directories (relative to project root)
     BASE_DIR = Path(__file__).parent  # backend/core
@@ -40,19 +42,33 @@ class Config:
     DATA_DIR = PROJECT_ROOT / os.getenv("DATA_DIR", "data")
     FILES_DIR = PROJECT_ROOT / os.getenv("FILES_DIR", "data/files")
     EXPORT_DIR = PROJECT_ROOT / os.getenv("EXPORT_DIR", "data/raw_exports")
-    LOGS_DIR = PROJECT_ROOT / "logs"
+    # LOGS_DIR uses backend directory for consistency (logs written here on both local and EC2)
+    LOGS_DIR = BASE_DIR.parent / "logs"
     PROJECT_REGISTRY_FILE = PROJECT_ROOT / os.getenv("PROJECT_REGISTRY_FILE", "data/project_registry.json")
     
     # Notion credentials
     NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
     NOTION_PARENT_PAGE_ID = os.getenv("NOTION_PARENT_PAGE_ID", "")
+    NOTION_VERSION = os.getenv("NOTION_VERSION", "2025-09-03")
+    
+    # Notion pipeline settings
+    NOTION_PIPELINE_MAX_PAGES = int(os.getenv("NOTION_PIPELINE_MAX_PAGES", "2000"))
+    NOTION_PIPELINE_DEEP_FETCH = os.getenv("NOTION_PIPELINE_DEEP_FETCH", "false").lower() == "true"
+    NOTION_PIPELINE_FETCH_BLOCKS = os.getenv("NOTION_PIPELINE_FETCH_BLOCKS", "false").lower() == "true"
+    NOTION_API_RATE_LIMIT_DELAY = float(os.getenv("NOTION_API_RATE_LIMIT_DELAY", "0.35"))  # seconds between requests
 
     # Google OAuth (app-level)
     GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
     GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
     GOOGLE_OAUTH_REDIRECT_BASE = os.getenv("GOOGLE_OAUTH_REDIRECT_BASE", "")
-    FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:5173")
+    # Base URL of the frontend application (must be set explicitly in .env)
+    FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "")
     SESSION_SECRET = os.getenv("SESSION_SECRET", "")
+    
+    # Cookie domain for cross-subdomain sharing in production
+    # Set to ".yourdomain.com" (with leading dot) to share cookies across subdomains
+    # e.g., ".dinoagent.com" allows cookies between app.dinoagent.com and api.dinoagent.com
+    COOKIE_DOMAIN = os.getenv("COOKIE_DOMAIN", "")
 
     # Safety & permissions configuration
     SLACK_MODE = os.getenv("SLACK_MODE", "standard").lower()
@@ -84,12 +100,12 @@ class Config:
     API_HOST = os.getenv("API_HOST", "0.0.0.0")
     
     # Rate limiting (requests per minute)
-    TIER_1_RATE_LIMIT = 1
-    TIER_2_RATE_LIMIT = 20
-    TIER_3_RATE_LIMIT = 50
+    TIER_1_RATE_LIMIT = int(os.getenv("TIER_1_RATE_LIMIT", "1"))
+    TIER_2_RATE_LIMIT = int(os.getenv("TIER_2_RATE_LIMIT", "20"))
+    TIER_3_RATE_LIMIT = int(os.getenv("TIER_3_RATE_LIMIT", "50"))
     TIER_4_RATE_LIMIT = int(os.getenv("TIER_4_RATE_LIMIT", "100"))
     DEFAULT_RATE_LIMIT = int(os.getenv("DEFAULT_RATE_LIMIT", "50"))
-    SPECIAL_RATE_LIMIT = 1  # For conversations.history on non-Marketplace apps
+    SPECIAL_RATE_LIMIT = int(os.getenv("SPECIAL_RATE_LIMIT", "1"))  # For conversations.history on non-Marketplace apps
     
     # Burst limiting
     MAX_BURST_REQUESTS = 5
@@ -106,7 +122,7 @@ class Config:
     
     # Logging
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-    LOG_FILE = os.getenv("LOG_FILE", "logs/slack_agent.log")
+    LOG_FILE = os.getenv("LOG_FILE", str(LOGS_DIR / "slack_agent.log"))
     
     # Workspace
     WORKSPACE_NAME = os.getenv("WORKSPACE_NAME", "")
@@ -115,6 +131,10 @@ class Config:
     # Performance
     BATCH_SIZE = 100
     WORKER_THREADS = 4
+
+    AUTO_SYNC_EMBEDDINGS_AFTER_PIPELINE = (
+        os.getenv("AUTO_SYNC_EMBEDDINGS_AFTER_PIPELINE", "false").lower() == "true"
+    )
     
     @classmethod
     def create_directories(cls):

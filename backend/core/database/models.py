@@ -295,11 +295,18 @@ class NotionPage(Base):
     # Display metadata
     title = Column(String(255))
     icon = Column(JSON)
+    cover = Column(JSON)
     url = Column(String(500))
     last_edited_time = Column(DateTime)
 
+    # Deep fetched content (blocks as JSON, database schema)
+    blocks_data = Column(JSON)  # Fetched block children with IDs
+    schema_data = Column(JSON)  # Database schema/properties if object_type='database'
+
     # Raw payload for future enrichment
     raw_data = Column(JSON)
+
+    embedding = Column(JSON)
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -540,6 +547,23 @@ class ProjectSource(Base):
     )
 
 
+class ProjectSyncCursor(Base):
+    __tablename__ = "project_sync_cursors"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    project_id = Column(String(50), ForeignKey("projects.id"), nullable=False)
+    source_type = Column(String(50), nullable=False)
+    source_id = Column(String(255), nullable=False)
+    cursor_value = Column(Float)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "source_type", "source_id", name="uq_project_sync_cursor"),
+        Index("idx_project_sync_cursor_project", "project_id"),
+        Index("idx_project_sync_cursor_type", "source_type"),
+    )
+
+
 class Workflow(Base):
     """Definition of a live workflow (e.g., Slack → Notion)."""
     __tablename__ = "workflows"
@@ -712,4 +736,119 @@ class AppSettings(Base):
 
     __table_args__ = (
         Index("idx_app_settings_scope", "scope"),
+    )
+
+
+class PipelineRun(Base):
+    """Track pipeline run status across multiple workers.
+    
+    Stores status for Slack, Notion, Gmail pipelines so that
+    status can be queried from any Uvicorn worker.
+    """
+    
+    __tablename__ = "pipeline_runs"
+    
+    run_id = Column(String(64), primary_key=True)
+    pipeline_type = Column(String(50), nullable=False)  # 'slack', 'notion', 'gmail'
+    status = Column(String(50), default="pending")  # pending, running, completed, failed, cancelled
+    created_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    stats = Column(JSON, default=dict)
+    error = Column(Text, nullable=True)
+    config = Column(JSON, default=dict)  # Store include_archived, download_files, etc.
+    cancel_requested = Column(Boolean, default=False)
+    
+    __table_args__ = (
+        Index("idx_pipeline_runs_type_status", "pipeline_type", "status"),
+        Index("idx_pipeline_runs_created", "created_at"),
+    )
+
+
+# ============================================================================
+# Modular Workflow System (v2) - Source → AI Prompt → Output
+# ============================================================================
+
+class UserWorkflow(Base):
+    """User-scoped modular workflow with Source → AI Prompt → Output blocks.
+    
+    Each workflow is a 3-block pipeline:
+    1. Source Block: Defines data sources (Slack channels, Gmail labels, Notion pages)
+    2. AI Prompt Block: Custom prompt that processes the source data
+    3. Output Block: Destination for results (Notion, Slack, Gmail, etc.)
+    """
+    __tablename__ = "user_workflows"
+
+    id = Column(String(50), primary_key=True, default=lambda: uuid4().hex)
+    owner_user_id = Column(String(50), ForeignKey("app_users.id"), nullable=False)
+    name = Column(String(255), nullable=False)
+    description = Column(Text)
+    
+    # Block configurations stored as JSONB
+    source_config = Column(JSON, default=dict)  # {sources: [{type, channels/labels/pages, time_range, ...}]}
+    prompt_config = Column(JSON, default=dict)  # {system_prompt, user_instructions, output_format}
+    output_config = Column(JSON, default=dict)  # {outputs: [{type, target_id, mode, ...}]}
+    
+    # Scheduling configuration
+    schedule_type = Column(String(50), default="manual")  # 'manual', 'interval', 'cron'
+    schedule_config = Column(JSON, default=dict)  # {interval_seconds: 3600} or {cron: "0 9 * * *"}
+    
+    # State
+    status = Column(String(50), default="draft")  # 'draft', 'active', 'paused', 'error'
+    last_run_at = Column(DateTime)
+    next_run_at = Column(DateTime)
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # Relationships
+    runs = relationship("WorkflowRun", back_populates="workflow", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        Index("idx_user_workflow_owner", "owner_user_id"),
+        Index("idx_user_workflow_status", "status"),
+        Index("idx_user_workflow_updated", "updated_at"),
+        Index("idx_user_workflow_next_run", "next_run_at"),
+    )
+
+
+class WorkflowRun(Base):
+    """Execution log for a single workflow run.
+    
+    Tracks status, progress, source data, AI response, and output results.
+    """
+    __tablename__ = "workflow_runs"
+
+    id = Column(String(50), primary_key=True, default=lambda: uuid4().hex)
+    workflow_id = Column(String(50), ForeignKey("user_workflows.id"), nullable=False)
+    
+    # Execution status
+    status = Column(String(50), nullable=False, default="pending")  # 'pending', 'running', 'completed', 'failed', 'cancelled'
+    started_at = Column(DateTime)
+    completed_at = Column(DateTime)
+    
+    # Execution details
+    source_items_count = Column(Integer, default=0)
+    source_data_preview = Column(Text)  # First N chars of source data for debugging
+    ai_response = Column(Text)  # Full AI response
+    output_result = Column(JSON)  # {success: true, outputs: [{type, status, details}]}
+    
+    error_message = Column(Text)
+    
+    # Progress tracking for real-time updates
+    current_step = Column(String(50))  # 'fetching_sources', 'processing_ai', 'executing_output', 'completed'
+    progress_percent = Column(Integer, default=0)
+    
+    # Logs for detailed tracking
+    logs = Column(JSON, default=list)  # [{timestamp, level, message}]
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    # Relationships
+    workflow = relationship("UserWorkflow", back_populates="runs")
+
+    __table_args__ = (
+        Index("idx_workflow_run_workflow", "workflow_id"),
+        Index("idx_workflow_run_status", "status"),
+        Index("idx_workflow_run_started", "started_at"),
     )

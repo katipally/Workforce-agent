@@ -17,7 +17,7 @@ this function.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Set, Optional
 
 from core.database.db_manager import DatabaseManager
 from core.slack.client import SlackClient
@@ -26,6 +26,11 @@ from core.utils.logger import get_logger
 from settings.service import get_effective_slack_bot_token, get_effective_notion_token
 
 logger = get_logger(__name__)
+
+# Best-effort deletion sync can be noisy for some workspaces (e.g. when
+# messages are pruned frequently or workflows are re-created). Gate it behind
+# a module-level flag so we can disable it in hosting environments.
+DELETION_SYNC_ENABLED = False
 
 
 def _build_message_text(message: Dict[str, Any], is_reply: bool = False) -> str:
@@ -176,7 +181,7 @@ def process_workflow_once(workflow_id: str) -> Dict[str, Any]:
     # users.info once per user per run.
     user_name_cache: Dict[str, str] = {}
 
-    def _resolve_user_name(user_id: str | None) -> str:
+    def _resolve_user_name(user_id: Optional[str]) -> str:
         if not user_id:
             return "someone"
         if user_id in user_name_cache:
@@ -310,17 +315,11 @@ def process_workflow_once(workflow_id: str) -> Dict[str, Any]:
                 raw_user_id = msg.get("user") or msg.get("user_id")
                 msg["__wf_author_name"] = _resolve_user_name(raw_user_id)
                 text = _build_message_text(msg, is_reply=False)
-                try:
-                    notion.update_bulleted_list_item(notion_root_block_id, text)
-                except Exception as e:  # pragma: no cover - defensive
-                    logger.error(
-                        "Failed to update Notion block for workflow %s channel %s message %s: %s",
-                        workflow_id,
-                        channel_id,
-                        ts_raw,
-                        e,
-                        exc_info=True,
-                    )
+                updated = notion.update_bulleted_list_item(notion_root_block_id, text)
+                if not updated:
+                    is_archived_root = notion.is_block_archived(notion_root_block_id)
+                    if is_archived_root:
+                        db.delete_slack_notion_mapping(workflow_id, channel_id, ts)
             else:
                 # Resolve human-friendly author name for the root message.
                 raw_user_id = msg.get("user") or msg.get("user_id")
@@ -387,17 +386,13 @@ def process_workflow_once(workflow_id: str) -> Dict[str, Any]:
                         reply["__wf_author_name"] = _resolve_user_name(raw_reply_user_id)
 
                         reply_text = _build_message_text(reply, is_reply=True)
-                        try:
-                            notion.update_bulleted_list_item(existing_reply.notion_block_id, reply_text)
-                        except Exception as e:  # pragma: no cover - defensive
-                            logger.error(
-                                "Failed to update reply block for workflow %s channel %s ts=%s: %s",
-                                workflow_id,
-                                channel_id,
-                                r_ts_raw,
-                                e,
-                                exc_info=True,
-                            )
+                        updated_reply = notion.update_bulleted_list_item(
+                            existing_reply.notion_block_id, reply_text
+                        )
+                        if not updated_reply:
+                            is_archived_reply = notion.is_block_archived(existing_reply.notion_block_id)
+                            if is_archived_reply:
+                                db.delete_slack_notion_mapping(workflow_id, channel_id, r_ts)
                         continue
 
                     # Resolve human-friendly author name for the reply.
@@ -443,12 +438,14 @@ def process_workflow_once(workflow_id: str) -> Dict[str, Any]:
                     )
                     replies_synced += 1
 
-        # After processing all visible messages for this channel, perform a
-        # best-effort deletion sync for recent messages: any mapped message
-        # whose Slack timestamp is within the current history window but whose
-        # ts is no longer present in `seen_ts` is treated as deleted in Slack
-        # and marked accordingly in Notion.
-        if seen_ts:
+        # After processing all visible messages for this channel, we optionally
+        # perform a best-effort deletion sync for recent messages: any mapped
+        # message whose Slack timestamp is within the current history window
+        # but whose ts is no longer present in `seen_ts` is treated as deleted
+        # in Slack and marked accordingly in Notion. This behavior is gated
+        # behind DELETION_SYNC_ENABLED because it can be surprising in some
+        # deployments.
+        if DELETION_SYNC_ENABLED and seen_ts:
             try:
                 min_seen_ts = min(seen_ts)
                 recent_mappings = db.list_slack_notion_mappings_for_channel_since(

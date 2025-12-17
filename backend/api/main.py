@@ -4,6 +4,21 @@ Main application with WebSocket streaming support.
 """
 
 import asyncio
+import importlib.metadata as _importlib_metadata
+
+# Compatibility shim for Python 3.9: some dependencies expect
+# importlib.metadata.packages_distributions to exist.
+try:
+    _ = _importlib_metadata.packages_distributions
+except AttributeError:  # pragma: no cover - best-effort shim
+    try:
+        import importlib_metadata as _importlib_metadata_backport  # type: ignore[import]
+
+        _importlib_metadata.packages_distributions = (  # type: ignore[attr-defined]
+            _importlib_metadata_backport.packages_distributions
+        )
+    except Exception:
+        pass
 
 from fastapi import (
     FastAPI,
@@ -21,7 +36,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Optional, List, Dict, Any, Tuple
 import json
 import os
 
@@ -40,10 +55,12 @@ import secrets
 from datetime import datetime, timedelta
 from pathlib import Path
 from email.utils import parsedate_to_datetime
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
+import time
 import requests
-from sqlalchemy import cast, or_
+from sqlalchemy import cast, or_, func
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Session
 from google.oauth2 import id_token as google_id_token
 from google.auth.transport import requests as google_requests
 from google.oauth2.credentials import Credentials
@@ -52,7 +69,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 # LLM message types for summary generation
-from langchain.schema import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage
 
 # Add core directory to path
 core_path = Path(__file__).parent.parent / 'core'
@@ -65,7 +82,7 @@ if str(agent_path) not in sys.path:
     sys.path.insert(0, str(agent_path))
 
 from config import Config
-from utils.logger import get_logger
+from utils.logger import get_logger, setup_logging
 from database.db_manager import DatabaseManager
 from database.models import (
     Workspace,
@@ -82,12 +99,55 @@ from database.models import (
     AppUser,
     UserOAuthToken,
     AppSession,
+    PipelineRun,
 )
 from slack.extractor import ExtractionCoordinator
+from slack.extractor.channels import ChannelExtractor
+from slack.extractor.messages import MessageExtractor
+from slack.sender.message_sender import MessageSender
+from slack.sender.file_sender import FileSender
 from gmail import GmailClient
 from notion_export import NotionClient
+from sentence_transformer_engine import SentenceTransformerEmbedding
+
+"""Initialize logging and core services."""
+
+# Ensure data/logs directories exist and configure logging
+Config.create_directories()
+setup_logging()
 
 logger = get_logger(__name__)
+
+_gmail_labels_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_notion_hierarchy_cache: Tuple[float, Dict[str, Any]] = (0.0, {})
+_slack_channel_options_cache: Tuple[float, Dict[str, Any]] = (0.0, {})
+
+_OPTIONS_CACHE_TTL_SECONDS = 300.0
+
+_project_embedding_model: Optional[SentenceTransformerEmbedding] = None
+_project_embedding_model_lock = threading.Lock()
+
+
+def _get_project_embedding_model() -> SentenceTransformerEmbedding:
+    global _project_embedding_model
+    if _project_embedding_model is not None:
+        return _project_embedding_model
+    with _project_embedding_model_lock:
+        if _project_embedding_model is None:
+            _project_embedding_model = SentenceTransformerEmbedding(
+                model_name=Config.EMBEDDING_MODEL,
+                use_gpu=Config.USE_GPU,
+            )
+    return _project_embedding_model
+
+class PipelineCancelled(Exception):
+    """Raised when a pipeline stop is requested."""
+
+
+def _project_chat_session_id(project_id: str, owner_user_id: str) -> str:
+    # chat_sessions.session_id is limited to 50 chars; use a short stable hash
+    digest = hashlib.sha1(f"{owner_user_id}:{project_id}".encode("utf-8")).hexdigest()[:32]
+    return f"projchat_{digest}"
 
 # Initialize database manager
 db_manager = DatabaseManager()
@@ -97,15 +157,51 @@ SESSION_TTL_SECONDS = 60 * 60 * 24 * 7
 
 
 def _cookie_settings() -> Dict[str, Any]:
-    secure = not (
-        Config.FRONTEND_BASE_URL.startswith("http://localhost")
-        or Config.FRONTEND_BASE_URL.startswith("http://127.0.0.1")
+    """Get cookie settings based on environment.
+    
+    For cross-subdomain auth (e.g., app.domain.com + api.domain.com):
+    - Set COOKIE_DOMAIN=.domain.com in .env
+    - This allows SameSite=Lax (more secure, better browser support)
+    
+    For cross-origin auth (different domains):
+    - Leave COOKIE_DOMAIN empty
+    - Uses SameSite=None (required for cross-origin, but blocked by some browsers)
+    """
+    frontend_url = Config.FRONTEND_BASE_URL or ""
+    cookie_domain = Config.COOKIE_DOMAIN or ""
+    
+    is_local = (
+        frontend_url.startswith("http://localhost")
+        or frontend_url.startswith("http://127.0.0.1")
+        or not frontend_url  # Empty = assume local dev
     )
-    return {
+
+    if is_local:
+        return {
+            "path": "/",
+            "httponly": True,
+            "secure": False,
+            "samesite": "lax",
+        }
+
+    # Production settings
+    settings: Dict[str, Any] = {
+        "path": "/",
         "httponly": True,
-        "secure": secure,
-        "samesite": "lax",
+        "secure": True,
     }
+    
+    # If COOKIE_DOMAIN is set, we're using same-root-domain setup
+    # which allows SameSite=Lax (more compatible with browsers)
+    if cookie_domain:
+        settings["domain"] = cookie_domain
+        settings["samesite"] = "lax"
+    else:
+        # Cross-origin setup requires SameSite=None
+        # Note: This is blocked by Safari ITP and some other browsers
+        settings["samesite"] = "none"
+    
+    return settings
 
 
 def _delete_app_session(session_id: str) -> None:
@@ -152,6 +248,13 @@ def _get_user_from_session_id(session_id: Optional[str]) -> AppUser:
 
 def get_current_user(request: Request) -> AppUser:
     session_id = request.cookies.get(SESSION_COOKIE_NAME)
+    if not session_id:
+        user_agent = request.headers.get("user-agent", "unknown")
+        logger.warning(
+            "No session cookie found - UserAgent: %s, Cookies: %s",
+            user_agent[:100] if user_agent else "none",
+            list(request.cookies.keys())
+        )
     return _get_user_from_session_id(session_id)
 
 
@@ -297,7 +400,9 @@ from settings.service import (
     get_effective_openai_key,
     get_effective_llm_model,
     get_effective_notion_token,
+    get_effective_slack_bot_token,
     bootstrap_app_settings_from_config_if_empty,
+    sync_workspace_settings_from_config,
 )
 
 # Import embedding synchronizer for pipeline integration
@@ -307,12 +412,85 @@ from embeddings_sync import sync_embeddings_after_pipeline
 # Global variables
 rag_engine = None
 ai_brain = None  # Kept for backward-compatible health reporting; brains are built per-user.
-rag_lock: asyncio.Lock | None = None
-ai_brain_lock: asyncio.Lock | None = None
+rag_lock: Optional[asyncio.Lock] = None
+ai_brain_lock: Optional[asyncio.Lock] = None
 
 # Background workflow worker (Slack → Notion) state
-workflow_worker_thread: threading.Thread | None = None
-workflow_worker_stop_event: threading.Event | None = None
+workflow_worker_thread: Optional[threading.Thread] = None
+workflow_worker_stop_event: Optional[threading.Event] = None
+
+
+def _has_active_slack_to_notion_workflows() -> bool:
+    """Return True if there is at least one active Slack → Notion workflow."""
+
+    try:
+        workflows = db_manager.list_workflows(limit=500)
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error("Failed to list workflows when checking active status: %s", e, exc_info=True)
+        return False
+
+    for wf in workflows:
+        if getattr(wf, "type", None) == "slack_to_notion" and getattr(wf, "status", None) == "active":
+            return True
+    return False
+
+
+def _start_workflow_worker_if_needed() -> None:
+    """Start the Slack → Notion worker thread only when there are active workflows."""
+
+    global workflow_worker_thread, workflow_worker_stop_event
+
+    if workflow_worker_thread is not None and workflow_worker_thread.is_alive():
+        return
+
+    if not _has_active_slack_to_notion_workflows():
+        logger.info("No active Slack → Notion workflows; scheduler thread not started")
+        return
+
+    # Import here to avoid circular imports at module load time
+    from workflows.slack_to_notion_worker import run_scheduler
+
+    workflow_worker_stop_event = threading.Event()
+
+    def _runner() -> None:
+        run_scheduler(stop_event=workflow_worker_stop_event)
+
+    workflow_worker_thread = threading.Thread(
+        target=_runner,
+        name="slack_to_notion_worker",
+        daemon=True,
+    )
+    workflow_worker_thread.start()
+    logger.info("Started Slack → Notion workflow scheduler background thread")
+
+
+def _stop_workflow_worker_internal() -> None:
+    """Stop the background Slack → Notion workflow scheduler thread if running."""
+
+    global workflow_worker_thread, workflow_worker_stop_event
+
+    if workflow_worker_stop_event is not None:
+        workflow_worker_stop_event.set()
+
+    if workflow_worker_thread is not None and workflow_worker_thread.is_alive():
+        workflow_worker_thread.join(timeout=10)
+
+    workflow_worker_thread = None
+    workflow_worker_stop_event = None
+
+
+def _reconcile_workflow_worker_state() -> None:
+    """Ensure the worker thread state matches DB workflow state.
+
+    If there is at least one active Slack → Notion workflow, the scheduler
+    thread is started (if not already running). If there are none, the thread
+    is stopped.
+    """
+
+    if _has_active_slack_to_notion_workflows():
+        _start_workflow_worker_if_needed()
+    else:
+        _stop_workflow_worker_internal()
 
 
 async def get_rag_engine() -> HybridRAGEngine:
@@ -397,6 +575,7 @@ async def _build_ai_brain_for_user(current_user: AppUser) -> WorkforceAIBrain:
             rag_engine=rag,
             model=model,
             temperature=0.7,
+            user_id=current_user.id,
         ),
     )
 
@@ -454,8 +633,11 @@ async def google_login(request: Request, redirect_path: Optional[str] = "/"):
 async def google_callback(request: Request, code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None):
     """Handle Google OAuth callback, create/update user, and set session cookie."""
 
-    frontend_base = Config.FRONTEND_BASE_URL or "http://localhost:5173"
-    default_redirect = frontend_base.rstrip("/") or "http://localhost:5173"
+    # Prefer explicit FRONTEND_BASE_URL, but fall back to the callback's base URL
+    frontend_base = (Config.FRONTEND_BASE_URL or "").rstrip("/")
+    if not frontend_base:
+        frontend_base = str(request.base_url).rstrip("/")
+    default_redirect = frontend_base
 
     if error or not code:
         redirect_url = f"{default_redirect}?auth_error={error or 'missing_code'}"
@@ -598,15 +780,96 @@ async def google_callback(request: Request, code: Optional[str] = None, state: O
         session.add(app_session)
         session.commit()
 
-    redirect_url = f"{default_redirect}{redirect_path}"
+    # Log successful session creation
+    user_agent = request.headers.get("user-agent", "unknown")
+    logger.info(
+        "OAuth callback successful - User: %s, SessionID: %s, UserAgent: %s",
+        email,
+        session_id,
+        user_agent[:100] if user_agent else "none"
+    )
+
+    # Add session token to URL as fallback for mobile Safari (ITP workaround)
+    # The frontend will call /auth/session-exchange to set the cookie
+    redirect_separator = "&" if "?" in redirect_path else "?"
+    redirect_url = f"{default_redirect}{redirect_path}{redirect_separator}_session_token={session_id}"
+    
     response = RedirectResponse(url=redirect_url, status_code=status.HTTP_302_FOUND)
     if session_id:
+        cookie_settings = _cookie_settings()
+        logger.info(
+            "Setting session cookie - SessionID: %s, Settings: %s",
+            session_id[:8] + "...",
+            cookie_settings
+        )
         response.set_cookie(
             key=SESSION_COOKIE_NAME,
             value=session_id,
             max_age=SESSION_TTL_SECONDS,
-            **_cookie_settings(),
+            **cookie_settings,
         )
+    return response
+
+
+@app.post("/auth/session-exchange")
+async def session_exchange(request: Request):
+    """Exchange a session token from URL for a proper session cookie.
+    
+    This is a workaround for mobile Safari's Intelligent Tracking Prevention (ITP)
+    which blocks cross-site cookies even with SameSite=None. The frontend calls
+    this endpoint with the token from the URL to set the cookie via a same-site request.
+    """
+    try:
+        body = await request.json()
+        token = body.get("token")
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid request body"
+        )
+    
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing token"
+        )
+    
+    # Validate the token is a valid session
+    with db_manager.get_session() as session:
+        app_session = session.query(AppSession).filter_by(id=token).first()
+        if not app_session:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired token"
+            )
+        
+        # Check if session is expired
+        if app_session.expires_at and app_session.expires_at < datetime.utcnow():
+            session.delete(app_session)
+            session.commit()
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session expired"
+            )
+        
+        # Update last_seen
+        app_session.last_seen_at = datetime.utcnow()
+        session.commit()
+    
+    # Set the cookie via a same-site response
+    response = JSONResponse({"detail": "session_set"})
+    cookie_settings = _cookie_settings()
+    logger.info(
+        "Session exchange successful - SessionID: %s, Settings: %s",
+        token[:8] + "...",
+        cookie_settings
+    )
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=token,
+        max_age=SESSION_TTL_SECONDS,
+        **cookie_settings,
+    )
     return response
 
 
@@ -619,13 +882,23 @@ async def logout(request: Request):
         _delete_app_session(session_id)
 
     response = JSONResponse({"detail": "logged_out"})
-    response.delete_cookie(SESSION_COOKIE_NAME)
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/")
     return response
 
 
 @app.get("/auth/me")
-async def auth_me(current_user: AppUser = Depends(get_current_user)):
+async def auth_me(request: Request, current_user: AppUser = Depends(get_current_user)):
     """Return the current authenticated user's profile."""
+
+    # Log successful authentication
+    user_agent = request.headers.get("user-agent", "unknown")
+    session_id = request.cookies.get(SESSION_COOKIE_NAME, "none")
+    logger.info(
+        "Auth check successful - User: %s, SessionID: %s, UserAgent: %s",
+        current_user.email,
+        session_id[:8] + "..." if session_id != "none" else "none",
+        user_agent[:100] if user_agent else "none"
+    )
 
     return {
         "id": current_user.id,
@@ -636,9 +909,48 @@ async def auth_me(current_user: AppUser = Depends(get_current_user)):
     }
 
 # CORS middleware for React frontend
-_frontend_origins = ["http://localhost:5173", "http://localhost:3000"]
-if Config.FRONTEND_BASE_URL and Config.FRONTEND_BASE_URL not in _frontend_origins:
-    _frontend_origins.append(Config.FRONTEND_BASE_URL)
+_frontend_origins: list[str] = []
+
+
+def _add_cors_origin(origin: str) -> None:
+    origin = (origin or "").strip().rstrip("/")
+    if not origin:
+        return
+
+    if origin not in _frontend_origins:
+        _frontend_origins.append(origin)
+
+    # Add both www/non-www variants to avoid subtle production mismatches.
+    try:
+        parsed = urlsplit(origin)
+        if not parsed.scheme or not parsed.netloc:
+            return
+
+        host = parsed.netloc
+        if host.startswith("www."):
+            alt_host = host[4:]
+        else:
+            alt_host = f"www.{host}"
+
+        alt_origin = f"{parsed.scheme}://{alt_host}"
+        if alt_origin not in _frontend_origins:
+            _frontend_origins.append(alt_origin)
+    except Exception:
+        return
+
+
+if Config.FRONTEND_BASE_URL:
+    _add_cors_origin(Config.FRONTEND_BASE_URL)
+
+extra_origins = os.getenv("CORS_ALLOWED_ORIGINS", "")
+for origin in extra_origins.split(","):
+    _add_cors_origin(origin)
+
+if not _frontend_origins:
+    # Fallback to permissive CORS when no origins are configured
+    _frontend_origins.append("*")
+
+logger.info("Configured CORS allowed origins: %s", _frontend_origins)
 
 app.add_middleware(
     CORSMiddleware,
@@ -664,48 +976,47 @@ async def start_workflow_worker() -> None:
     This avoids requiring a separate `python workflows/slack_to_notion_worker.py`
     process. The thread is stopped cleanly on application shutdown.
     """
-    global workflow_worker_thread, workflow_worker_stop_event
-
-    # Already running
-    if workflow_worker_thread is not None and workflow_worker_thread.is_alive():
-        return
-
-    # Import here to avoid circular imports at module load time
-    from workflows.slack_to_notion_worker import run_scheduler
-
-    workflow_worker_stop_event = threading.Event()
-
-    def _runner() -> None:
-        run_scheduler(stop_event=workflow_worker_stop_event)
-
-    workflow_worker_thread = threading.Thread(
-        target=_runner,
-        name="slack_to_notion_worker",
-        daemon=True,
-    )
-    workflow_worker_thread.start()
-    logger.info("Started Slack → Notion workflow scheduler background thread")
+    _start_workflow_worker_if_needed()
 
 
 @app.on_event("shutdown")
 async def stop_workflow_worker() -> None:
     """Stop the background Slack → Notion workflow scheduler thread."""
-    global workflow_worker_thread, workflow_worker_stop_event
+    _stop_workflow_worker_internal()
 
-    if workflow_worker_stop_event is not None:
-        workflow_worker_stop_event.set()
 
-    if workflow_worker_thread is not None and workflow_worker_thread.is_alive():
-        workflow_worker_thread.join(timeout=10)
+@app.on_event("startup")
+async def start_workflow_scheduler_v2() -> None:
+    """Start the modular workflow scheduler (v2) in a background thread."""
+    try:
+        from workflows.workflow_scheduler import reconcile_scheduler_state
+        reconcile_scheduler_state(db_manager)
+    except Exception as e:
+        logger.warning(f"Failed to start workflow scheduler v2: {e}")
 
-    workflow_worker_thread = None
-    workflow_worker_stop_event = None
+
+@app.on_event("shutdown")
+async def stop_workflow_scheduler_v2() -> None:
+    """Stop the modular workflow scheduler (v2) thread."""
+    try:
+        from workflows.workflow_scheduler import stop_workflow_scheduler
+        stop_workflow_scheduler()
+    except Exception as e:
+        logger.warning(f"Failed to stop workflow scheduler v2: {e}")
+
 
 # Request/Response models
+class SourcePreferences(BaseModel):
+    slack: bool = True
+    gmail: bool = True
+    notion: bool = True
+
+
 class ChatRequest(BaseModel):
     """Chat request model."""
     query: str
     conversation_history: Optional[List[Dict[str, str]]] = None
+    source_prefs: Optional[SourcePreferences] = None
 
 
 class ChatResponse(BaseModel):
@@ -721,6 +1032,22 @@ class HealthResponse(BaseModel):
     models_loaded: bool
     ai_brain_loaded: bool
     capabilities: List[str]
+
+
+class ConnectorHealth(BaseModel):
+    """Status for a single external connector (Slack, Gmail, Notion)."""
+
+    status: str  # connected, disconnected, degraded
+    detail: Optional[str] = None
+
+
+class ChatConnectorHealthResponse(BaseModel):
+    """Aggregated connector health for the chat UI."""
+
+    overall_status: str
+    slack: ConnectorHealth
+    gmail: ConnectorHealth
+    notion: ConnectorHealth
 
 
 class UserSettingsUpdate(BaseModel):
@@ -811,7 +1138,7 @@ class WorkflowChannelPayload(BaseModel):
     slack_channel_name: Optional[str] = None
 
 
-WORKFLOW_ALLOWED_INTERVALS = {30, 60, 300, 600, 3600}
+WORKFLOW_ALLOWED_INTERVALS = {30,3600, 10800, 28800, 86400}
 
 
 # Routes
@@ -824,6 +1151,60 @@ async def root():
         "ai_brain_loaded": ai_brain is not None,
         "capabilities": ["slack", "gmail", "notion", "rag_search"] if ai_brain else []
     }
+
+
+@app.get("/api/chat/connectors/status", response_model=ChatConnectorHealthResponse)
+async def get_chat_connector_status(
+    current_user: AppUser = Depends(get_current_user),
+):
+    """Return high-level connector health for Slack, Gmail, and Notion.
+
+    This is used by the Chat UI header to show per-platform status. It is a
+    lightweight check based primarily on configuration and user OAuth state,
+    and does not perform heavy API calls.
+    """
+
+    # Slack workspace-level status
+    slack_token = get_effective_slack_bot_token(db_manager)
+    if slack_token:
+        slack_status = "connected"
+        slack_detail = "Slack bot token configured"
+    else:
+        slack_status = "disconnected"
+        slack_detail = "Slack bot token not configured"
+
+    # Gmail per-user status
+    if getattr(current_user, "has_gmail_access", False):
+        gmail_status = "connected"
+        gmail_detail = "Gmail authorized for current user"
+    else:
+        gmail_status = "disconnected"
+        gmail_detail = "Gmail not authorized for current user"
+
+    # Notion workspace-level status
+    notion_token = get_effective_notion_token(db_manager)
+    if notion_token:
+        notion_status = "connected"
+        notion_detail = "Notion token configured"
+    else:
+        notion_status = "disconnected"
+        notion_detail = "Notion token not configured"
+
+    # Derive overall status
+    connector_statuses = {slack_status, gmail_status, notion_status}
+    if connector_statuses == {"connected"}:
+        overall_status = "connected"
+    elif connector_statuses == {"disconnected"}:
+        overall_status = "disconnected"
+    else:
+        overall_status = "degraded"
+
+    return ChatConnectorHealthResponse(
+        overall_status=overall_status,
+        slack=ConnectorHealth(status=slack_status, detail=slack_detail),
+        gmail=ConnectorHealth(status=gmail_status, detail=gmail_detail),
+        notion=ConnectorHealth(status=notion_status, detail=notion_detail),
+    )
 
 
 @app.get("/api/settings/me")
@@ -881,6 +1262,27 @@ async def update_workspace_settings_endpoint(
 
     data = payload.dict(exclude_unset=True)
     result = update_workspace_settings(db_manager, data)
+
+    # Clear cached AI engines so they are rebuilt with new settings on next use.
+    rag_engine = None
+    ai_brain = None
+
+    return result
+
+
+@app.post("/api/settings/workspace/sync-from-env")
+async def sync_workspace_settings_from_env_endpoint(
+    current_user: AppUser = Depends(get_current_user),
+):
+    """Sync workspace-wide settings from current Config/env values.
+
+    This is used by the Workspace settings UI "Sync from env" button to pull
+    values from .env/Config into the AppSettings document.
+    """
+
+    global rag_engine, ai_brain
+
+    result = sync_workspace_settings_from_config(db_manager)
 
     # Clear cached AI engines so they are rebuilt with new settings on next use.
     rag_engine = None
@@ -1092,32 +1494,42 @@ async def chat_message(
     Returns:
         Chat response with answer and sources
     """
+    brain = None
     try:
         brain = await _build_ai_brain_for_user(current_user)
 
         # Collect streaming response into single output
         full_response = ""
         sources = []
-        
+
+        prefs_dict = request.source_prefs.dict() if request.source_prefs else None
+
         async for event in brain.stream_query(
             request.query,
             request.conversation_history or [],
             user_email=current_user.email,
+            source_prefs=prefs_dict,
         ):
-            if event.get('type') == 'token':
-                full_response += event.get('content', '')
-            elif event.get('type') == 'sources':
-                sources = event.get('content', [])
-        
+            if event.get("type") == "token":
+                full_response += event.get("content", "")
+            elif event.get("type") == "sources":
+                sources = event.get("content", [])
+
         return ChatResponse(
             response=full_response,
             sources=sources,
             intent="general"  # AI Brain doesn't expose intent separately
         )
-    
+
     except Exception as e:
         logger.error(f"Error in chat: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        try:
+            if brain and hasattr(brain, "close"):
+                await brain.close()
+        except Exception:
+            pass
 
 
 def _truncate_history(history: List[Dict[str, str]], max_messages: int = 40, max_chars: int = 8000) -> List[Dict[str, str]]:
@@ -1207,6 +1619,7 @@ async def websocket_chat(websocket: WebSocket):
                 message_data = json.loads(data)
                 query = message_data.get('query', '').strip()
                 session_id = message_data.get('session_id', 'default')
+                source_prefs = message_data.get('source_prefs') or None
                 
                 if not query:
                     await websocket.send_json({
@@ -1277,6 +1690,7 @@ async def websocket_chat(websocket: WebSocket):
                         query,
                         conversation_history,
                         user_email=current_user.email,
+                        source_prefs=source_prefs,
                     ):
                         try:
                             await websocket.send_json(event)
@@ -1319,6 +1733,10 @@ async def websocket_chat(websocket: WebSocket):
                     except:
                         break
             
+            except WebSocketDisconnect as e:
+                logger.debug(f"WebSocket disconnected during processing: {e}")
+                break
+
             except json.JSONDecodeError:
                 logger.warning("Invalid JSON received")
                 try:
@@ -1343,8 +1761,13 @@ async def websocket_chat(websocket: WebSocket):
         # Clean shutdown - no error logging for normal disconnects
         logger.debug("WebSocket connection closed")
         try:
+            if brain and hasattr(brain, "close"):
+                await brain.close()
+        except Exception:
+            pass
+        try:
             await websocket.close()
-        except:
+        except Exception:
             pass
 
 
@@ -1673,7 +2096,7 @@ async def generate_project_summary(
     """
 
     try:
-        project = db_manager.get_project(project_id)
+        project = db_manager.get_project(project_id, owner_user_id=current_user.id)
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
 
@@ -1897,7 +2320,7 @@ async def generate_project_summary(
 
 
 @app.post("/api/projects/{project_id}/sync")
-async def sync_project_data(project_id: str):
+async def sync_project_data(project_id: str, current_user: AppUser = Depends(get_current_user)):
     """Embed Slack and Gmail data for the project's mapped sources.
 
     This endpoint generates vector embeddings for Slack messages and Gmail
@@ -1907,7 +2330,7 @@ async def sync_project_data(project_id: str):
     """
 
     try:
-        project = db_manager.get_project(project_id)
+        project = db_manager.get_project(project_id, owner_user_id=current_user.id)
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
 
@@ -1948,7 +2371,9 @@ async def sync_project_data(project_id: str):
                         last_slack_ts = datetime.fromtimestamp(last_msg.timestamp)
 
                 if gmail_label_ids:
-                    gmail_base = session.query(GmailMessage)
+                    gmail_base = session.query(GmailMessage).filter(
+                        GmailMessage.account_email == current_user.email
+                    )
                     label_filters = [
                         cast(GmailMessage.label_ids, JSONB).contains([lbl])
                         for lbl in gmail_label_ids
@@ -1973,32 +2398,37 @@ async def sync_project_data(project_id: str):
                 # Generate embeddings for unmapped rows using the configured
                 # sentence-transformers model and the generic embedding column.
                 if slack_channel_ids:
-                    slack_query = (
-                        session.query(Message)
-                        .filter(Message.channel_id.in_(slack_channel_ids))
-                        .filter(Message.text.isnot(None))
-                        .filter(Message.text != "")
-                        .filter(Message.embedding.is_(None))
-                    )
-
-                    slack_messages = slack_query.all()
                     batch_size = 64
-                    for i in range(0, len(slack_messages), batch_size):
-                        batch = slack_messages[i : i + batch_size]
-                        texts = [m.text for m in batch]
+                    while True:
+                        slack_batch = (
+                            session.query(Message)
+                            .filter(Message.channel_id.in_(slack_channel_ids))
+                            .filter(Message.text.isnot(None))
+                            .filter(Message.text != "")
+                            .filter(Message.embedding.is_(None))
+                            .order_by(Message.timestamp.desc())
+                            .limit(batch_size)
+                            .all()
+                        )
+                        if not slack_batch:
+                            break
+
+                        texts = [m.text for m in slack_batch]
                         embeddings = embedding_model.encode(
                             texts,
                             batch_size=len(texts),
                             is_query=False,
                             show_progress=False,
                         )
-                        for msg, emb in zip(batch, embeddings):
+                        for msg, emb in zip(slack_batch, embeddings):
                             msg.embedding = emb.tolist()
-                        indexed_slack += len(batch)
+                        indexed_slack += len(slack_batch)
                         session.commit()
 
                 if gmail_label_ids:
-                    gmail_query = session.query(GmailMessage)
+                    gmail_query = session.query(GmailMessage).filter(
+                        GmailMessage.account_email == current_user.email
+                    )
                     label_filters = [
                         cast(GmailMessage.label_ids, JSONB).contains([lbl])
                         for lbl in gmail_label_ids
@@ -2006,13 +2436,19 @@ async def sync_project_data(project_id: str):
                     if label_filters:
                         gmail_query = gmail_query.filter(or_(*label_filters))
 
-                    gmail_to_embed = gmail_query.filter(GmailMessage.embedding.is_(None)).all()
-
                     batch_size = 32
-                    for i in range(0, len(gmail_to_embed), batch_size):
-                        batch = gmail_to_embed[i : i + batch_size]
+                    while True:
+                        gmail_batch = (
+                            gmail_query.filter(GmailMessage.embedding.is_(None))
+                            .order_by(GmailMessage.date.desc())
+                            .limit(batch_size)
+                            .all()
+                        )
+                        if not gmail_batch:
+                            break
+
                         texts: List[str] = []
-                        for email in batch:
+                        for email in gmail_batch:
                             text_parts: List[str] = []
                             if email.subject:
                                 text_parts.append(email.subject)
@@ -2027,9 +2463,9 @@ async def sync_project_data(project_id: str):
                             is_query=False,
                             show_progress=False,
                         )
-                        for email, emb in zip(batch, embeddings):
+                        for email, emb in zip(gmail_batch, embeddings):
                             email.embedding = emb.tolist()
-                        indexed_gmail += len(batch)
+                        indexed_gmail += len(gmail_batch)
                         session.commit()
 
             return {
@@ -2058,8 +2494,581 @@ async def sync_project_data(project_id: str):
         raise HTTPException(status_code=500, detail="Failed to sync project data")
 
 
+def _run_project_sync(
+    run_id: str,
+    project_id: str,
+    owner_user_id: str,
+    account_email: str,
+) -> None:
+    _update_pipeline_run(run_id, status="running", started_at=datetime.utcnow())
+
+    stats: Dict[str, Any] = {
+        "project_id": project_id,
+        "stage": "starting",
+        "progress": 0.0,
+        "processed": 0,
+        "total": 0,
+        "indexed_slack": 0,
+        "indexed_gmail": 0,
+        "indexed_notion": 0,
+        "last_synced": {"slack": None, "gmail": None, "notion": None},
+    }
+
+    def _check_cancel():
+        if _is_cancel_requested(run_id):
+            raise PipelineCancelled()
+
+    try:
+        project = db_manager.get_project(project_id, owner_user_id=owner_user_id)
+        if not project:
+            _update_pipeline_run(
+                run_id,
+                status="failed",
+                finished_at=datetime.utcnow(),
+                error="Project not found",
+                stats=stats,
+            )
+            return
+
+        sources = db_manager.get_project_sources(project_id)
+        slack_channel_ids = [s.source_id for s in sources if s.source_type == "slack_channel"]
+        gmail_label_ids = [s.source_id for s in sources if s.source_type == "gmail_label"]
+        notion_page_ids = [s.source_id for s in sources if s.source_type == "notion_page"]
+
+        embedding_model = _get_project_embedding_model()
+
+        with db_manager.get_session() as session:
+            total = 0
+
+            for channel_id in slack_channel_ids:
+                cursor = db_manager.get_project_sync_cursor(project_id, "slack_channel", channel_id) or 0.0
+                cursor_dt = datetime.fromtimestamp(cursor) if cursor else datetime.utcfromtimestamp(0)
+                _check_cancel()
+                cnt = (
+                    session.query(func.count(Message.message_id))
+                    .filter(Message.channel_id == channel_id)
+                    .filter(Message.text.isnot(None))
+                    .filter(Message.text != "")
+                    .filter(Message.embedding.is_(None))
+                    .filter(Message.created_at > cursor_dt)
+                    .scalar()
+                )
+                total += int(cnt or 0)
+
+            for label_id in gmail_label_ids:
+                cursor = db_manager.get_project_sync_cursor(project_id, "gmail_label", label_id) or 0.0
+                cursor_dt = datetime.fromtimestamp(cursor) if cursor else datetime.utcfromtimestamp(0)
+                _check_cancel()
+                cnt = (
+                    session.query(func.count(GmailMessage.message_id))
+                    .filter(GmailMessage.account_email == account_email)
+                    .filter(cast(GmailMessage.label_ids, JSONB).contains([label_id]))
+                    .filter(GmailMessage.embedding.is_(None))
+                    .filter(GmailMessage.created_at > cursor_dt)
+                    .scalar()
+                )
+                total += int(cnt or 0)
+
+            for page_id in notion_page_ids:
+                cursor = db_manager.get_project_sync_cursor(project_id, "notion_page", page_id) or 0.0
+                cursor_dt = datetime.fromtimestamp(cursor) if cursor else datetime.utcfromtimestamp(0)
+                _check_cancel()
+                cnt = (
+                    session.query(func.count(NotionPage.page_id))
+                    .filter(NotionPage.page_id == page_id)
+                    .filter(
+                        or_(
+                            NotionPage.embedding.is_(None),
+                            NotionPage.updated_at > cursor_dt,
+                        )
+                    )
+                    .scalar()
+                )
+                total += int(cnt or 0)
+
+            stats["total"] = total
+            _update_pipeline_run(run_id, stats=stats)
+
+            processed = 0
+
+            for channel_id in slack_channel_ids:
+                stats["stage"] = f"embedding_slack:{channel_id}"
+                _update_pipeline_run(run_id, stats=stats)
+                cursor = db_manager.get_project_sync_cursor(project_id, "slack_channel", channel_id) or 0.0
+                cursor_dt = datetime.fromtimestamp(cursor) if cursor else datetime.utcfromtimestamp(0)
+                last_ts = cursor
+                while True:
+                    _check_cancel()
+                    batch = (
+                        session.query(Message)
+                        .filter(Message.channel_id == channel_id)
+                        .filter(Message.text.isnot(None))
+                        .filter(Message.text != "")
+                        .filter(Message.embedding.is_(None))
+                        .filter(Message.created_at > cursor_dt)
+                        .order_by(Message.created_at.asc())
+                        .limit(64)
+                        .all()
+                    )
+                    if not batch:
+                        break
+                    texts = [m.text or "" for m in batch]
+                    embeddings = embedding_model.encode(texts, batch_size=min(32, len(texts)), show_progress=False)
+                    for msg, emb in zip(batch, embeddings):
+                        msg.embedding = emb.tolist()
+                        if msg.created_at:
+                            last_ts = max(last_ts, msg.created_at.timestamp())
+                    session.commit()
+                    processed += len(batch)
+                    stats["indexed_slack"] += len(batch)
+                    stats["processed"] = processed
+                    stats["progress"] = 1.0 if total == 0 else min(1.0, processed / total)
+                    _update_pipeline_run(run_id, stats=stats)
+
+                db_manager.upsert_project_sync_cursor(project_id, "slack_channel", channel_id, last_ts)
+
+            for label_id in gmail_label_ids:
+                stats["stage"] = f"embedding_gmail:{label_id}"
+                _update_pipeline_run(run_id, stats=stats)
+                cursor = db_manager.get_project_sync_cursor(project_id, "gmail_label", label_id) or 0.0
+                cursor_dt = datetime.fromtimestamp(cursor) if cursor else datetime.utcfromtimestamp(0)
+                last_ts = cursor
+                while True:
+                    _check_cancel()
+                    batch = (
+                        session.query(GmailMessage)
+                        .filter(GmailMessage.account_email == account_email)
+                        .filter(cast(GmailMessage.label_ids, JSONB).contains([label_id]))
+                        .filter(GmailMessage.embedding.is_(None))
+                        .filter(GmailMessage.created_at > cursor_dt)
+                        .order_by(GmailMessage.created_at.asc())
+                        .limit(32)
+                        .all()
+                    )
+                    if not batch:
+                        break
+
+                    texts: List[str] = []
+                    for email in batch:
+                        parts: List[str] = []
+                        if email.subject:
+                            parts.append(email.subject)
+                        if email.body_text:
+                            parts.append(email.body_text[:1000])
+                        text = "\n\n".join(parts).strip() or "Empty email"
+                        texts.append(text)
+
+                    embeddings = embedding_model.encode(texts, batch_size=min(16, len(texts)), show_progress=False)
+                    for email, emb in zip(batch, embeddings):
+                        email.embedding = emb.tolist()
+                        if email.created_at:
+                            last_ts = max(last_ts, email.created_at.timestamp())
+                    session.commit()
+                    processed += len(batch)
+                    stats["indexed_gmail"] += len(batch)
+                    stats["processed"] = processed
+                    stats["progress"] = 1.0 if total == 0 else min(1.0, processed / total)
+                    _update_pipeline_run(run_id, stats=stats)
+
+                db_manager.upsert_project_sync_cursor(project_id, "gmail_label", label_id, last_ts)
+
+            for page_id in notion_page_ids:
+                stats["stage"] = f"embedding_notion:{page_id}"
+                _update_pipeline_run(run_id, stats=stats)
+                cursor = db_manager.get_project_sync_cursor(project_id, "notion_page", page_id) or 0.0
+                cursor_dt = datetime.fromtimestamp(cursor) if cursor else datetime.utcfromtimestamp(0)
+                last_ts = cursor
+                while True:
+                    _check_cancel()
+                    batch = (
+                        session.query(NotionPage)
+                        .filter(NotionPage.page_id == page_id)
+                        .filter(
+                            or_(
+                                NotionPage.embedding.is_(None),
+                                NotionPage.updated_at > cursor_dt,
+                            )
+                        )
+                        .order_by(NotionPage.updated_at.asc())
+                        .limit(10)
+                        .all()
+                    )
+                    if not batch:
+                        break
+
+                    texts = [f"Title: {p.title or 'Untitled'}" for p in batch]
+                    embeddings = embedding_model.encode(texts, batch_size=min(8, len(texts)), show_progress=False)
+                    for page, emb in zip(batch, embeddings):
+                        page.embedding = emb.tolist()
+                        if page.updated_at:
+                            last_ts = max(last_ts, page.updated_at.timestamp())
+                    session.commit()
+                    processed += len(batch)
+                    stats["indexed_notion"] += len(batch)
+                    stats["processed"] = processed
+                    stats["progress"] = 1.0 if total == 0 else min(1.0, processed / total)
+                    _update_pipeline_run(run_id, stats=stats)
+
+                db_manager.upsert_project_sync_cursor(project_id, "notion_page", page_id, last_ts)
+
+        with db_manager.get_session() as session:
+            last_slack_ts = None
+            if slack_channel_ids:
+                last_msg = (
+                    session.query(Message)
+                    .filter(Message.channel_id.in_(slack_channel_ids))
+                    .order_by(Message.timestamp.desc())
+                    .first()
+                )
+                if last_msg and last_msg.timestamp:
+                    last_slack_ts = datetime.fromtimestamp(last_msg.timestamp)
+
+            last_gmail_ts = None
+            if gmail_label_ids:
+                gmail_base = session.query(GmailMessage).filter(GmailMessage.account_email == account_email)
+                label_filters = [cast(GmailMessage.label_ids, JSONB).contains([lbl]) for lbl in gmail_label_ids]
+                if label_filters:
+                    gmail_base = gmail_base.filter(or_(*label_filters))
+                last_email = gmail_base.order_by(GmailMessage.date.desc()).first()
+                if last_email and last_email.date:
+                    last_gmail_ts = last_email.date
+
+            last_notion_ts = None
+            if notion_page_ids:
+                last_page = (
+                    session.query(NotionPage)
+                    .filter(NotionPage.page_id.in_(notion_page_ids))
+                    .order_by(NotionPage.last_edited_time.desc())
+                    .first()
+                )
+                if last_page and last_page.last_edited_time:
+                    last_notion_ts = last_page.last_edited_time
+
+        stats["stage"] = "completed"
+        stats["progress"] = 1.0
+        stats["last_synced"] = {
+            "slack": last_slack_ts.isoformat() if last_slack_ts else None,
+            "gmail": last_gmail_ts.isoformat() if last_gmail_ts else None,
+            "notion": last_notion_ts.isoformat() if last_notion_ts else None,
+        }
+        _update_pipeline_run(run_id, status="completed", finished_at=datetime.utcnow(), stats=stats)
+        try:
+            db_manager.update_project(project_id, owner_user_id=owner_user_id, last_project_sync_at=datetime.utcnow())
+        except Exception:
+            pass
+
+    except PipelineCancelled:
+        stats["stage"] = "cancelled"
+        _update_pipeline_run(run_id, status="cancelled", finished_at=datetime.utcnow(), stats=stats)
+    except KeyboardInterrupt:
+        stats["stage"] = "cancelled"
+        _update_pipeline_run(run_id, status="cancelled", finished_at=datetime.utcnow(), stats=stats)
+    except Exception as e:  # pragma: no cover
+        _update_pipeline_run(run_id, status="failed", finished_at=datetime.utcnow(), error=str(e), stats=stats)
+
+
+def _run_project_auto_summary(
+    run_id: str,
+    project_id: str,
+    owner_user_id: str,
+    account_email: str,
+    max_tokens: int = 256,
+) -> None:
+    _update_pipeline_run(run_id, status="running", started_at=datetime.utcnow())
+    stats: Dict[str, Any] = {"project_id": project_id, "stage": "starting", "progress": 0.0}
+    try:
+        project = db_manager.get_project(project_id, owner_user_id=owner_user_id)
+        if not project:
+            _update_pipeline_run(run_id, status="failed", finished_at=datetime.utcnow(), error="Project not found")
+            return
+
+        sources = db_manager.get_project_sources(project_id)
+        slack_channel_ids = [s.source_id for s in sources if s.source_type == "slack_channel"]
+        gmail_label_ids = [s.source_id for s in sources if s.source_type == "gmail_label"]
+        notion_page_ids = [s.source_id for s in sources if s.source_type == "notion_page"]
+
+        if _is_cancel_requested(run_id):
+            raise PipelineCancelled()
+
+        engine = asyncio.run(get_rag_engine())
+        stats["stage"] = "loading_context"
+        stats["progress"] = 0.1
+        _update_pipeline_run(run_id, stats=stats)
+
+        context_lines: List[str] = []
+        slack_limit = 80
+        gmail_limit = 40
+        notion_limit = 5
+
+        with db_manager.get_session() as session:
+            if slack_channel_ids:
+                slack_query = (
+                    session.query(Message, Channel, User)
+                    .join(Channel, Message.channel_id == Channel.channel_id)
+                    .outerjoin(User, Message.user_id == User.user_id)
+                    .filter(Message.channel_id.in_(slack_channel_ids))
+                    .order_by(Message.timestamp.desc())
+                    .limit(slack_limit)
+                )
+                for msg, ch, user in slack_query.all():
+                    if not msg.text:
+                        continue
+                    user_name = None
+                    if user is not None:
+                        user_name = user.real_name or user.display_name or user.username
+                    ts = datetime.fromtimestamp(msg.timestamp).isoformat() if msg.timestamp else ""
+                    text = (msg.text or "").replace("\n", " ").strip()
+                    context_lines.append(
+                        f"[SLACK] {ts} #{ch.name or ch.channel_id} {user_name or 'Someone'}: {text}"
+                    )
+
+            if gmail_label_ids:
+                gmail_query = session.query(GmailMessage).filter(GmailMessage.account_email == account_email)
+                label_filters = [cast(GmailMessage.label_ids, JSONB).contains([lbl]) for lbl in gmail_label_ids]
+                if label_filters:
+                    gmail_query = gmail_query.filter(or_(*label_filters))
+                gmail_query = gmail_query.order_by(GmailMessage.date.desc()).limit(gmail_limit)
+                for email in gmail_query.all():
+                    ts = (
+                        email.date.isoformat()
+                        if email.date
+                        else (email.created_at.isoformat() if email.created_at else "")
+                    )
+                    from_addr = email.from_address or "Unknown sender"
+                    subject = (email.subject or "No subject").replace("\n", " ").strip()
+                    snippet = email.snippet or (email.body_text[:200] if email.body_text else "")
+                    snippet = (snippet or "").replace("\n", " ").strip()
+                    context_lines.append(f"[GMAIL] {ts} from {from_addr} – {subject}: {snippet}")
+
+            notion_pages: List[NotionPage] = []
+            if notion_page_ids:
+                notion_pages = (
+                    session.query(NotionPage)
+                    .filter(NotionPage.page_id.in_(notion_page_ids))
+                    .order_by(NotionPage.last_edited_time.desc())
+                    .limit(notion_limit)
+                    .all()
+                )
+
+        if _is_cancel_requested(run_id):
+            raise PipelineCancelled()
+
+        stats["stage"] = "llm"
+        stats["progress"] = 0.6
+        _update_pipeline_run(run_id, stats=stats)
+
+        for page in notion_pages:
+            if _is_cancel_requested(run_id):
+                raise PipelineCancelled()
+            try:
+                page_text = engine._get_notion_page_text(page.page_id, max_blocks=40)
+            except Exception:
+                page_text = ""
+            if not page_text:
+                continue
+            snippet = page_text.replace("\n", " ").strip()[:400]
+            context_lines.append(f"[NOTION] {page.title or 'Untitled page'}: {snippet}")
+
+        max_chars = 8000
+        context_text = "\n".join(context_lines)
+        if len(context_text) > max_chars:
+            context_text = context_text[-max_chars:]
+
+        system_prompt = (
+            "You are helping maintain a single source of truth for a cross-tool project. "
+            "Based ONLY on the context from Slack, Gmail, and Notion shown below, produce compact JSON with keys "
+            "'short_description', 'summary', 'main_goal', 'current_status', and 'important_notes'."
+        )
+        user_prompt = (
+            f"Project name: {project.name}\n\n"
+            "Context from linked Slack, Gmail, and Notion sources (most recent items first):\n"
+            f"{context_text}"
+        )
+
+        response = engine.llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
+        raw_text = response.content.strip()
+
+        short_desc = None
+        summary = None
+        main_goal_text: Optional[str] = None
+        current_status_text: Optional[str] = None
+        important_notes_text: Optional[str] = None
+        try:
+            parsed = json.loads(raw_text)
+            if isinstance(parsed, dict):
+                short_desc = parsed.get("short_description")
+                summary = parsed.get("summary")
+                main_goal_text = parsed.get("main_goal")
+                current_status_text = parsed.get("current_status") or parsed.get("status")
+                important_notes_text = parsed.get("important_notes") or parsed.get("notes")
+        except Exception:
+            pass
+
+        def _to_str(value: Any) -> Optional[str]:
+            if value is None:
+                return None
+            if isinstance(value, str):
+                return value
+            if isinstance(value, (list, tuple)):
+                return "\n".join(str(v) for v in value)
+            return str(value)
+
+        short_desc = _to_str(short_desc)
+        summary = _to_str(summary)
+        main_goal_text = _to_str(main_goal_text)
+        current_status_text = _to_str(current_status_text)
+        important_notes_text = _to_str(important_notes_text)
+
+        if _is_cancel_requested(run_id):
+            raise PipelineCancelled()
+
+        stats.update(
+            {
+                "stage": "saving",
+                "progress": 0.9,
+                "short_description": short_desc,
+                "summary": summary,
+                "main_goal": main_goal_text,
+                "current_status": current_status_text,
+                "important_notes": important_notes_text,
+            }
+        )
+        _update_pipeline_run(run_id, stats=stats)
+
+        db_manager.update_project(
+            project_id,
+            owner_user_id=owner_user_id,
+            description=short_desc,
+            summary=summary,
+            main_goal=main_goal_text,
+            current_status_summary=current_status_text,
+            important_notes=important_notes_text,
+            last_summary_generated_at=datetime.utcnow(),
+        )
+
+        stats["stage"] = "completed"
+        stats["progress"] = 1.0
+        _update_pipeline_run(run_id, status="completed", finished_at=datetime.utcnow(), stats=stats)
+    except PipelineCancelled:
+        stats["stage"] = "cancelled"
+        _update_pipeline_run(run_id, status="cancelled", finished_at=datetime.utcnow(), stats=stats)
+    except Exception as e:  # pragma: no cover
+        _update_pipeline_run(run_id, status="failed", finished_at=datetime.utcnow(), error=str(e), stats=stats)
+
+
+@app.post("/api/projects/{project_id}/sync/run")
+async def run_project_sync(project_id: str, current_user: AppUser = Depends(get_current_user)):
+    project = db_manager.get_project(project_id, owner_user_id=current_user.id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    run_id = uuid.uuid4().hex
+    with db_manager.get_session() as session:
+        pipeline_run = PipelineRun(
+            run_id=run_id,
+            pipeline_type="project_sync",
+            status="pending",
+            config={
+                "project_id": project_id,
+                "owner_user_id": current_user.id,
+                "account_email": current_user.email,
+            },
+        )
+        session.add(pipeline_run)
+        session.commit()
+
+    thread = threading.Thread(
+        target=_run_project_sync,
+        args=(run_id, project_id, current_user.id, current_user.email),
+        daemon=True,
+    )
+    thread.start()
+    return {"run_id": run_id, "status": "started"}
+
+
+@app.get("/api/projects/sync/status/{run_id}")
+async def get_project_sync_status(run_id: str, current_user: AppUser = Depends(get_current_user)):
+    run = _get_pipeline_run(run_id)
+    if not run or run.get("pipeline_type") != "project_sync":
+        raise HTTPException(status_code=404, detail="Run not found")
+    if (run.get("config") or {}).get("owner_user_id") != current_user.id:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return run
+
+
+@app.post("/api/projects/sync/stop/{run_id}")
+async def stop_project_sync(run_id: str, current_user: AppUser = Depends(get_current_user)):
+    run = _get_pipeline_run(run_id)
+    if not run or run.get("pipeline_type") != "project_sync":
+        raise HTTPException(status_code=404, detail="Run not found")
+    if (run.get("config") or {}).get("owner_user_id") != current_user.id:
+        raise HTTPException(status_code=404, detail="Run not found")
+    _update_pipeline_run(run_id, cancel_requested=True)
+    return {"run_id": run_id, "status": "cancelling"}
+
+
+@app.post("/api/projects/{project_id}/auto-summary/run")
+async def run_project_auto_summary(
+    project_id: str,
+    payload: ProjectSummaryRequest,
+    current_user: AppUser = Depends(get_current_user),
+):
+    project = db_manager.get_project(project_id, owner_user_id=current_user.id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    run_id = uuid.uuid4().hex
+    with db_manager.get_session() as session:
+        pipeline_run = PipelineRun(
+            run_id=run_id,
+            pipeline_type="project_summary",
+            status="pending",
+            config={
+                "project_id": project_id,
+                "owner_user_id": current_user.id,
+                "account_email": current_user.email,
+                "max_tokens": payload.max_tokens or 256,
+            },
+        )
+        session.add(pipeline_run)
+        session.commit()
+
+    thread = threading.Thread(
+        target=_run_project_auto_summary,
+        args=(run_id, project_id, current_user.id, current_user.email, int(payload.max_tokens or 256)),
+        daemon=True,
+    )
+    thread.start()
+    return {"run_id": run_id, "status": "started"}
+
+
+@app.get("/api/projects/auto-summary/status/{run_id}")
+async def get_project_auto_summary_status(run_id: str, current_user: AppUser = Depends(get_current_user)):
+    run = _get_pipeline_run(run_id)
+    if not run or run.get("pipeline_type") != "project_summary":
+        raise HTTPException(status_code=404, detail="Run not found")
+    if (run.get("config") or {}).get("owner_user_id") != current_user.id:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return run
+
+
+@app.post("/api/projects/auto-summary/stop/{run_id}")
+async def stop_project_auto_summary(run_id: str, current_user: AppUser = Depends(get_current_user)):
+    run = _get_pipeline_run(run_id)
+    if not run or run.get("pipeline_type") != "project_summary":
+        raise HTTPException(status_code=404, detail="Run not found")
+    if (run.get("config") or {}).get("owner_user_id") != current_user.id:
+        raise HTTPException(status_code=404, detail="Run not found")
+    _update_pipeline_run(run_id, cancel_requested=True)
+    return {"run_id": run_id, "status": "cancelling"}
+
+
 @app.get("/api/projects/{project_id}/activity")
-async def get_project_activity(project_id: str, limit: int = 50):
+async def get_project_activity(
+    project_id: str,
+    limit: int = 50,
+    current_user: AppUser = Depends(get_current_user),
+):
     """Return recent Slack/Gmail/Notion activity for a project.
 
     This aggregates events from mapped Slack channels, Gmail labels, and
@@ -2067,7 +3076,7 @@ async def get_project_activity(project_id: str, limit: int = 50):
     """
 
     try:
-        project = db_manager.get_project(project_id)
+        project = db_manager.get_project(project_id, owner_user_id=current_user.id)
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
 
@@ -2117,7 +3126,9 @@ async def get_project_activity(project_id: str, limit: int = 50):
 
             # Gmail activity
             if gmail_label_ids:
-                gmail_query = session.query(GmailMessage)
+                gmail_query = session.query(GmailMessage).filter(
+                    GmailMessage.account_email == current_user.email
+                )
                 label_filters = [
                     cast(GmailMessage.label_ids, JSONB).contains([lbl]) for lbl in gmail_label_ids
                 ]
@@ -2199,14 +3210,38 @@ async def chat_project(
         raise HTTPException(status_code=400, detail="Query must not be empty")
 
     try:
-        project = db_manager.get_project(project_id)
+        project = db_manager.get_project(project_id, owner_user_id=current_user.id)
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
+
+        session_id = _project_chat_session_id(project_id, current_user.id)
+        try:
+            existing_session = db_manager.get_chat_session(session_id, owner_user_id=current_user.id)
+            if not existing_session:
+                db_manager.create_chat_session(
+                    session_id,
+                    title=f"Project: {project.name}",
+                    owner_user_id=current_user.id,
+                )
+        except Exception:
+            logger.warning("Failed ensuring project chat session exists", exc_info=True)
 
         sources = db_manager.get_project_sources(project_id)
         slack_channel_ids = [s.source_id for s in sources if s.source_type == "slack_channel"]
         gmail_label_ids = [s.source_id for s in sources if s.source_type == "gmail_label"]
         notion_page_ids = [s.source_id for s in sources if s.source_type == "notion_page"]
+
+        conversation_history: List[Dict[str, str]] = []
+        try:
+            history = await _run_in_executor(db_manager.get_chat_history, session_id, 100)
+            conversation_history = _truncate_history(history)
+        except Exception:
+            conversation_history = payload.conversation_history or []
+
+        try:
+            await _run_in_executor(db_manager.add_chat_message, session_id, "user", query)
+        except Exception:
+            logger.warning("Failed to save project chat user message", exc_info=True)
 
         # Use the hybrid RAG engine's project-scoped query instead of the generic
         # AI Brain tool-calling loop. This keeps project chat fast and strictly
@@ -2222,10 +3257,21 @@ async def chat_project(
             label_ids=gmail_label_ids,
             notion_page_ids=notion_page_ids,
             project_name=project.name,
-            conversation_history=payload.conversation_history or [],
+            conversation_history=conversation_history,
             force_search=True,
             gmail_account_email=current_user.email,
         )
+
+        try:
+            await _run_in_executor(
+                db_manager.add_chat_message,
+                session_id,
+                "assistant",
+                result.get("response", ""),
+                result.get("sources", []),
+            )
+        except Exception:
+            logger.warning("Failed to save project chat assistant message", exc_info=True)
 
         return ChatResponse(
             response=result.get("response", ""),
@@ -2240,23 +3286,71 @@ async def chat_project(
         raise HTTPException(status_code=500, detail="Project chat failed")
 
 
+@app.get("/api/projects/{project_id}/chat/history")
+async def get_project_chat_history(
+    project_id: str,
+    limit: int = 200,
+    current_user: AppUser = Depends(get_current_user),
+):
+    project = db_manager.get_project(project_id, owner_user_id=current_user.id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    session_id = _project_chat_session_id(project_id, current_user.id)
+    session = db_manager.get_chat_session(session_id, owner_user_id=current_user.id)
+    if not session:
+        return {"project_id": project_id, "session_id": session_id, "messages": []}
+
+    messages = db_manager.get_chat_history(session_id, limit=limit)
+    return {"project_id": project_id, "session_id": session_id, "messages": messages}
+
+
+@app.delete("/api/projects/{project_id}/chat/history")
+async def clear_project_chat_history(
+    project_id: str,
+    current_user: AppUser = Depends(get_current_user),
+):
+    project = db_manager.get_project(project_id, owner_user_id=current_user.id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    session_id = _project_chat_session_id(project_id, current_user.id)
+    db_manager.delete_chat_session(session_id, owner_user_id=current_user.id)
+    return {"status": "ok", "project_id": project_id}
+
+
 @app.get("/api/workflows")
 async def list_workflows():
     """List workflows for the Workflows tab."""
     try:
         workflows = db_manager.list_workflows(limit=100)
         result: List[Dict[str, Any]] = []
+        now = datetime.utcnow()
         for wf in workflows:
             channels = db_manager.get_workflow_channels(wf.id)
+            is_active = wf.status == "active"
+            next_run_at: Optional[str] = None
+            due_now = False
+
+            if wf.type == "slack_to_notion" and is_active:
+                interval = wf.poll_interval_seconds or 30
+                last_run = wf.last_run_at or (now - timedelta(seconds=interval * 2))
+                next_due = last_run + timedelta(seconds=interval)
+                next_run_at = next_due.isoformat()
+                due_now = now >= next_due
+
             result.append(
                 {
                     "id": wf.id,
                     "name": wf.name,
                     "type": wf.type,
                     "status": wf.status,
+                    "is_active": is_active,
                     "notion_master_page_id": wf.notion_master_page_id,
                     "poll_interval_seconds": wf.poll_interval_seconds,
                     "last_run_at": wf.last_run_at.isoformat() if wf.last_run_at else None,
+                    "next_run_at": next_run_at,
+                    "due_now": due_now,
                     "created_at": wf.created_at.isoformat() if wf.created_at else None,
                     "updated_at": wf.updated_at.isoformat() if wf.updated_at else None,
                     "channels": [
@@ -2288,11 +3382,11 @@ async def create_workflow(payload: WorkflowCreateRequest):
                 detail="Unsupported workflow type; only 'slack_to_notion' is supported",
             )
 
-        interval = payload.poll_interval_seconds or 30
+        interval = payload.poll_interval_seconds or 3600
         if interval not in WORKFLOW_ALLOWED_INTERVALS:
             raise HTTPException(
                 status_code=400,
-                detail="Invalid poll_interval_seconds; allowed values are 30, 60, 300, 600, 3600",
+                detail="Invalid poll_interval_seconds; allowed values are 3600, 10800, 28800, 86400",
             )
 
         status = payload.status or "active"
@@ -2305,7 +3399,7 @@ async def create_workflow(payload: WorkflowCreateRequest):
             poll_interval_seconds=interval,
         )
 
-        return {
+        response = {
             "id": workflow.id,
             "name": workflow.name,
             "type": workflow.type,
@@ -2317,6 +3411,9 @@ async def create_workflow(payload: WorkflowCreateRequest):
             "updated_at": workflow.updated_at.isoformat() if workflow.updated_at else None,
             "channels": [],
         }
+
+        _reconcile_workflow_worker_state()
+        return response
     except HTTPException:
         raise
     except Exception as e:  # pragma: no cover - defensive logging
@@ -2372,7 +3469,7 @@ async def update_workflow_endpoint(workflow_id: str, payload: WorkflowUpdateRequ
             if interval not in WORKFLOW_ALLOWED_INTERVALS:
                 raise HTTPException(
                     status_code=400,
-                    detail="Invalid poll_interval_seconds; allowed values are 30, 60, 300, 600, 3600",
+                    detail="Invalid poll_interval_seconds; allowed values are 3600, 10800, 28800, 86400",
                 )
 
         workflow = db_manager.update_workflow(workflow_id, **fields)
@@ -2380,7 +3477,7 @@ async def update_workflow_endpoint(workflow_id: str, payload: WorkflowUpdateRequ
             raise HTTPException(status_code=404, detail="Workflow not found")
 
         channels = db_manager.get_workflow_channels(workflow_id)
-        return {
+        response = {
             "id": workflow.id,
             "name": workflow.name,
             "type": workflow.type,
@@ -2402,6 +3499,9 @@ async def update_workflow_endpoint(workflow_id: str, payload: WorkflowUpdateRequ
                 for c in channels
             ],
         }
+
+        _reconcile_workflow_worker_state()
+        return response
     except HTTPException:
         raise
     except Exception as e:  # pragma: no cover - defensive logging
@@ -2414,6 +3514,7 @@ async def delete_workflow_endpoint(workflow_id: str):
     """Delete a workflow and its mappings."""
     try:
         db_manager.delete_workflow(workflow_id)
+        _reconcile_workflow_worker_state()
         return {"status": "ok"}
     except Exception as e:  # pragma: no cover - defensive logging
         logger.error(f"Error deleting workflow {workflow_id}: {e}", exc_info=True)
@@ -2503,6 +3604,417 @@ async def run_workflow_once(workflow_id: str):
     except Exception as e:  # pragma: no cover - defensive logging
         logger.error(f"Error running workflow {workflow_id} once: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to run workflow once")
+
+
+# ============================================================================
+# User Workflows v2 - Modular Source → AI Prompt → Output
+# ============================================================================
+
+
+class UserWorkflowCreateRequest(BaseModel):
+    """Request to create a new user workflow."""
+    name: str
+    description: Optional[str] = None
+    source_config: Optional[Dict[str, Any]] = None
+    prompt_config: Optional[Dict[str, Any]] = None
+    output_config: Optional[Dict[str, Any]] = None
+    schedule_type: str = "manual"
+    schedule_config: Optional[Dict[str, Any]] = None
+
+
+class UserWorkflowUpdateRequest(BaseModel):
+    """Request to update a user workflow."""
+    name: Optional[str] = None
+    description: Optional[str] = None
+    source_config: Optional[Dict[str, Any]] = None
+    prompt_config: Optional[Dict[str, Any]] = None
+    output_config: Optional[Dict[str, Any]] = None
+    schedule_type: Optional[str] = None
+    schedule_config: Optional[Dict[str, Any]] = None
+    status: Optional[str] = None
+
+
+def _serialize_user_workflow(wf) -> Dict[str, Any]:
+    """Serialize a UserWorkflow model to a dict."""
+    return {
+        "id": wf.id,
+        "name": wf.name,
+        "description": wf.description,
+        "source_config": wf.source_config or {},
+        "prompt_config": wf.prompt_config or {},
+        "output_config": wf.output_config or {},
+        "schedule_type": wf.schedule_type,
+        "schedule_config": wf.schedule_config or {},
+        "status": wf.status,
+        "last_run_at": wf.last_run_at.isoformat() if wf.last_run_at else None,
+        "next_run_at": wf.next_run_at.isoformat() if wf.next_run_at else None,
+        "created_at": wf.created_at.isoformat() if wf.created_at else None,
+        "updated_at": wf.updated_at.isoformat() if wf.updated_at else None,
+    }
+
+
+def _serialize_workflow_run(run) -> Dict[str, Any]:
+    """Serialize a WorkflowRun model to a dict."""
+    return {
+        "id": run.id,
+        "workflow_id": run.workflow_id,
+        "status": run.status,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        "source_items_count": run.source_items_count,
+        "source_data_preview": run.source_data_preview,
+        "ai_response": run.ai_response,
+        "output_result": run.output_result,
+        "error_message": run.error_message,
+        "current_step": run.current_step,
+        "progress_percent": run.progress_percent,
+        "logs": run.logs or [],
+        "created_at": run.created_at.isoformat() if run.created_at else None,
+    }
+
+
+@app.get("/api/v2/workflows")
+async def list_user_workflows(user: AppUser = Depends(get_current_user)):
+    """List all workflows for the workspace (shared)."""
+    try:
+        workflows = db_manager.list_user_workflows()
+        return {"workflows": [_serialize_user_workflow(wf) for wf in workflows]}
+    except Exception as e:
+        logger.error(f"Error listing user workflows: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to list workflows")
+
+
+@app.post("/api/v2/workflows")
+async def create_user_workflow(
+    req: UserWorkflowCreateRequest,
+    user: AppUser = Depends(get_current_user)
+):
+    """Create a new user workflow."""
+    try:
+        workflow = db_manager.create_user_workflow(
+            owner_user_id=user.id,
+            name=req.name,
+            description=req.description,
+            source_config=req.source_config,
+            prompt_config=req.prompt_config,
+            output_config=req.output_config,
+            schedule_type=req.schedule_type,
+            schedule_config=req.schedule_config,
+        )
+        return _serialize_user_workflow(workflow)
+    except Exception as e:
+        logger.error(f"Error creating user workflow: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to create workflow")
+
+
+@app.get("/api/v2/workflows/{workflow_id}")
+async def get_user_workflow(
+    workflow_id: str,
+    user: AppUser = Depends(get_current_user)
+):
+    """Get a specific workflow by ID."""
+    try:
+        workflow = db_manager.get_user_workflow(workflow_id)
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        return _serialize_user_workflow(workflow)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting user workflow {workflow_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to get workflow")
+
+
+@app.put("/api/v2/workflows/{workflow_id}")
+async def update_user_workflow(
+    workflow_id: str,
+    req: UserWorkflowUpdateRequest,
+    user: AppUser = Depends(get_current_user)
+):
+    """Update a workflow's configuration."""
+    try:
+        updates = {k: v for k, v in req.model_dump().items() if v is not None}
+        workflow = db_manager.update_user_workflow(workflow_id, None, **updates)
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        return _serialize_user_workflow(workflow)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating user workflow {workflow_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to update workflow")
+
+
+@app.delete("/api/v2/workflows/{workflow_id}")
+async def delete_user_workflow(
+    workflow_id: str,
+    user: AppUser = Depends(get_current_user)
+):
+    """Delete a workflow and all its runs."""
+    try:
+        deleted = db_manager.delete_user_workflow(workflow_id, None)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        return {"status": "ok"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting user workflow {workflow_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to delete workflow")
+
+
+@app.post("/api/v2/workflows/{workflow_id}/run")
+async def run_user_workflow(
+    workflow_id: str,
+    user: AppUser = Depends(get_current_user)
+):
+    """Trigger a manual run of a workflow."""
+    try:
+        workflow = db_manager.get_user_workflow(workflow_id)
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+
+        # Import and run the workflow engine
+        from workflows.workflow_engine import WorkflowExecutionEngine
+        engine = WorkflowExecutionEngine(db_manager, workflow.owner_user_id)
+
+        # Create a run record immediately so the UI can poll for status/logs.
+        run = db_manager.create_workflow_run(workflow_id)
+        run_id = run.id
+
+        # Run in background thread to avoid blocking the API.
+        loop = asyncio.get_running_loop()
+
+        def _runner():
+            return asyncio.run(engine.execute_workflow(workflow_id, run_id=run_id))
+
+        fut = loop.run_in_executor(None, _runner)
+
+        def _done_callback(f):
+            try:
+                _ = f.result()
+            except Exception as e:  # pragma: no cover
+                logger.error(f"Background workflow run failed (workflow_id={workflow_id}, run_id={run_id}): {e}", exc_info=True)
+
+        fut.add_done_callback(_done_callback)
+
+        return {"run_id": run_id, "status": "running"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error running user workflow {workflow_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to run workflow")
+
+
+class WorkflowRunResolveRequest(BaseModel):
+    selection: str
+
+
+@app.post("/api/v2/workflows/{workflow_id}/runs/{run_id}/resolve")
+async def resolve_workflow_run_conflict(
+    workflow_id: str,
+    run_id: str,
+    req: WorkflowRunResolveRequest,
+    user: AppUser = Depends(get_current_user),
+):
+    """Resolve a paused workflow run conflict and resume execution."""
+    try:
+        workflow = db_manager.get_user_workflow(workflow_id)
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+
+        run = db_manager.get_workflow_run(run_id)
+        if not run or run.workflow_id != workflow_id:
+            raise HTTPException(status_code=404, detail="Run not found")
+
+        if run.status != "awaiting_user_input":
+            raise HTTPException(status_code=400, detail="Run is not awaiting user input")
+
+        selection = (req.selection or "").strip()
+        if not selection:
+            raise HTTPException(status_code=400, detail="selection is required")
+
+        from workflows.workflow_engine import WorkflowExecutionEngine
+        engine = WorkflowExecutionEngine(db_manager, workflow.owner_user_id)
+
+        loop = asyncio.get_running_loop()
+
+        def _runner():
+            return asyncio.run(engine.resume_workflow_run(workflow_id, run_id, selection))
+
+        fut = loop.run_in_executor(None, _runner)
+
+        def _done_callback(f):
+            try:
+                _ = f.result()
+            except Exception as e:  # pragma: no cover
+                logger.error(f"Background workflow resume failed (workflow_id={workflow_id}, run_id={run_id}): {e}", exc_info=True)
+
+        fut.add_done_callback(_done_callback)
+
+        return {"run_id": run_id, "status": "running"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error resolving workflow run conflict {run_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to resolve workflow run conflict")
+
+
+@app.get("/api/v2/workflows/{workflow_id}/runs")
+async def list_workflow_runs(
+    workflow_id: str,
+    limit: int = 20,
+    user: AppUser = Depends(get_current_user)
+):
+    """List runs for a workflow."""
+    try:
+        workflow = db_manager.get_user_workflow(workflow_id)
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+
+        runs = db_manager.list_workflow_runs(workflow_id, limit)
+        return {"runs": [_serialize_workflow_run(r) for r in runs]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error listing runs for workflow {workflow_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to list workflow runs")
+
+
+@app.get("/api/v2/workflows/{workflow_id}/runs/{run_id}")
+async def get_workflow_run(
+    workflow_id: str,
+    run_id: str,
+    user: AppUser = Depends(get_current_user)
+):
+    """Get details of a specific workflow run."""
+    try:
+        workflow = db_manager.get_user_workflow(workflow_id)
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+
+        run = db_manager.get_workflow_run(run_id)
+        if not run or run.workflow_id != workflow_id:
+            raise HTTPException(status_code=404, detail="Run not found")
+
+        return _serialize_workflow_run(run)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting run {run_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to get workflow run")
+
+
+@app.post("/api/v2/workflows/{workflow_id}/runs/{run_id}/cancel")
+async def cancel_workflow_run(
+    workflow_id: str,
+    run_id: str,
+    user: AppUser = Depends(get_current_user)
+):
+    """Cancel a running workflow."""
+    try:
+        workflow = db_manager.get_user_workflow(workflow_id)
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+
+        run = db_manager.get_workflow_run(run_id)
+        if not run or run.workflow_id != workflow_id:
+            raise HTTPException(status_code=404, detail="Run not found")
+
+        if run.status != "running":
+            raise HTTPException(status_code=400, detail="Run is not currently running")
+
+        # Mark the run as cancelled
+        db_manager.update_workflow_run(
+            run_id,
+            status="cancelled",
+            completed_at=datetime.utcnow(),
+            current_step="cancelled",
+            error_message="Cancelled by user"
+        )
+        db_manager.add_workflow_run_log(run_id, "info", "Workflow cancelled by user")
+
+        return {"success": True, "message": "Workflow cancelled"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error cancelling run {run_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to cancel workflow run")
+
+
+# ============================================================================
+# Workflow Source Helpers (for UI dropdowns)
+# ============================================================================
+
+
+@app.get("/api/v2/workflows/sources/slack/channels")
+async def get_workflow_slack_channels(user: AppUser = Depends(get_current_user)):
+    """Get available Slack channels for workflow source configuration."""
+    try:
+        channels = db_manager.get_all_channels(include_archived=False)
+        return {
+            "channels": [
+                {
+                    "id": ch.channel_id,
+                    "name": ch.name,
+                    "is_private": ch.is_private,
+                    "num_members": ch.num_members,
+                }
+                for ch in channels
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Error getting Slack channels for workflow: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to get Slack channels")
+
+
+@app.get("/api/v2/workflows/sources/gmail/labels")
+async def get_workflow_gmail_labels(user: AppUser = Depends(get_current_user)):
+    """Get available Gmail labels for workflow source configuration."""
+    try:
+        with db_manager.get_session() as session:
+            from database.models import GmailLabel
+            labels = session.query(GmailLabel).all()
+            return {
+                "labels": [
+                    {
+                        "id": label.label_id,
+                        "name": label.name,
+                        "type": label.type,
+                    }
+                    for label in labels
+                ]
+            }
+    except Exception as e:
+        logger.error(f"Error getting Gmail labels for workflow: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to get Gmail labels")
+
+
+@app.get("/api/v2/workflows/sources/notion/pages")
+async def get_workflow_notion_pages(user: AppUser = Depends(get_current_user)):
+    """Get available Notion pages for workflow source configuration."""
+    try:
+        with db_manager.get_session() as session:
+            pages = (
+                session.query(NotionPage)
+                .order_by(NotionPage.last_edited_time.desc())
+                .limit(100)
+                .all()
+            )
+            return {
+                "pages": [
+                    {
+                        "id": page.page_id,
+                        "title": page.title or "Untitled",
+                        "object_type": page.object_type,
+                        "url": page.url,
+                    }
+                    for page in pages
+                ]
+            }
+    except Exception as e:
+        logger.error(f"Error getting Notion pages for workflow: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to get Notion pages")
 
 
 # File upload configuration
@@ -2649,10 +4161,40 @@ class SlackPipelineRun(BaseModel):
     error: Optional[str] = None
 
 
-# In-memory registry of Slack pipeline runs. This is sufficient for v1 where
-# runs are manually triggered and short-lived. If needed, we can persist this
-# to the database later.
-slack_pipeline_runs: Dict[str, Dict[str, Any]] = {}
+# Helper functions for database-backed pipeline runs (works with multiple workers)
+def _update_pipeline_run(run_id: str, **updates):
+    """Update a pipeline run in the database."""
+    with db_manager.get_session() as session:
+        run = session.query(PipelineRun).filter(PipelineRun.run_id == run_id).first()
+        if run:
+            for key, value in updates.items():
+                setattr(run, key, value)
+            session.commit()
+
+
+def _get_pipeline_run(run_id: str) -> Optional[Dict[str, Any]]:
+    """Get a pipeline run from the database."""
+    with db_manager.get_session() as session:
+        run = session.query(PipelineRun).filter(PipelineRun.run_id == run_id).first()
+        if not run:
+            return None
+        return {
+            "run_id": run.run_id,
+            "pipeline_type": run.pipeline_type,
+            "status": run.status,
+            "created_at": run.created_at.isoformat() if run.created_at else None,
+            "started_at": run.started_at.isoformat() if run.started_at else None,
+            "finished_at": run.finished_at.isoformat() if run.finished_at else None,
+            "stats": run.stats or {},
+            "error": run.error,
+            "config": run.config or {},
+            "cancel_requested": run.cancel_requested,
+        }
+
+
+def _is_cancel_requested(run_id: str) -> bool:
+    run = _get_pipeline_run(run_id)
+    return bool(run and run.get("cancel_requested"))
 
 
 def _run_slack_pipeline(run_id: str, include_archived: bool = False, download_files: bool = False) -> None:
@@ -2660,7 +4202,7 @@ def _run_slack_pipeline(run_id: str, include_archived: bool = False, download_fi
 
     Uses the existing ExtractionCoordinator to perform a full workspace
     extraction (workspace, users, channels, messages, files) and updates the
-    in-memory run registry with progress and statistics.
+    database with progress and statistics.
     """
 
     logger.info(
@@ -2670,14 +4212,7 @@ def _run_slack_pipeline(run_id: str, include_archived: bool = False, download_fi
         download_files,
     )
 
-    run_info = slack_pipeline_runs.get(run_id)
-    if not run_info:
-        # Should not happen, but guard against it.
-        slack_pipeline_runs[run_id] = {"run_id": run_id}
-        run_info = slack_pipeline_runs[run_id]
-
-    run_info["status"] = "running"
-    run_info["started_at"] = datetime.utcnow().isoformat()
+    _update_pipeline_run(run_id, status="running", started_at=datetime.utcnow())
 
     coordinator = ExtractionCoordinator(db_manager=db_manager)
 
@@ -2688,12 +4223,7 @@ def _run_slack_pipeline(run_id: str, include_archived: bool = False, download_fi
         )
 
         stats = results.get("statistics", {}) or {}
-
-        # If a cancel request came in while the extraction was running,
-        # we still record stats but mark the run as cancelled instead of
-        # completed so the UI reflects the user's intent.
-        run_info["finished_at"] = datetime.utcnow().isoformat()
-        run_info["stats"] = {
+        run_stats = {
             "users": stats.get("users", 0),
             "channels": stats.get("channels", 0),
             "messages": stats.get("messages", 0),
@@ -2701,31 +4231,35 @@ def _run_slack_pipeline(run_id: str, include_archived: bool = False, download_fi
             "reactions": stats.get("reactions", 0),
         }
 
-        if run_info.get("cancel_requested"):
-            run_info["status"] = "cancelled"
+        # Check if cancel was requested
+        run_info = _get_pipeline_run(run_id)
+        if run_info and run_info.get("cancel_requested"):
+            _update_pipeline_run(run_id, status="cancelled", finished_at=datetime.utcnow(), stats=run_stats)
             logger.info("Slack pipeline run %s marked as cancelled", run_id)
         else:
-            run_info["status"] = "completed"
-            logger.info("Slack pipeline run %s completed: %s", run_id, run_info["stats"])
-            
-            # Automatically sync embeddings after successful extraction
-            try:
-                logger.info("Auto-syncing Slack embeddings...")
-                embed_stats = sync_embeddings_after_pipeline(
-                    data_source="slack",
-                    db_manager=db_manager
-                )
-                run_info["embedding_stats"] = embed_stats
-                logger.info("✓ Slack embeddings synced: %s", embed_stats)
-            except Exception as embed_error:
-                logger.error(f"Embedding sync failed (non-fatal): {embed_error}")
-                run_info["embedding_error"] = str(embed_error)
+            _update_pipeline_run(run_id, status="completed", finished_at=datetime.utcnow(), stats=run_stats)
+            logger.info("Slack pipeline run %s completed: %s", run_id, run_stats)
+
+            if Config.AUTO_SYNC_EMBEDDINGS_AFTER_PIPELINE:
+                # Automatically sync embeddings after successful extraction
+                try:
+                    logger.info("Auto-syncing Slack embeddings...")
+                    embed_stats = sync_embeddings_after_pipeline(
+                        data_source="slack",
+                        db_manager=db_manager
+                    )
+                    # Update stats with embedding info
+                    run_stats["embedding_stats"] = embed_stats
+                    _update_pipeline_run(run_id, stats=run_stats)
+                    logger.info("✓ Slack embeddings synced: %s", embed_stats)
+                except Exception as embed_error:
+                    logger.error(f"Embedding sync failed (non-fatal): {embed_error}")
+                    run_stats["embedding_error"] = str(embed_error)
+                    _update_pipeline_run(run_id, stats=run_stats)
 
     except Exception as e:  # pragma: no cover - defensive logging
         logger.error(f"Slack pipeline run {run_id} failed: {e}", exc_info=True)
-        run_info["status"] = "failed"
-        run_info["finished_at"] = datetime.utcnow().isoformat()
-        run_info["error"] = str(e)
+        _update_pipeline_run(run_id, status="failed", finished_at=datetime.utcnow(), error=str(e))
 
 
 @app.post("/api/pipelines/slack/run")
@@ -2745,13 +4279,17 @@ async def run_slack_pipeline(
     """
 
     run_id = uuid.uuid4().hex
-    slack_pipeline_runs[run_id] = {
-        "run_id": run_id,
-        "status": "pending",
-        "created_at": datetime.utcnow().isoformat(),
-        "include_archived": include_archived,
-        "download_files": download_files,
-    }
+    
+    # Create pipeline run in database (works with multiple workers)
+    with db_manager.get_session() as session:
+        pipeline_run = PipelineRun(
+            run_id=run_id,
+            pipeline_type="slack",
+            status="pending",
+            config={"include_archived": include_archived, "download_files": download_files},
+        )
+        session.add(pipeline_run)
+        session.commit()
 
     thread = threading.Thread(
         target=_run_slack_pipeline,
@@ -2763,6 +4301,263 @@ async def run_slack_pipeline(
     return {"run_id": run_id, "status": "started"}
 
 
+def _run_slack_channel_pipeline(
+    run_id: str,
+    channel_id: str,
+    include_threads: bool = False,
+    lookback_hours: Optional[int] = 24,
+) -> None:
+    """Background worker to refresh a single Slack channel incrementally."""
+    logger.info(
+        "Starting Slack channel pipeline run %s (channel=%s, include_threads=%s, lookback_hours=%s)",
+        run_id,
+        channel_id,
+        include_threads,
+        lookback_hours,
+    )
+
+    _update_pipeline_run(run_id, status="running", started_at=datetime.utcnow())
+
+    # Determine incremental window from SyncStatus
+    sync_status = db_manager.get_sync_status(channel_id)
+    oldest = None
+    if sync_status and sync_status.last_synced_ts:
+        oldest = sync_status.last_synced_ts
+        if lookback_hours and lookback_hours > 0:
+            # Revisit a small window to capture edits/reactions
+            revisit = datetime.utcnow().timestamp() - (lookback_hours * 3600)
+            oldest = min(oldest, revisit) if oldest else revisit
+    elif lookback_hours and lookback_hours > 0:
+        oldest = datetime.utcnow().timestamp() - (lookback_hours * 3600)
+
+    extractor = MessageExtractor(db_manager=db_manager)
+
+    # Stats container
+    stats: Dict[str, Any] = {"channel_id": channel_id, "progress": 0.0}
+
+    def progress_cb(payload: Dict[str, float]):
+        # payload keys: stage, progress, total_messages, processed_messages
+        stats.update(payload)
+        if _is_cancel_requested(run_id):
+            raise PipelineCancelled()
+        _update_pipeline_run(run_id, stats=stats)
+
+    try:
+        count = extractor.extract_channel_history(
+            channel_id=channel_id,
+            oldest=oldest,
+            include_threads=include_threads,
+            progress_callback=progress_cb,
+        )
+
+        stats.update(
+            {
+                "messages": count,
+                "progress": 1.0,
+                "completed_at": datetime.utcnow().isoformat(),
+            }
+        )
+        _update_pipeline_run(
+            run_id,
+            status="completed",
+            finished_at=datetime.utcnow(),
+            stats=stats,
+        )
+        logger.info(
+            "Slack channel pipeline run %s completed: channel=%s, messages=%s",
+            run_id,
+            channel_id,
+            count,
+        )
+    except PipelineCancelled:
+        logger.info("Slack channel pipeline run %s cancelled", run_id)
+        _update_pipeline_run(
+            run_id,
+            status="cancelled",
+            finished_at=datetime.utcnow(),
+            stats=stats,
+        )
+    except KeyboardInterrupt:
+        logger.info("Slack channel pipeline run %s cancelled (interrupt)", run_id)
+        _update_pipeline_run(
+            run_id,
+            status="cancelled",
+            finished_at=datetime.utcnow(),
+            stats=stats,
+        )
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(f"Slack channel pipeline run {run_id} failed: {e}", exc_info=True)
+        _update_pipeline_run(
+            run_id,
+            status="failed",
+            finished_at=datetime.utcnow(),
+            error=str(e),
+            stats=stats,
+        )
+
+
+def _run_slack_channels_refresh(
+    run_id: str,
+    include_archived: bool = False,
+) -> None:
+    """Background worker to refresh Slack channel list only."""
+    logger.info("Starting Slack channel list refresh run %s", run_id)
+    _update_pipeline_run(run_id, status="running", started_at=datetime.utcnow())
+
+    extractor = ChannelExtractor(db_manager=db_manager)
+    stats: Dict[str, Any] = {"progress": 0.0}
+
+    def progress_cb(payload: Dict[str, Any]):
+        stats.update(payload)
+        if _is_cancel_requested(run_id):
+            raise PipelineCancelled()
+        _update_pipeline_run(run_id, stats=stats)
+
+    try:
+        count = extractor.extract_all_channels(
+            exclude_archived=not include_archived,
+            progress_callback=progress_cb,
+            cancel_check=lambda: _is_cancel_requested(run_id),
+        )
+        stats.update({"channels": count, "progress": 1.0, "completed_at": datetime.utcnow().isoformat()})
+        _update_pipeline_run(run_id, status="completed", finished_at=datetime.utcnow(), stats=stats)
+        logger.info("Slack channel list refresh run %s completed, channels=%s", run_id, count)
+    except PipelineCancelled:
+        logger.info("Slack channel list refresh run %s cancelled", run_id)
+        _update_pipeline_run(
+            run_id,
+            status="cancelled",
+            finished_at=datetime.utcnow(),
+            stats=stats,
+        )
+    except KeyboardInterrupt:
+        logger.info("Slack channel list refresh run %s cancelled (interrupt)", run_id)
+        _update_pipeline_run(
+            run_id,
+            status="cancelled",
+            finished_at=datetime.utcnow(),
+            stats=stats,
+        )
+    except Exception as e:  # pragma: no cover
+        logger.error(f"Slack channel list refresh run {run_id} failed: {e}", exc_info=True)
+        _update_pipeline_run(
+            run_id,
+            status="failed",
+            finished_at=datetime.utcnow(),
+            error=str(e),
+            stats=stats,
+        )
+
+
+@app.post("/api/pipelines/slack/channel/run")
+async def run_slack_channel_pipeline(
+    channel_id: str,
+    include_threads: bool = False,
+    lookback_hours: Optional[int] = 24,
+    current_user: AppUser = Depends(get_current_user),
+):
+    """Trigger an incremental Slack pipeline run for a single channel."""
+    if not channel_id:
+        raise HTTPException(status_code=400, detail="channel_id is required")
+
+    run_id = uuid.uuid4().hex
+
+    with db_manager.get_session() as session:
+        pipeline_run = PipelineRun(
+            run_id=run_id,
+            pipeline_type="slack_channel",
+            status="pending",
+            config={
+                "channel_id": channel_id,
+                "include_threads": include_threads,
+                "lookback_hours": lookback_hours,
+            },
+        )
+        session.add(pipeline_run)
+        session.commit()
+
+    thread = threading.Thread(
+        target=_run_slack_channel_pipeline,
+        args=(run_id, channel_id, include_threads, lookback_hours),
+        daemon=True,
+    )
+    thread.start()
+
+    return {"run_id": run_id, "status": "started"}
+
+
+@app.get("/api/pipelines/slack/channel/status/{run_id}")
+async def get_slack_channel_pipeline_status(
+    run_id: str,
+    current_user: AppUser = Depends(get_current_user),
+):
+    """Get the status of a single-channel Slack pipeline run."""
+    run = _get_pipeline_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return run
+
+
+@app.post("/api/pipelines/slack/channel/stop/{run_id}")
+async def stop_slack_channel_pipeline(
+    run_id: str,
+    current_user: AppUser = Depends(get_current_user),
+):
+    """Request cancellation of a single-channel Slack pipeline run."""
+    run = _get_pipeline_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run["pipeline_type"] != "slack_channel":
+        raise HTTPException(status_code=400, detail="Run is not a slack_channel pipeline")
+
+    _update_pipeline_run(run_id, cancel_requested=True)
+    return {"run_id": run_id, "status": "cancelling"}
+
+
+@app.post("/api/pipelines/slack/channels/refresh")
+async def refresh_slack_channel_list(
+    include_archived: bool = False,
+    current_user: AppUser = Depends(get_current_user),
+):
+    """Refresh Slack channel list only (no messages/files) with background progress."""
+    run_id = uuid.uuid4().hex
+
+    with db_manager.get_session() as session:
+        pipeline_run = PipelineRun(
+            run_id=run_id,
+            pipeline_type="slack_channels",
+            status="pending",
+            config={"include_archived": include_archived},
+        )
+        session.add(pipeline_run)
+        session.commit()
+
+    thread = threading.Thread(
+        target=_run_slack_channels_refresh,
+        args=(run_id, include_archived),
+        daemon=True,
+    )
+    thread.start()
+
+    return {"run_id": run_id, "status": "started"}
+
+
+@app.post("/api/pipelines/slack/channels/stop/{run_id}")
+async def stop_slack_channel_list(
+    run_id: str,
+    current_user: AppUser = Depends(get_current_user),
+):
+    """Request cancellation of Slack channel list refresh."""
+    run = _get_pipeline_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run["pipeline_type"] != "slack_channels":
+        raise HTTPException(status_code=400, detail="Run is not a slack_channels pipeline")
+
+    _update_pipeline_run(run_id, cancel_requested=True)
+    return {"run_id": run_id, "status": "cancelling"}
+
+
 @app.get("/api/pipelines/slack/status/{run_id}")
 async def get_slack_pipeline_status(
     run_id: str,
@@ -2770,7 +4565,7 @@ async def get_slack_pipeline_status(
 ):
     """Get the status of a Slack pipeline run."""
 
-    run = slack_pipeline_runs.get(run_id)
+    run = _get_pipeline_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
     return run
@@ -2788,15 +4583,17 @@ async def stop_slack_pipeline(
     user's intent.
     """
 
-    run = slack_pipeline_runs.get(run_id)
+    run = _get_pipeline_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    run["cancel_requested"] = True
-    if run.get("status") in ("pending", "running"):
-        run["status"] = "cancelling"
-    run["finished_at"] = datetime.utcnow().isoformat()
-    return run
+    _update_pipeline_run(
+        run_id,
+        cancel_requested=True,
+        status="cancelling" if run.get("status") in ("pending", "running") else run.get("status"),
+        finished_at=datetime.utcnow(),
+    )
+    return _get_pipeline_run(run_id)
 
 
 @app.get("/api/pipelines/slack/data")
@@ -2811,22 +4608,22 @@ async def get_slack_pipeline_data(
     """
 
     try:
+        # Use batch query to avoid N+1 problem (was 1 query per channel!)
         channels = db_manager.get_all_channels(include_archived=True)
         stats = db_manager.get_statistics()
+        message_counts = db_manager.get_messages_count_by_channel()
 
-        channel_data = []
-        for ch in channels:
-            message_count = db_manager.get_messages_count(channel_id=ch.channel_id)
-            channel_data.append(
-                {
-                    "channel_id": ch.channel_id,
-                    "name": ch.name,
-                    "is_private": ch.is_private,
-                    "is_archived": ch.is_archived,
-                    "num_members": ch.num_members,
-                    "message_count": message_count,
-                }
-            )
+        channel_data = [
+            {
+                "channel_id": ch.channel_id,
+                "name": ch.name,
+                "is_private": ch.is_private,
+                "is_archived": ch.is_archived,
+                "num_members": ch.num_members,
+                "message_count": message_counts.get(ch.channel_id, 0),
+            }
+            for ch in channels
+        ]
 
         return {
             "stats": stats,
@@ -2835,6 +4632,41 @@ async def get_slack_pipeline_data(
 
     except Exception as e:  # pragma: no cover - defensive logging
         logger.error(f"Error fetching Slack pipeline data: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/pipelines/slack/channels/options")
+async def get_slack_channel_options(current_user: AppUser = Depends(get_current_user)):
+    """Return Slack channel options for selection UIs (Projects tab).
+
+    This endpoint is intentionally lightweight vs /api/pipelines/slack/data:
+    it does NOT compute global stats or per-channel message counts.
+    """
+
+    global _slack_channel_options_cache
+
+    try:
+        now = time.time()
+        cached_at, cached = _slack_channel_options_cache
+        if cached and (now - cached_at) < _OPTIONS_CACHE_TTL_SECONDS:
+            return cached
+
+        channels = db_manager.get_all_channels(include_archived=True)
+        payload = {
+            "channels": [
+                {
+                    "channel_id": ch.channel_id,
+                    "name": ch.name,
+                    "is_private": ch.is_private,
+                    "is_archived": ch.is_archived,
+                }
+                for ch in channels
+            ]
+        }
+        _slack_channel_options_cache = (now, payload)
+        return payload
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(f"Error fetching Slack channel options: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -2998,6 +4830,8 @@ def _persist_gmail_message_from_full(
     date_val: Optional[datetime],
     body_text: str,
     body_html: str,
+    session: Optional[Session] = None,
+    commit: bool = True,
 ) -> None:
     """Upsert a GmailMessage row from a full Gmail API message."""
 
@@ -3027,58 +4861,69 @@ def _persist_gmail_message_from_full(
 
         thread_id = full_msg.get("threadId")
 
-        with db_manager.get_session() as session:
-            # Ensure the GmailThread row exists so the foreign key on
-            # GmailMessage.thread_id does not fail the insert.
-            thread = None
-            if thread_id:
-                thread = session.query(GmailThread).filter_by(thread_id=thread_id).first()
-                if not thread:
-                    thread = GmailThread(
-                        thread_id=thread_id,
-                        account_email=account_email,
-                        snippet=full_msg.get("snippet", ""),
-                        history_id=full_msg.get("historyId"),
-                    )
-                    session.add(thread)
+        owns_session = session is None
+        if owns_session:
+            session = db_manager.get_session()
 
-            msg = session.query(GmailMessage).filter_by(message_id=msg_id).first()
-            if not msg:
-                msg = GmailMessage(
-                    message_id=msg_id,
-                    account_email=account_email,
+        assert session is not None
+
+        # Ensure the GmailThread row exists so the foreign key on
+        # GmailMessage.thread_id does not fail the insert.
+        thread = None
+        if thread_id:
+            thread = session.get(GmailThread, thread_id)
+            if not thread:
+                thread = GmailThread(
                     thread_id=thread_id,
+                    account_email=account_email,
+                    snippet=full_msg.get("snippet", ""),
+                    history_id=full_msg.get("historyId"),
                 )
-                session.add(msg)
+                session.add(thread)
 
-            msg.thread_id = thread_id
-            msg.history_id = full_msg.get("historyId")
-            msg.from_address = from_raw
-            msg.to_addresses = to_raw
-            msg.cc_addresses = cc_raw
-            msg.bcc_addresses = bcc_raw
-            msg.subject = headers.get("subject", "")
-            msg.date = date_val
-            msg.body_text = body_text
-            msg.body_html = body_html
-            msg.snippet = full_msg.get("snippet", "")
-            msg.label_ids = label_ids
-            msg.is_unread = is_unread
-            msg.is_starred = is_starred
-            msg.is_important = is_important
-            msg.is_draft = is_draft
-            msg.is_sent = is_sent
-            msg.raw_data = full_msg
-            msg.updated_at = datetime.utcnow()
+        msg = session.get(GmailMessage, msg_id)
+        is_new_message = msg is None
+        if not msg:
+            msg = GmailMessage(
+                message_id=msg_id,
+                account_email=account_email,
+                thread_id=thread_id,
+            )
+            session.add(msg)
 
-            # Keep basic thread metadata in sync
-            if thread is not None:
-                thread.snippet = thread.snippet or full_msg.get("snippet", "")
-                thread.history_id = full_msg.get("historyId") or thread.history_id
-                thread.message_count = session.query(GmailMessage).filter_by(thread_id=thread_id).count()
-                thread.updated_at = datetime.utcnow()
+        msg.thread_id = thread_id
+        msg.history_id = full_msg.get("historyId")
+        msg.from_address = from_raw
+        msg.to_addresses = to_raw
+        msg.cc_addresses = cc_raw
+        msg.bcc_addresses = bcc_raw
+        msg.subject = headers.get("subject", "")
+        msg.date = date_val
+        msg.body_text = body_text
+        msg.body_html = body_html
+        msg.snippet = full_msg.get("snippet", "")
+        msg.label_ids = label_ids
+        msg.is_unread = is_unread
+        msg.is_starred = is_starred
+        msg.is_important = is_important
+        msg.is_draft = is_draft
+        msg.is_sent = is_sent
+        msg.raw_data = full_msg
+        msg.updated_at = datetime.utcnow()
 
+        # Keep basic thread metadata in sync (avoid per-message COUNT(*) queries)
+        if thread is not None:
+            thread.snippet = thread.snippet or full_msg.get("snippet", "")
+            thread.history_id = full_msg.get("historyId") or thread.history_id
+            if is_new_message:
+                thread.message_count = int(thread.message_count or 0) + 1
+            thread.updated_at = datetime.utcnow()
+
+        if commit:
             session.commit()
+
+        if owns_session:
+            session.close()
 
     except Exception as e:  # pragma: no cover - defensive logging
         logger.error(f"Failed to persist Gmail message {full_msg.get('id')}: {e}", exc_info=True)
@@ -3094,27 +4939,30 @@ def _run_gmail_pipeline(run_id: str, label_id: str, user_id: str) -> None:
 
     logger.info("Starting Gmail pipeline run %s for label %s (user_id=%s)", run_id, label_id, user_id)
 
-    run_info = gmail_pipeline_runs.get(run_id) or {}
-    gmail_pipeline_runs[run_id] = run_info
-    run_info.setdefault("cancel_requested", False)
-    run_info["status"] = "running"
-    run_info["started_at"] = datetime.utcnow().isoformat()
-    run_info["label_id"] = label_id
-    run_info["user_id"] = user_id
+    run_stats: Dict[str, Any] = {"label_id": label_id}
+    _update_pipeline_run(run_id, status="running", started_at=datetime.utcnow(), stats=run_stats)
 
     creds = _build_google_credentials_for_user_id(user_id)
     if not creds:
-        run_info["status"] = "failed"
-        run_info["finished_at"] = datetime.utcnow().isoformat()
-        run_info["error"] = "Gmail not authorized for user"
+        _update_pipeline_run(
+            run_id,
+            status="failed",
+            finished_at=datetime.utcnow(),
+            error="Gmail not authorized for user",
+            stats=run_stats,
+        )
         logger.error("No valid Gmail credentials for user %s in pipeline run %s", user_id, run_id)
         return
 
     client = GmailClient()
     if not client.init_with_credentials(creds):
-        run_info["status"] = "failed"
-        run_info["finished_at"] = datetime.utcnow().isoformat()
-        run_info["error"] = "Gmail authentication failed"
+        _update_pipeline_run(
+            run_id,
+            status="failed",
+            finished_at=datetime.utcnow(),
+            error="Gmail authentication failed",
+            stats=run_stats,
+        )
         logger.error("Gmail authentication failed for pipeline run %s", run_id)
         return
 
@@ -3157,105 +5005,40 @@ def _run_gmail_pipeline(run_id: str, label_id: str, user_id: str) -> None:
     stop = False
 
     try:
-        while not stop and processed_new < max_new_messages:
-            # Cooperative cancellation support
-            if run_info.get("cancel_requested"):
-                run_info["status"] = "cancelled"
-                run_info["finished_at"] = datetime.utcnow().isoformat()
-                run_info["message_count"] = len(messages)
-                gmail_run_messages[run_id] = messages
-                logger.info("Gmail pipeline run %s cancelled", run_id)
-                return
+        commit_batch_size = max(1, int(getattr(Config, "BATCH_SIZE", 100)))
+        pending_commits = 0
 
-            batch_size = min(100, max_new_messages - processed_new)
-            result = client.list_messages(
-                max_results=batch_size,
-                page_token=page_token,
-                label_ids=[label_id],
-            )
+        with db_manager.get_session() as session:
+            while not stop and processed_new < max_new_messages:
+                # Cooperative cancellation support
+                if _is_cancel_requested(run_id):
+                    session.commit()
+                    run_stats["message_count"] = len(messages)
+                    _update_pipeline_run(
+                        run_id,
+                        status="cancelled",
+                        finished_at=datetime.utcnow(),
+                        stats=run_stats,
+                    )
+                    logger.info("Gmail pipeline run %s cancelled", run_id)
+                    return
 
-            msg_list = result.get("messages", []) or []
-            if not msg_list:
-                break
-
-            for msg_info in msg_list:
-                if processed_new >= max_new_messages:
-                    stop = True
-                    break
-
-                msg_id = msg_info.get("id")
-                if not msg_id:
-                    continue
-
-                full_msg = client.get_message(msg_id, format="full")
-                if not full_msg:
-                    continue
-
-                internal_date_ms_str = full_msg.get("internalDate")
-                try:
-                    internal_date_ms = int(internal_date_ms_str) if internal_date_ms_str else 0
-                except Exception:
-                    internal_date_ms = 0
-
-                if last_ts_ms and internal_date_ms <= last_ts_ms:
-                    stop = True
-                    break
-
-                headers_list = full_msg.get("payload", {}).get("headers", []) or []
-                headers = {h.get("name", "").lower(): h.get("value", "") for h in headers_list}
-
-                from_raw = headers.get("from", "")
-                to_raw = headers.get("to")
-                cc_raw = headers.get("cc")
-                bcc_raw = headers.get("bcc")
-                subject = headers.get("subject", "")
-                date_str = headers.get("date")
-                try:
-                    date_val = parsedate_to_datetime(date_str) if date_str else None
-                except Exception:
-                    date_val = None
-
-                body_text, body_html = _extract_gmail_body(full_msg.get("payload", {}) or {})
-
-                # Persist into the GmailMessage table so Gmail data is durable
-                # across runs and available to the chat/RAG tools.
-                _persist_gmail_message_from_full(full_msg, client, date_val, body_text, body_html)
-
-                message_obj = {
-                    "id": msg_id,
-                    "thread_id": full_msg.get("threadId"),
-                    "from": from_raw,
-                    "to": to_raw,
-                    "cc": cc_raw,
-                    "bcc": bcc_raw,
-                    "subject": subject,
-                    "date": date_val.isoformat() if date_val else None,
-                    "snippet": full_msg.get("snippet", ""),
-                    "body_text": body_text,
-                    "body_html": body_html,
-                }
-                messages.append(message_obj)
-                processed_new += 1
-
-                if internal_date_ms > newest_ts_ms:
-                    newest_ts_ms = internal_date_ms
-
-            page_token = result.get("nextPageToken")
-            if not page_token:
-                break
-
-        # If no new messages were found for this label (common after the
-        # first incremental run), still return the latest messages so the
-        # UI always shows something useful.
-        if not messages:
-            try:
-                fallback_result = client.list_messages(
-                    max_results=50,
+                batch_size = min(100, max_new_messages - processed_new)
+                result = client.list_messages(
+                    max_results=batch_size,
+                    page_token=page_token,
                     label_ids=[label_id],
                 )
-                fallback_list = fallback_result.get("messages", []) or []
 
-                for msg_info in fallback_list:
+                msg_list = result.get("messages", []) or []
+                if not msg_list:
+                    break
+
+                for msg_info in msg_list:
+                    if processed_new >= max_new_messages:
+                        stop = True
+                        break
+
                     msg_id = msg_info.get("id")
                     if not msg_id:
                         continue
@@ -3269,6 +5052,10 @@ def _run_gmail_pipeline(run_id: str, label_id: str, user_id: str) -> None:
                         internal_date_ms = int(internal_date_ms_str) if internal_date_ms_str else 0
                     except Exception:
                         internal_date_ms = 0
+
+                    if last_ts_ms and internal_date_ms <= last_ts_ms:
+                        stop = True
+                        break
 
                     headers_list = full_msg.get("payload", {}).get("headers", []) or []
                     headers = {h.get("name", "").lower(): h.get("value", "") for h in headers_list}
@@ -3286,9 +5073,20 @@ def _run_gmail_pipeline(run_id: str, label_id: str, user_id: str) -> None:
 
                     body_text, body_html = _extract_gmail_body(full_msg.get("payload", {}) or {})
 
-                    # Persist fallback messages to the database as well so the
-                    # label's history is complete.
-                    _persist_gmail_message_from_full(full_msg, client, date_val, body_text, body_html)
+                    # Persist into the GmailMessage table so Gmail data is durable
+                    # across runs and available to the chat/RAG tools.
+                    _persist_gmail_message_from_full(
+                        full_msg,
+                        client,
+                        date_val,
+                        body_text,
+                        body_html,
+                        session=session,
+                        commit=False,
+                    )
+                    pending_commits += 1
+                    if pending_commits % commit_batch_size == 0:
+                        session.commit()
 
                     message_obj = {
                         "id": msg_id,
@@ -3304,17 +5102,103 @@ def _run_gmail_pipeline(run_id: str, label_id: str, user_id: str) -> None:
                         "body_html": body_html,
                     }
                     messages.append(message_obj)
+                    processed_new += 1
 
                     if internal_date_ms > newest_ts_ms:
                         newest_ts_ms = internal_date_ms
 
-            except Exception as e:  # pragma: no cover - defensive logging
-                logger.error(f"Fallback Gmail fetch failed for run {run_id}: {e}", exc_info=True)
+                page_token = result.get("nextPageToken")
+                if not page_token:
+                    break
+
+            # If no new messages were found for this label (common after the
+            # first incremental run), still return the latest messages so the
+            # UI always shows something useful.
+            if not messages:
+                try:
+                    fallback_result = client.list_messages(
+                        max_results=50,
+                        label_ids=[label_id],
+                    )
+                    fallback_list = fallback_result.get("messages", []) or []
+
+                    for msg_info in fallback_list:
+                        msg_id = msg_info.get("id")
+                        if not msg_id:
+                            continue
+
+                        full_msg = client.get_message(msg_id, format="full")
+                        if not full_msg:
+                            continue
+
+                        internal_date_ms_str = full_msg.get("internalDate")
+                        try:
+                            internal_date_ms = int(internal_date_ms_str) if internal_date_ms_str else 0
+                        except Exception:
+                            internal_date_ms = 0
+
+                        headers_list = full_msg.get("payload", {}).get("headers", []) or []
+                        headers = {h.get("name", "").lower(): h.get("value", "") for h in headers_list}
+
+                        from_raw = headers.get("from", "")
+                        to_raw = headers.get("to")
+                        cc_raw = headers.get("cc")
+                        bcc_raw = headers.get("bcc")
+                        subject = headers.get("subject", "")
+                        date_str = headers.get("date")
+                        try:
+                            date_val = parsedate_to_datetime(date_str) if date_str else None
+                        except Exception:
+                            date_val = None
+
+                        body_text, body_html = _extract_gmail_body(full_msg.get("payload", {}) or {})
+
+                        # Persist fallback messages to the database as well so the
+                        # label's history is complete.
+                        _persist_gmail_message_from_full(
+                            full_msg,
+                            client,
+                            date_val,
+                            body_text,
+                            body_html,
+                            session=session,
+                            commit=False,
+                        )
+                        pending_commits += 1
+                        if pending_commits % commit_batch_size == 0:
+                            session.commit()
+
+                        message_obj = {
+                            "id": msg_id,
+                            "thread_id": full_msg.get("threadId"),
+                            "from": from_raw,
+                            "to": to_raw,
+                            "cc": cc_raw,
+                            "bcc": bcc_raw,
+                            "subject": subject,
+                            "date": date_val.isoformat() if date_val else None,
+                            "snippet": full_msg.get("snippet", ""),
+                            "body_text": body_text,
+                            "body_html": body_html,
+                        }
+                        messages.append(message_obj)
+
+                        if internal_date_ms > newest_ts_ms:
+                            newest_ts_ms = internal_date_ms
+
+                except Exception as e:  # pragma: no cover - defensive logging
+                    logger.error(f"Fallback Gmail fetch failed for run {run_id}: {e}", exc_info=True)
+
+            session.commit()
 
         gmail_run_messages[run_id] = messages
-        run_info["status"] = "completed"
-        run_info["finished_at"] = datetime.utcnow().isoformat()
-        run_info["message_count"] = len(messages)
+        run_stats["message_count"] = len(messages)
+        _update_pipeline_run(
+            run_id,
+            status="completed",
+            finished_at=datetime.utcnow(),
+            stats=run_stats,
+        )
 
         if newest_ts_ms > last_ts_ms:
             if account_email:
@@ -3333,50 +5217,69 @@ def _run_gmail_pipeline(run_id: str, label_id: str, user_id: str) -> None:
             label_id,
             len(messages),
         )
-        
-        # Automatically sync embeddings after successful ingestion
-        try:
-            logger.info("Auto-syncing Gmail embeddings for label %s...", label_id)
-            embed_stats = sync_embeddings_after_pipeline(
-                data_source="gmail",
-                source_ids=[label_id],
-                db_manager=db_manager
-            )
-            run_info["embedding_stats"] = embed_stats
-            logger.info("✓ Gmail embeddings synced: %s", embed_stats)
-        except Exception as embed_error:
-            logger.error(f"Embedding sync failed (non-fatal): {embed_error}")
-            run_info["embedding_error"] = str(embed_error)
+
+        if Config.AUTO_SYNC_EMBEDDINGS_AFTER_PIPELINE:
+            # Automatically sync embeddings after successful ingestion
+            try:
+                logger.info("Auto-syncing Gmail embeddings for label %s...", label_id)
+                embed_stats = sync_embeddings_after_pipeline(
+                    data_source="gmail",
+                    source_ids=[label_id],
+                    db_manager=db_manager
+                )
+                run_stats["embedding_stats"] = embed_stats
+                _update_pipeline_run(run_id, stats=run_stats)
+                logger.info("✓ Gmail embeddings synced: %s", embed_stats)
+            except Exception as embed_error:
+                logger.error(f"Embedding sync failed (non-fatal): {embed_error}")
+                run_stats["embedding_error"] = str(embed_error)
+                _update_pipeline_run(run_id, stats=run_stats)
 
     except Exception as e:  # pragma: no cover - defensive logging
         logger.error(f"Gmail pipeline run {run_id} failed: {e}", exc_info=True)
-        run_info["status"] = "failed"
-        run_info["finished_at"] = datetime.utcnow().isoformat()
-        run_info["error"] = str(e)
+        run_stats["error"] = str(e)
+        _update_pipeline_run(
+            run_id,
+            status="failed",
+            finished_at=datetime.utcnow(),
+            error=str(e),
+            stats=run_stats,
+        )
 
 
 @app.get("/api/pipelines/gmail/labels")
 async def list_gmail_labels(current_user: AppUser = Depends(get_current_user)):
     """List available Gmail labels using the Gmail API."""
+    now = time.time()
+    cached = _gmail_labels_cache.get(current_user.id)
+    if cached and (now - cached[0]) < _OPTIONS_CACHE_TTL_SECONDS:
+        return cached[1]
+
     creds = _build_google_credentials_for_user_id(current_user.id)
     if not creds:
         # Return empty label list if Gmail is not connected for this user.
         logger.warning("Gmail not connected for user %s; returning empty label list", current_user.id)
-        return {"labels": []}
+        payload = {"labels": []}
+        _gmail_labels_cache[current_user.id] = (now, payload)
+        return payload
 
     client = GmailClient()
     if not client.init_with_credentials(creds):
         logger.error("Gmail init_with_credentials failed when listing labels for user %s", current_user.id)
-        return {"labels": []}
+        payload = {"labels": []}
+        _gmail_labels_cache[current_user.id] = (now, payload)
+        return payload
 
     labels = client.list_labels() or []
-    return {
+    payload = {
         "labels": [
             {"id": lbl.get("id"), "name": lbl.get("name"), "type": lbl.get("type")}
             for lbl in labels
             if lbl.get("id") and lbl.get("name")
         ]
     }
+    _gmail_labels_cache[current_user.id] = (now, payload)
+    return payload
 
 
 @app.post("/api/pipelines/gmail/run")
@@ -3396,14 +5299,16 @@ async def run_gmail_pipeline(label_id: str, current_user: AppUser = Depends(get_
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Gmail not authorized")
 
     run_id = uuid.uuid4().hex
-    gmail_pipeline_runs[run_id] = {
-        "run_id": run_id,
-        "label_id": label_id,
-        "user_id": current_user.id,
-        "status": "pending",
-        "created_at": datetime.utcnow().isoformat(),
-        "cancel_requested": False,
-    }
+
+    with db_manager.get_session() as session:
+        pipeline_run = PipelineRun(
+            run_id=run_id,
+            pipeline_type="gmail",
+            status="pending",
+            config={"label_id": label_id, "user_id": current_user.id},
+        )
+        session.add(pipeline_run)
+        session.commit()
 
     thread = threading.Thread(target=_run_gmail_pipeline, args=(run_id, label_id, current_user.id), daemon=True)
     thread.start()
@@ -3415,10 +5320,15 @@ async def run_gmail_pipeline(label_id: str, current_user: AppUser = Depends(get_
 async def get_gmail_pipeline_status(run_id: str, current_user: AppUser = Depends(get_current_user)):
     """Get the status of a Gmail pipeline run."""
 
-    run = gmail_pipeline_runs.get(run_id)
-    if not run or run.get("user_id") != current_user.id:
+    run = _get_pipeline_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    cfg = run.get("config") or {}
+    if cfg.get("user_id") != current_user.id:
         # Hide existence of other users' runs
         raise HTTPException(status_code=404, detail="Run not found")
+
     return run
 
 
@@ -3426,26 +5336,36 @@ async def get_gmail_pipeline_status(run_id: str, current_user: AppUser = Depends
 async def stop_gmail_pipeline(run_id: str, current_user: AppUser = Depends(get_current_user)):
     """Request cancellation of a Gmail pipeline run."""
 
-    run = gmail_pipeline_runs.get(run_id)
-    if not run or run.get("user_id") != current_user.id:
+    run = _get_pipeline_run(run_id)
+    if not run:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    run["cancel_requested"] = True
+    cfg = run.get("config") or {}
+    if cfg.get("user_id") != current_user.id:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    updates: Dict[str, Any] = {"cancel_requested": True}
     if run.get("status") in ("pending", "running"):
-        run["status"] = "cancelling"
-    run["finished_at"] = datetime.utcnow().isoformat()
-    return run
+        updates["status"] = "cancelling"
+    _update_pipeline_run(run_id, **updates)
+
+    refreshed = _get_pipeline_run(run_id)
+    return refreshed or {"run_id": run_id, "status": "cancelling"}
 
 
 @app.get("/api/pipelines/gmail/messages")
 async def get_gmail_pipeline_messages(run_id: str, current_user: AppUser = Depends(get_current_user)):
     """Return messages for a specific Gmail pipeline run."""
 
-    run = gmail_pipeline_runs.get(run_id)
+    run = _get_pipeline_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    label_id = run.get("label_id")
+    cfg = run.get("config") or {}
+    if cfg.get("user_id") != current_user.id:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    label_id = cfg.get("label_id")
 
     # Always prefer DB-backed messages when available, but fall back to the
     # in-memory run results so the user sees emails immediately after a run
@@ -3551,7 +5471,7 @@ async def get_gmail_messages_by_label(label_id: str, limit: int = 200, current_u
 # ============================================================================
 
 
-notion_pipeline_runs: Dict[str, Dict[str, Any]] = {}
+# notion_run_pages still in-memory for large page data (not critical for status)
 notion_run_pages: Dict[str, List[Dict[str, Any]]] = {}
 
 
@@ -3647,9 +5567,18 @@ def _summarize_notion_properties(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
     return items
 
 
-def _summarize_notion_blocks(blocks: List[Dict[str, Any]]) -> Tuple[List[str], List[Dict[str, Any]]]:
+def _summarize_notion_blocks(
+    blocks: List[Dict[str, Any]],
+    include_databases: bool = True,
+) -> Tuple[List[str], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Summarize Notion blocks into text lines, attachments, and database references.
+    
+    Returns:
+        Tuple of (text_lines, attachments, child_databases)
+    """
     lines: List[str] = []
     attachments: List[Dict[str, Any]] = []
+    child_databases: List[Dict[str, Any]] = []
 
     for block in blocks:
         if not isinstance(block, dict):
@@ -3659,6 +5588,18 @@ def _summarize_notion_blocks(blocks: List[Dict[str, Any]]) -> Tuple[List[str], L
             continue
 
         value = block.get(block_type) or {}
+
+        # Handle child_database blocks
+        if block_type == "child_database" and include_databases:
+            db_id = block.get("id")
+            db_title = value.get("title", "Database")
+            if db_id:
+                child_databases.append({
+                    "id": db_id,
+                    "title": db_title,
+                    "type": "child_database",
+                })
+            continue
 
         if block_type in (
             "paragraph",
@@ -3711,7 +5652,202 @@ def _summarize_notion_blocks(blocks: List[Dict[str, Any]]) -> Tuple[List[str], L
                 }
             )
 
-    return lines, attachments
+        # Handle embed and bookmark blocks
+        if block_type in ("embed", "bookmark", "link_preview"):
+            url = value.get("url", "")
+            caption_texts = []
+            for rt in value.get("caption") or []:
+                if isinstance(rt, dict):
+                    txt = rt.get("plain_text") or rt.get("text", {}).get("content")
+                    if txt:
+                        caption_texts.append(txt)
+            name = "".join(caption_texts) if caption_texts else url
+            if url:
+                attachments.append({
+                    "id": block.get("id"),
+                    "type": block_type,
+                    "name": name,
+                    "url": url,
+                })
+
+        # Handle code blocks
+        if block_type == "code":
+            language = value.get("language", "")
+            rich_text = value.get("rich_text") or []
+            code_parts = []
+            for rt in rich_text:
+                if isinstance(rt, dict):
+                    txt = rt.get("plain_text", "")
+                    if txt:
+                        code_parts.append(txt)
+            code_text = "".join(code_parts)
+            if code_text:
+                lines.append(f"```{language}")
+                lines.append(code_text)
+                lines.append("```")
+
+        # Handle table_row blocks
+        if block_type == "table_row":
+            cells = value.get("cells", [])
+            cell_texts = []
+            for cell in cells:
+                cell_parts = []
+                for rt in cell:
+                    if isinstance(rt, dict):
+                        txt = rt.get("plain_text", "")
+                        if txt:
+                            cell_parts.append(txt)
+                cell_texts.append("".join(cell_parts))
+            if cell_texts:
+                lines.append("| " + " | ".join(cell_texts) + " |")
+
+        # Handle divider blocks
+        if block_type == "divider":
+            lines.append("---")
+
+    return lines, attachments, child_databases
+
+
+def _flatten_notion_block_tree(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    flat: List[Dict[str, Any]] = []
+    stack: List[Dict[str, Any]] = []
+    for b in blocks or []:
+        if isinstance(b, dict):
+            stack.append(b)
+    while stack:
+        block = stack.pop()
+        if not isinstance(block, dict):
+            continue
+        flat.append(block)
+        children = block.get("_children")
+        if isinstance(children, list) and children:
+            for child in children:
+                if isinstance(child, dict):
+                    stack.append(child)
+    return flat
+
+
+def _query_notion_database_for_api(database_id: str, db_title: Optional[str] = None) -> Dict[str, Any]:
+    """Query a Notion database and return its entries formatted for the API.
+    
+    If the database returns 0 entries (possibly a linked view), will search
+    for the original database by title.
+    """
+    from core.notion_export.client import NotionClient
+    
+    token = Config.NOTION_TOKEN
+    if not token:
+        return {"entries": [], "error": "NOTION_TOKEN not configured"}
+    
+    try:
+        client = NotionClient(token)
+        
+        # Get database metadata
+        db_meta = client.get_database(database_id)
+        actual_db_id = database_id
+        
+        if db_meta:
+            # Get database title
+            title_parts = db_meta.get("title", [])
+            db_title = "".join(t.get("plain_text", "") for t in title_parts) or db_title
+        
+        # Get schema
+        schema = db_meta.get("properties", {}) if db_meta else {}
+        
+        # Get title column
+        title_col = None
+        for col_name, col_schema in schema.items():
+            if col_schema.get("type") == "title":
+                title_col = col_name
+                break
+        
+        # Query entries (up to 500)
+        entries = client.query_database(database_id, max_results=500)
+        
+        # If no entries, this might be a LINKED database view
+        # Try to find the original database by title
+        if not entries and db_title:
+            logger.info(f"No entries for {database_id}, searching for original database '{db_title}'")
+            original_db = client.find_database_by_title(db_title)
+            if original_db:
+                original_id = original_db.get("id")
+                if original_id and original_id != database_id:
+                    logger.info(f"Found original database: {original_id}")
+                    actual_db_id = original_id
+                    db_meta = original_db
+                    schema = db_meta.get("properties", {})
+                    # Update title_col
+                    title_col = None
+                    for col_name, col_schema in schema.items():
+                        if col_schema.get("type") == "title":
+                            title_col = col_name
+                            break
+                    entries = client.query_database(actual_db_id, max_results=500)
+        
+        if not db_meta:
+            return {"entries": [], "error": "Could not access database"}
+        
+        # Order columns: title first, then other important columns, then rest
+        ordered_columns = []
+        other_columns = []
+        for col_name, col_schema in schema.items():
+            if col_schema.get("type") == "title":
+                ordered_columns.insert(0, col_name)  # Title first
+            elif col_name.lower() in ["name", "status", "priority", "date", "due date", "assignee"]:
+                ordered_columns.append(col_name)  # Important columns early
+            else:
+                other_columns.append(col_name)
+        ordered_columns.extend(sorted(other_columns))
+        
+        formatted_entries = []
+        for entry in entries:
+            formatted = client.format_database_entry(entry)
+            props = formatted["properties"]
+            
+            entry_data = {
+                "id": formatted["id"],
+                "title": props.get(title_col, "Untitled") if title_col else "Untitled",
+                "properties": props,
+            }
+            formatted_entries.append(entry_data)
+        
+        return {
+            "requested_database_id": database_id,
+            "database_id": actual_db_id,
+            "title": "".join(t.get("plain_text", "") for t in db_meta.get("title", [])) if db_meta else db_title,
+            "columns": ordered_columns,
+            "entries": formatted_entries,
+            "total": len(formatted_entries),
+            "properties": schema,
+        }
+    except Exception as e:
+        logger.error(f"Error querying database {database_id}: {e}")
+        return {"requested_database_id": database_id, "entries": [], "error": str(e)}
+
+
+def _build_database_schema_cache(
+    *,
+    properties: Dict[str, Any],
+    db_data: Dict[str, Any],
+) -> Dict[str, Any]:
+    schema_data: Dict[str, Any] = {"properties": properties or {}}
+    if isinstance(db_data, dict):
+        if db_data.get("database_id"):
+            schema_data["cached_database_id"] = db_data.get("database_id")
+        if db_data.get("requested_database_id"):
+            schema_data["cached_requested_database_id"] = db_data.get("requested_database_id")
+        if db_data.get("title") is not None:
+            schema_data["cached_title"] = db_data.get("title")
+        if db_data.get("columns") is not None:
+            schema_data["cached_columns"] = db_data.get("columns")
+        if db_data.get("entries") is not None:
+            schema_data["cached_entries"] = db_data.get("entries")
+        if db_data.get("total") is not None:
+            schema_data["cached_total"] = db_data.get("total")
+        if db_data.get("error") is not None:
+            schema_data["cached_error"] = db_data.get("error")
+    schema_data["cached_at"] = datetime.utcnow().isoformat()
+    return schema_data
 
 
 def _persist_notion_pages(
@@ -3778,6 +5914,18 @@ def _persist_notion_pages(
                 db_page.url = p.get("url")
                 db_page.parent_id = p.get("parent_id")
 
+                # Persist icon and cover metadata
+                if p.get("icon") is not None:
+                    db_page.icon = p.get("icon")
+                if p.get("cover") is not None:
+                    db_page.cover = p.get("cover")
+
+                # Persist deep-fetched blocks and schema
+                if p.get("blocks_data") is not None:
+                    db_page.blocks_data = p.get("blocks_data")
+                if p.get("schema_data") is not None:
+                    db_page.schema_data = p.get("schema_data")
+
                 last_edited_str = p.get("last_edited_time")
                 if last_edited_str:
                     try:
@@ -3806,20 +5954,136 @@ def _persist_notion_pages(
         logger.error(f"Failed to persist Notion pages: {e}", exc_info=True)
 
 
-def _run_notion_pipeline(run_id: str) -> None:
-    """Background worker to fetch Notion pages under NOTION_PARENT_PAGE_ID."""
+def _fetch_notion_blocks(page_id: str, headers: Dict[str, str], max_depth: int = 3) -> List[Dict[str, Any]]:
+    """Recursively fetch all blocks for a Notion page with rate limiting."""
+    import time
+    all_blocks: List[Dict[str, Any]] = []
+    
+    def fetch_children(block_id: str, depth: int) -> List[Dict[str, Any]]:
+        if depth > max_depth:
+            return []
+        blocks: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
+        
+        while True:
+            time.sleep(Config.NOTION_API_RATE_LIMIT_DELAY)
+            params: Dict[str, Any] = {"page_size": 100}
+            if cursor:
+                params["start_cursor"] = cursor
+            
+            try:
+                resp = requests.get(
+                    f"https://api.notion.com/v1/blocks/{block_id}/children",
+                    headers=headers,
+                    params=params,
+                    timeout=30,
+                )
+                if resp.status_code != 200:
+                    break
+                data = resp.json()
+                results = data.get("results", []) or []
+                
+                for block in results:
+                    block_copy = dict(block)
+                    blocks.append(block_copy)
+                    # Recursively fetch children for blocks that have them
+                    if block.get("has_children"):
+                        child_blocks = fetch_children(block.get("id"), depth + 1)
+                        block_copy["_children"] = child_blocks
+                
+                if not data.get("has_more"):
+                    break
+                cursor = data.get("next_cursor")
+            except Exception as e:
+                logger.warning(f"Error fetching blocks for {block_id}: {e}")
+                break
+        
+        return blocks
+    
+    return fetch_children(page_id, 0)
 
-    run_info = notion_pipeline_runs.get(run_id) or {}
-    notion_pipeline_runs[run_id] = run_info
-    run_info.setdefault("cancel_requested", False)
-    run_info["status"] = "running"
-    run_info["started_at"] = datetime.utcnow().isoformat()
+
+def _fetch_notion_database_schema(database_id: str, headers: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    """Fetch database schema/properties."""
+    import time
+    time.sleep(Config.NOTION_API_RATE_LIMIT_DELAY)
+    try:
+        resp = requests.get(
+            f"https://api.notion.com/v1/databases/{database_id}",
+            headers=headers,
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            db_data = resp.json() or {}
+            data_sources = db_data.get("data_sources") or []
+            ds_id = None
+            if isinstance(data_sources, list) and data_sources:
+                first = data_sources[0]
+                if isinstance(first, dict):
+                    ds_id = first.get("id")
+
+            if ds_id:
+                ds_resp = requests.get(
+                    f"https://api.notion.com/v1/data_sources/{ds_id}",
+                    headers=headers,
+                    timeout=30,
+                )
+                if ds_resp.status_code == 200:
+                    ds_data = ds_resp.json() or {}
+                    return {
+                        "properties": ds_data.get("properties", {}),
+                        "title": db_data.get("title", []),
+                        "description": db_data.get("description", []),
+                        "is_inline": db_data.get("is_inline", False),
+                        "data_source_id": ds_id,
+                    }
+
+            return {
+                "properties": db_data.get("properties", {}),
+                "title": db_data.get("title", []),
+                "description": db_data.get("description", []),
+                "is_inline": db_data.get("is_inline", False),
+            }
+
+        # Also support passing a data_source_id directly (common in 2025+).
+        ds_resp = requests.get(
+            f"https://api.notion.com/v1/data_sources/{database_id}",
+            headers=headers,
+            timeout=30,
+        )
+        if ds_resp.status_code == 200:
+            ds_data = ds_resp.json() or {}
+            parent = ds_data.get("parent") or {}
+            return {
+                "properties": ds_data.get("properties", {}),
+                "title": ds_data.get("title", []),
+                "description": ds_data.get("description", []),
+                "data_source_id": ds_data.get("id") or database_id,
+                "database_id": parent.get("database_id"),
+            }
+    except Exception as e:
+        logger.warning(f"Error fetching database schema for {database_id}: {e}")
+    return None
+
+
+def _run_notion_pipeline(
+    run_id: str,
+    deep_fetch_override: Optional[bool] = None,
+    fetch_blocks_override: Optional[bool] = None,
+) -> None:
+    """Background worker to fetch Notion pages under NOTION_PARENT_PAGE_ID."""
+    import time
+
+    _update_pipeline_run(run_id, status="running", started_at=datetime.utcnow())
 
     token = Config.NOTION_TOKEN
     if not token:
-        run_info["status"] = "failed"
-        run_info["finished_at"] = datetime.utcnow().isoformat()
-        run_info["error"] = "NOTION_TOKEN is not configured. Please set it in your environment."
+        _update_pipeline_run(
+            run_id,
+            status="failed",
+            finished_at=datetime.utcnow(),
+            error="NOTION_TOKEN is not configured. Please set it in your environment.",
+        )
         logger.error("Notion pipeline run %s failed: NOTION_TOKEN is not configured", run_id)
         return
 
@@ -3827,12 +6091,22 @@ def _run_notion_pipeline(run_id: str) -> None:
     workspace_name = Config.WORKSPACE_NAME or "Notion Workspace"
 
     pages: List[Dict[str, Any]] = []
-    max_pages = 500
+    max_pages = Config.NOTION_PIPELINE_MAX_PAGES
+    deep_fetch = (
+        deep_fetch_override
+        if deep_fetch_override is not None
+        else Config.NOTION_PIPELINE_DEEP_FETCH
+    )
+    fetch_blocks = (
+        fetch_blocks_override
+        if fetch_blocks_override is not None
+        else Config.NOTION_PIPELINE_FETCH_BLOCKS
+    )
 
     try:
         headers = {
             "Authorization": f"Bearer {token}",
-            "Notion-Version": "2022-06-28",
+            "Notion-Version": Config.NOTION_VERSION,
             "Content-Type": "application/json",
         }
 
@@ -3847,10 +6121,14 @@ def _run_notion_pipeline(run_id: str) -> None:
         while True:
             # Cooperative cancellation check so long-running searches can be
             # stopped from the UI.
-            if notion_pipeline_runs.get(run_id, {}).get("cancel_requested"):
-                run_info["status"] = "cancelled"
-                run_info["finished_at"] = datetime.utcnow().isoformat()
-                run_info["page_count"] = len(pages)
+            run_info = _get_pipeline_run(run_id)
+            if run_info and run_info.get("cancel_requested"):
+                _update_pipeline_run(
+                    run_id,
+                    status="cancelled",
+                    finished_at=datetime.utcnow(),
+                    stats={"page_count": len(pages)},
+                )
                 notion_run_pages[run_id] = pages
                 _persist_notion_pages(workspace_id, workspace_name, pages, full_refresh=False)
                 logger.info("Notion pipeline run %s cancelled", run_id)
@@ -3876,9 +6154,12 @@ def _run_notion_pipeline(run_id: str) -> None:
                     response.status_code,
                     response.text[:200],
                 )
-                run_info["status"] = "failed"
-                run_info["finished_at"] = datetime.utcnow().isoformat()
-                run_info["error"] = f"Notion API error {response.status_code}"
+                _update_pipeline_run(
+                    run_id,
+                    status="failed",
+                    finished_at=datetime.utcnow(),
+                    error=f"Notion API error {response.status_code}",
+                )
                 return
 
             data = response.json()
@@ -3886,7 +6167,7 @@ def _run_notion_pipeline(run_id: str) -> None:
 
             for page in results:
                 obj_type = page.get("object")
-                if obj_type not in ("page", "database"):
+                if obj_type not in ("page", "database", "data_source"):
                     continue
 
                 parent_obj = page.get("parent", {}) or {}
@@ -3896,18 +6177,38 @@ def _run_notion_pipeline(run_id: str) -> None:
                     parent_id = parent_obj.get("page_id")
                 elif parent_type == "database_id":
                     parent_id = parent_obj.get("database_id")
+                elif parent_type == "data_source_id":
+                    parent_id = parent_obj.get("database_id") or parent_obj.get("data_source_id")
 
-                pages.append(
-                    {
-                        "id": page.get("id"),
-                        "title": _extract_notion_title(page),
-                        "url": page.get("url"),
-                        "last_edited_time": page.get("last_edited_time"),
-                        "object_type": obj_type,
-                        "parent_id": parent_id,
-                        "raw": page,
-                    }
-                )
+                normalized_obj_type = "database" if obj_type == "data_source" else obj_type
+                page_data: Dict[str, Any] = {
+                    "id": page.get("id"),
+                    "title": _extract_notion_title(page),
+                    "url": page.get("url"),
+                    "last_edited_time": page.get("last_edited_time"),
+                    "object_type": normalized_obj_type,
+                    "parent_id": parent_id,
+                    "icon": page.get("icon"),
+                    "cover": page.get("cover"),
+                    "raw": page,
+                }
+
+                # Deep fetch blocks and schema if enabled
+                if deep_fetch:
+                    page_id = page.get("id")
+                    if obj_type in ("database", "data_source"):
+                        # Fetch database schema (properties live on data source in 2025 API)
+                        schema = _fetch_notion_database_schema(page_id, headers)
+                        if schema:
+                            page_data["schema_data"] = schema
+                    
+                    if fetch_blocks and obj_type == "page":
+                        # Fetch page blocks (skip for databases as they have rows, not blocks)
+                        blocks = _fetch_notion_blocks(page_id, headers, max_depth=3)
+                        if blocks:
+                            page_data["blocks_data"] = blocks
+
+                pages.append(page_data)
 
                 if len(pages) >= max_pages:
                     break
@@ -3918,48 +6219,84 @@ def _run_notion_pipeline(run_id: str) -> None:
             if not data.get("has_more"):
                 break
             start_cursor = data.get("next_cursor")
+            time.sleep(Config.NOTION_API_RATE_LIMIT_DELAY)  # Rate limit between search pages
 
         notion_run_pages[run_id] = pages
         _persist_notion_pages(workspace_id, workspace_name, pages, full_refresh=True)
-        run_info["status"] = "completed"
-        run_info["finished_at"] = datetime.utcnow().isoformat()
-        run_info["page_count"] = len(pages)
+
+        global _notion_hierarchy_cache
+        _notion_hierarchy_cache = (0.0, {})
+        
+        run_stats = {"page_count": len(pages)}
+        _update_pipeline_run(
+            run_id,
+            status="completed",
+            finished_at=datetime.utcnow(),
+            stats=run_stats,
+        )
 
         logger.info("Notion pipeline run %s completed with %s pages", run_id, len(pages))
-        
-        # Automatically sync embeddings after successful ingestion
-        try:
-            logger.info("Auto-syncing Notion embeddings for workspace %s...", workspace_id)
-            embed_stats = sync_embeddings_after_pipeline(
-                data_source="notion",
-                source_ids=[workspace_id],
-                db_manager=db_manager
-            )
-            run_info["embedding_stats"] = embed_stats
-            logger.info("✓ Notion embeddings synced: %s", embed_stats)
-        except Exception as embed_error:
-            logger.error(f"Embedding sync failed (non-fatal): {embed_error}")
-            run_info["embedding_error"] = str(embed_error)
+
+        if Config.AUTO_SYNC_EMBEDDINGS_AFTER_PIPELINE:
+            # Automatically sync embeddings after successful ingestion
+            try:
+                logger.info("Auto-syncing Notion embeddings for workspace %s...", workspace_id)
+                embed_stats = sync_embeddings_after_pipeline(
+                    data_source="notion",
+                    source_ids=[workspace_id],
+                    db_manager=db_manager
+                )
+                run_stats["embedding_stats"] = embed_stats
+                _update_pipeline_run(run_id, stats=run_stats)
+                logger.info("✓ Notion embeddings synced: %s", embed_stats)
+            except Exception as embed_error:
+                logger.error(f"Embedding sync failed (non-fatal): {embed_error}")
+                run_stats["embedding_error"] = str(embed_error)
+                _update_pipeline_run(run_id, stats=run_stats)
 
     except Exception as e:  # pragma: no cover - defensive logging
         logger.error(f"Notion pipeline run {run_id} failed: {e}", exc_info=True)
-        run_info["status"] = "failed"
-        run_info["finished_at"] = datetime.utcnow().isoformat()
-        run_info["error"] = str(e)
+        _update_pipeline_run(
+            run_id,
+            status="failed",
+            finished_at=datetime.utcnow(),
+            error=str(e),
+        )
 
 
 @app.post("/api/pipelines/notion/run")
-async def run_notion_pipeline():
-    """Trigger a Notion pipeline run to list pages under NOTION_PARENT_PAGE_ID."""
+async def run_notion_pipeline(mode: str = "titles"):
+    """Trigger a Notion pipeline run.
+
+    mode=titles: fast refresh that only persists titles/metadata.
+    mode=deep: optional deep fetch (blocks/schema) based on env.
+    """
 
     run_id = uuid.uuid4().hex
-    notion_pipeline_runs[run_id] = {
-        "run_id": run_id,
-        "status": "pending",
-        "created_at": datetime.utcnow().isoformat(),
-    }
+    
+    # Create pipeline run in database (works with multiple workers)
+    with db_manager.get_session() as session:
+        pipeline_run = PipelineRun(
+            run_id=run_id,
+            pipeline_type="notion",
+            status="pending",
+        )
+        session.add(pipeline_run)
+        session.commit()
 
-    thread = threading.Thread(target=_run_notion_pipeline, args=(run_id,), daemon=True)
+    mode_norm = (mode or "titles").strip().lower()
+    if mode_norm == "deep":
+        deep_fetch_override = True
+        fetch_blocks_override = True
+    else:
+        deep_fetch_override = False
+        fetch_blocks_override = False
+
+    thread = threading.Thread(
+        target=_run_notion_pipeline,
+        args=(run_id, deep_fetch_override, fetch_blocks_override),
+        daemon=True,
+    )
     thread.start()
 
     return {"run_id": run_id, "status": "started"}
@@ -3969,7 +6306,7 @@ async def run_notion_pipeline():
 async def get_notion_pipeline_status(run_id: str):
     """Get the status of a Notion pipeline run."""
 
-    run = notion_pipeline_runs.get(run_id)
+    run = _get_pipeline_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
     return run
@@ -3979,22 +6316,24 @@ async def get_notion_pipeline_status(run_id: str):
 async def stop_notion_pipeline(run_id: str):
     """Request cancellation of a Notion pipeline run."""
 
-    run = notion_pipeline_runs.get(run_id)
+    run = _get_pipeline_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    run["cancel_requested"] = True
-    if run.get("status") in ("pending", "running"):
-        run["status"] = "cancelling"
-    run["finished_at"] = datetime.utcnow().isoformat()
-    return run
+    _update_pipeline_run(
+        run_id,
+        cancel_requested=True,
+        status="cancelling" if run.get("status") in ("pending", "running") else run.get("status"),
+        finished_at=datetime.utcnow(),
+    )
+    return _get_pipeline_run(run_id)
 
 
 @app.get("/api/pipelines/notion/pages")
 async def get_notion_pipeline_pages(run_id: str):
     """Return pages for a specific Notion pipeline run."""
 
-    run = notion_pipeline_runs.get(run_id)
+    run = _get_pipeline_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
 
@@ -4011,6 +6350,13 @@ async def get_notion_hierarchy():
     independent from the in-memory pipeline state so that previously synced
     pages are available every time the user opens the Pipelines tab.
     """
+
+    global _notion_hierarchy_cache
+
+    now = time.time()
+    cached_at, cached = _notion_hierarchy_cache
+    if cached and (now - cached_at) < _OPTIONS_CACHE_TTL_SECONDS:
+        return cached
 
     preferred_workspace_id = Config.WORKSPACE_ID or "default-notion-workspace"
 
@@ -4067,15 +6413,29 @@ async def get_notion_hierarchy():
             else:
                 roots.append(node)
 
-    return {
+    payload = {
         "workspace_id": workspace_id,
         "workspace_name": workspace_name,
         "pages": roots,
     }
 
+    _notion_hierarchy_cache = (now, payload)
+    return payload
+
 
 @app.get("/api/notion/page-content")
-async def get_notion_page_content(page_id: str):
+async def get_notion_page_content(
+    page_id: str,
+    include_databases: bool = True,
+    refresh: bool = False,
+    cache_only: bool = False,
+):
+    """Get content of a Notion page including any embedded databases.
+    
+    Args:
+        page_id: The Notion page ID
+        include_databases: If True, query and include content from child databases
+    """
     token = Config.NOTION_TOKEN
     if not token:
         raise HTTPException(
@@ -4083,9 +6443,132 @@ async def get_notion_page_content(page_id: str):
             detail="NOTION_TOKEN is not configured. Please set it in your environment.",
         )
 
+    global _notion_hierarchy_cache
+
+    if cache_only and not refresh:
+        with db_manager.get_session() as session:
+            db_page = session.query(NotionPage).filter_by(page_id=page_id).first()
+
+            if not db_page:
+                return {
+                    "page_id": page_id,
+                    "content": "",
+                    "attachments": [],
+                    "is_database": False,
+                    "child_databases": [],
+                    "cached": False,
+                    "message": "Not found in local DB. Refresh titles list first.",
+                }
+
+            obj_type = (db_page.object_type or "page").lower()
+            if obj_type == "database":
+                schema = db_page.schema_data or {}
+                props = schema.get("properties") if isinstance(schema, dict) else {}
+                columns = list(props.keys()) if isinstance(props, dict) else []
+
+                cached_columns = schema.get("cached_columns") if isinstance(schema, dict) else None
+                cached_entries = schema.get("cached_entries") if isinstance(schema, dict) else None
+                cached_total = schema.get("cached_total") if isinstance(schema, dict) else None
+                cached_error = schema.get("cached_error") if isinstance(schema, dict) else None
+
+                if isinstance(cached_columns, list) and cached_columns:
+                    columns = cached_columns
+                entries = cached_entries if isinstance(cached_entries, list) else []
+                total = cached_total if isinstance(cached_total, int) else len(entries)
+
+                return {
+                    "page_id": page_id,
+                    "content": "",
+                    "attachments": [],
+                    "is_database": True,
+                    "database": {
+                        "database_id": page_id,
+                        "title": schema.get("cached_title") if isinstance(schema, dict) and schema.get("cached_title") else (db_page.title or "Untitled"),
+                        "columns": columns,
+                        "entries": entries,
+                        "total": total,
+                        "error": cached_error
+                        if cached_error
+                        else ("Not refreshed. Click Refresh to fetch entries." if not entries else None),
+                    },
+                    "child_databases": [],
+                    "cached": bool(entries) or bool(db_page.schema_data),
+                }
+
+            blocks = db_page.blocks_data or []
+            if not blocks:
+                return {
+                    "page_id": page_id,
+                    "content": "",
+                    "attachments": [],
+                    "is_database": False,
+                    "child_databases": [],
+                    "cached": False,
+                    "message": "No cached content. Click Refresh to fetch page data.",
+                }
+
+            flat_blocks = _flatten_notion_block_tree(blocks) if isinstance(blocks, list) else []
+            text_lines, attachments, child_databases = _summarize_notion_blocks(
+                flat_blocks, include_databases=include_databases
+            )
+
+            databases_content: List[Dict[str, Any]] = []
+            if include_databases and child_databases:
+                for db_ref in child_databases:
+                    db_id = db_ref.get("id") if isinstance(db_ref, dict) else None
+                    db_title = db_ref.get("title", "Database") if isinstance(db_ref, dict) else "Database"
+                    if db_id:
+                        cached_db = session.query(NotionPage).filter_by(page_id=db_id).first()
+                        if cached_db and cached_db.schema_data:
+                            schema = cached_db.schema_data or {}
+                            props = schema.get("properties") if isinstance(schema, dict) else {}
+                            columns = list(props.keys()) if isinstance(props, dict) else []
+                            cached_columns = schema.get("cached_columns") if isinstance(schema, dict) else None
+                            cached_entries = schema.get("cached_entries") if isinstance(schema, dict) else None
+                            cached_total = schema.get("cached_total") if isinstance(schema, dict) else None
+                            cached_error = schema.get("cached_error") if isinstance(schema, dict) else None
+                            if isinstance(cached_columns, list) and cached_columns:
+                                columns = cached_columns
+                            entries = cached_entries if isinstance(cached_entries, list) else []
+                            total = cached_total if isinstance(cached_total, int) else len(entries)
+                            databases_content.append(
+                                {
+                                    "database_id": db_id,
+                                    "title": schema.get("cached_title")
+                                    if isinstance(schema, dict) and schema.get("cached_title")
+                                    else (cached_db.title or db_title),
+                                    "columns": columns,
+                                    "entries": entries,
+                                    "total": total,
+                                    "error": cached_error
+                                    if cached_error
+                                    else ("Not refreshed. Click Refresh to fetch entries." if not entries else None),
+                                }
+                            )
+                        else:
+                            databases_content.append(
+                                {
+                                    "database_id": db_id,
+                                    "title": db_title,
+                                    "columns": [],
+                                    "entries": [],
+                                    "total": 0,
+                                    "error": "Not refreshed. Click Refresh to fetch entries.",
+                                }
+                            )
+
+            return {
+                "page_id": page_id,
+                "content": "\n".join(text_lines),
+                "attachments": attachments,
+                "is_database": False,
+                "child_databases": databases_content,
+                "cached": True,
+            }
+
     headers = {
         "Authorization": f"Bearer {token}",
-        "Notion-Version": "2022-06-28",
+        "Notion-Version": Config.NOTION_VERSION,
         "Content-Type": "application/json",
     }
 
@@ -4093,47 +6576,230 @@ async def get_notion_page_content(page_id: str):
     next_cursor: Optional[str] = None
 
     try:
-        while True:
-            params: Dict[str, Any] = {"page_size": 50}
-            if next_cursor:
-                params["start_cursor"] = next_cursor
+        if not refresh:
+            return {
+                "page_id": page_id,
+                "content": "",
+                "attachments": [],
+                "is_database": False,
+                "child_databases": [],
+                "cached": False,
+                "message": "Cache-only mode required unless refresh=true.",
+            }
 
-            resp = requests.get(
-                f"https://api.notion.com/v1/blocks/{page_id}/children",
-                headers=headers,
-                params=params,
-                timeout=30,
+        page_meta_resp = requests.get(
+            f"https://api.notion.com/v1/pages/{page_id}",
+            headers=headers,
+            timeout=30,
+        )
+        if page_meta_resp.status_code == 200:
+            page_meta = page_meta_resp.json()
+
+            with db_manager.get_session() as session:
+                existing = session.query(NotionPage).filter_by(page_id=page_id).first()
+                workspace_id = (
+                    existing.workspace_id
+                    if existing and existing.workspace_id
+                    else (Config.WORKSPACE_ID or "default-notion-workspace")
+                )
+                ws = session.query(NotionWorkspace).filter_by(workspace_id=workspace_id).first()
+                workspace_name = ws.name if ws and ws.name else (Config.WORKSPACE_NAME or "Notion Workspace")
+
+            blocks_tree = _fetch_notion_blocks(page_id, headers, max_depth=3)
+            flat_blocks = _flatten_notion_block_tree(blocks_tree)
+            text_lines, attachments, child_databases = _summarize_notion_blocks(
+                flat_blocks, include_databases=include_databases
             )
+            content = "\n".join(text_lines)
 
-            if resp.status_code != 200:
-                logger.error(
-                    "Notion blocks API error %s: %s",
-                    resp.status_code,
-                    resp.text[:200],
+            databases_content: List[Dict[str, Any]] = []
+            if include_databases and child_databases:
+                for db_ref in child_databases:
+                    db_id = db_ref.get("id")
+                    db_title = db_ref.get("title", "Database")
+                    if db_id:
+                        db_data = _query_notion_database_for_api(db_id, db_title=db_title)
+                        if not db_data.get("title"):
+                            db_data["title"] = db_title
+                        databases_content.append(db_data)
+
+                        # Persist cached database rows/schema so future cache_only requests
+                        # (including subpage expansions) do not require another refresh.
+                        db_properties = db_data.get("properties") if isinstance(db_data, dict) else {}
+                        schema_cache = _build_database_schema_cache(
+                            properties=db_properties if isinstance(db_properties, dict) else {},
+                            db_data=db_data,
+                        )
+
+                        db_page_payload: Dict[str, Any] = {
+                            "id": db_id,
+                            "title": db_data.get("title") or db_title,
+                            "url": None,
+                            "last_edited_time": None,
+                            "object_type": "database",
+                            "parent_id": page_id,
+                            "schema_data": schema_cache,
+                        }
+                        _persist_notion_pages(workspace_id, workspace_name, [db_page_payload], full_refresh=False)
+
+                        resolved_id = db_data.get("database_id") if isinstance(db_data, dict) else None
+                        if resolved_id and resolved_id != db_id:
+                            resolved_payload = dict(db_page_payload)
+                            resolved_payload["id"] = resolved_id
+                            _persist_notion_pages(
+                                workspace_id,
+                                workspace_name,
+                                [resolved_payload],
+                                full_refresh=False,
+                            )
+
+            parent_obj = page_meta.get("parent", {}) or {}
+            parent_type = parent_obj.get("type")
+            parent_id: Optional[str] = None
+            if parent_type == "page_id":
+                parent_id = parent_obj.get("page_id")
+            elif parent_type == "database_id":
+                parent_id = parent_obj.get("database_id")
+
+            page_data: Dict[str, Any] = {
+                "id": page_id,
+                "title": _extract_notion_title(page_meta),
+                "url": page_meta.get("url"),
+                "last_edited_time": page_meta.get("last_edited_time"),
+                "object_type": "page",
+                "parent_id": parent_id,
+                "icon": page_meta.get("icon"),
+                "cover": page_meta.get("cover"),
+                "raw": page_meta,
+                "blocks_data": blocks_tree,
+            }
+            _persist_notion_pages(workspace_id, workspace_name, [page_data], full_refresh=False)
+            _notion_hierarchy_cache = (0.0, {})
+
+            return {
+                "page_id": page_id,
+                "content": content,
+                "attachments": attachments,
+                "is_database": False,
+                "child_databases": databases_content,
+                "refreshed": True,
+            }
+
+        db_meta_resp = requests.get(
+            f"https://api.notion.com/v1/databases/{page_id}",
+            headers=headers,
+            timeout=30,
+        )
+        if db_meta_resp.status_code == 200:
+            db_meta = db_meta_resp.json() or {}
+            db_data = _query_notion_database_for_api(page_id)
+
+            with db_manager.get_session() as session:
+                existing = session.query(NotionPage).filter_by(page_id=page_id).first()
+                workspace_id = (
+                    existing.workspace_id
+                    if existing and existing.workspace_id
+                    else (Config.WORKSPACE_ID or "default-notion-workspace")
                 )
-                raise HTTPException(
-                    status_code=resp.status_code,
-                    detail=f"Notion API error {resp.status_code}",
+                ws = session.query(NotionWorkspace).filter_by(workspace_id=workspace_id).first()
+                workspace_name = ws.name if ws and ws.name else (Config.WORKSPACE_NAME or "Notion Workspace")
+
+            parent_obj = db_meta.get("parent", {}) or {}
+            parent_type = parent_obj.get("type")
+            parent_id: Optional[str] = None
+            if parent_type == "page_id":
+                parent_id = parent_obj.get("page_id")
+
+            db_properties = db_data.get("properties") if isinstance(db_data, dict) else {}
+            schema_data = _build_database_schema_cache(
+                properties=db_properties if isinstance(db_properties, dict) else {},
+                db_data=db_data,
+            )
+            schema_data["title"] = db_meta.get("title", [])
+            schema_data["description"] = db_meta.get("description", [])
+            schema_data["is_inline"] = db_meta.get("is_inline", False)
+
+            page_data = {
+                "id": page_id,
+                "title": "".join(t.get("plain_text", "") for t in db_meta.get("title", [])) or "Untitled",
+                "url": db_meta.get("url"),
+                "last_edited_time": db_meta.get("last_edited_time"),
+                "object_type": "database",
+                "parent_id": parent_id,
+                "icon": db_meta.get("icon"),
+                "cover": db_meta.get("cover"),
+                "raw": db_meta,
+                "schema_data": schema_data,
+            }
+            _persist_notion_pages(workspace_id, workspace_name, [page_data], full_refresh=False)
+            _notion_hierarchy_cache = (0.0, {})
+
+            return {
+                "page_id": page_id,
+                "content": "",
+                "attachments": [],
+                "is_database": True,
+                "database": db_data,
+                "child_databases": [],
+                "refreshed": True,
+            }
+
+        ds_meta_resp = requests.get(
+            f"https://api.notion.com/v1/data_sources/{page_id}",
+            headers=headers,
+            timeout=30,
+        )
+        if ds_meta_resp.status_code == 200:
+            ds_meta = ds_meta_resp.json() or {}
+            db_data = _query_notion_database_for_api(page_id)
+
+            with db_manager.get_session() as session:
+                existing = session.query(NotionPage).filter_by(page_id=page_id).first()
+                workspace_id = (
+                    existing.workspace_id
+                    if existing and existing.workspace_id
+                    else (Config.WORKSPACE_ID or "default-notion-workspace")
                 )
+                ws = session.query(NotionWorkspace).filter_by(workspace_id=workspace_id).first()
+                workspace_name = ws.name if ws and ws.name else (Config.WORKSPACE_NAME or "Notion Workspace")
 
-            data = resp.json()
-            results = data.get("results", []) or []
-            all_blocks.extend(results)
+            db_properties = ds_meta.get("properties", {}) if isinstance(ds_meta, dict) else {}
+            schema_data = _build_database_schema_cache(
+                properties=db_properties if isinstance(db_properties, dict) else {},
+                db_data=db_data,
+            )
+            schema_data["title"] = ds_meta.get("title", [])
+            schema_data["description"] = ds_meta.get("description", [])
 
-            if not data.get("has_more"):
-                break
-            next_cursor = data.get("next_cursor")
-            if not next_cursor:
-                break
+            parent_obj = ds_meta.get("parent", {}) or {}
+            parent_id = parent_obj.get("database_id")
 
-        text_lines, attachments = _summarize_notion_blocks(all_blocks)
-        content = "\n".join(text_lines)
+            page_data = {
+                "id": page_id,
+                "title": "".join(t.get("plain_text", "") for t in ds_meta.get("title", [])) or "Untitled",
+                "url": ds_meta.get("url"),
+                "last_edited_time": ds_meta.get("last_edited_time"),
+                "object_type": "database",
+                "parent_id": parent_id,
+                "icon": ds_meta.get("icon"),
+                "cover": ds_meta.get("cover"),
+                "raw": ds_meta,
+                "schema_data": schema_data,
+            }
+            _persist_notion_pages(workspace_id, workspace_name, [page_data], full_refresh=False)
+            _notion_hierarchy_cache = (0.0, {})
 
-        return {
-            "page_id": page_id,
-            "content": content,
-            "attachments": attachments,
-        }
+            return {
+                "page_id": page_id,
+                "content": "",
+                "attachments": [],
+                "is_database": True,
+                "database": db_data,
+                "child_databases": [],
+                "refreshed": True,
+            }
+
+        raise HTTPException(status_code=404, detail="Notion page/database not found")
 
     except HTTPException:
         raise
@@ -4155,6 +6821,12 @@ async def startup_event():
 async def shutdown_event():
     """Run on application shutdown."""
     logger.info("Shutting down Workforce AI Agent API...")
+
+    try:
+        if ai_brain and hasattr(ai_brain, "close"):
+            await ai_brain.close()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

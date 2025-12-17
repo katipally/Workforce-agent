@@ -8,9 +8,14 @@ Combines:
 """
 
 from typing import TypedDict, List, Dict, Any, Optional, AsyncIterator
-from langgraph.graph import StateGraph, START, END
+try:
+    from langgraph.graph import StateGraph, START, END
+except ImportError:
+    from langgraph.graph import StateGraph
+    START = "__start__"
+    END = "__end__"
 from langchain_openai import ChatOpenAI
-from langchain.schema import HumanMessage, SystemMessage, AIMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 import numpy as np
 import os
 import sys
@@ -57,16 +62,21 @@ class HybridRAGEngine:
         self,
         openai_api_key: str,
         embedding_model: Optional[SentenceTransformerEmbedding] = None,
-        reranker_model: Optional[SentenceTransformerReranker] = None
+        reranker_model: Optional[SentenceTransformerReranker] = None,
+        user_id: Optional[str] = None
     ):
         """Initialize hybrid RAG engine.
         
         Args:
             openai_api_key: OpenAI API key
-            qwen_embedding: Optional pre-loaded Qwen embedding model
-            qwen_reranker: Optional pre-loaded Qwen reranker model
+            embedding_model: Optional pre-loaded embedding model
+            reranker_model: Optional pre-loaded reranker model
+            user_id: Optional user ID for Gmail OAuth credential lookup
         """
         logger.info("Initializing Hybrid RAG Engine...")
+        
+        # Store user_id for credential lookups
+        self.user_id = user_id
         
         # Initialize embedding / reranker models (lazy loading if not provided)
         self.embedding_model = embedding_model
@@ -85,8 +95,8 @@ class HybridRAGEngine:
             streaming=True
         )
         
-        # Initialize tools
-        self.tools = WorkforceTools()
+        # Initialize tools with user_id for Gmail OAuth support
+        self.tools = WorkforceTools(user_id=user_id)
         self.langchain_tools = self.tools.get_langchain_tools()
         
         # Initialize database
@@ -126,7 +136,7 @@ class HybridRAGEngine:
 
         headers = {
             "Authorization": f"Bearer {token}",
-            "Notion-Version": "2022-06-28",
+            "Notion-Version": Config.NOTION_VERSION,
             "Content-Type": "application/json",
         }
 
@@ -191,7 +201,7 @@ class HybridRAGEngine:
 
         headers = {
             "Authorization": f"Bearer {token}",
-            "Notion-Version": "2022-06-28",
+            "Notion-Version": Config.NOTION_VERSION,
         }
 
         url = f"https://api.notion.com/v1/blocks/{page_id}/children"
@@ -916,6 +926,7 @@ class HybridRAGEngine:
         query: str,
         top_k: int = 5,
         gmail_account_email: Optional[str] = None,
+        sources: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Hybrid retrieval with reranking.
         
@@ -941,6 +952,11 @@ class HybridRAGEngine:
             limit=20,
             gmail_account_email=gmail_account_email,
         )
+
+        if sources:
+            allowed = set(sources)
+            vector_results = [r for r in vector_results if r.get('type') in allowed]
+            keyword_results = [r for r in keyword_results if r.get('type') in allowed]
         
         # Step 3: RRF fusion
         fused_results = self._rrf_fusion(vector_results, keyword_results)

@@ -15,10 +15,15 @@ def setup_logging(
 ) -> None:
     """Setup logging configuration."""
     level = log_level or Config.LOG_LEVEL
-    file_path = log_file or Config.LOG_FILE
+    file_path = Path(log_file or Config.LOG_FILE)
     
-    # Create logs directory
+    # Create logs directory and ensure the target log file's directory exists
     Config.LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # If this fails, fallback to console-only logging but avoid crashing startup
+        pass
     
     # Create formatter
     console_formatter = colorlog.ColoredFormatter(
@@ -45,7 +50,7 @@ def setup_logging(
     
     # File handler with rotation
     file_handler = RotatingFileHandler(
-        file_path,
+        str(file_path),
         maxBytes=10 * 1024 * 1024,  # 10MB
         backupCount=5
     )

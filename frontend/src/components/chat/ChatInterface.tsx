@@ -8,9 +8,22 @@ import QuickActions from './QuickActions'
 import { Bot, History, Sparkles } from 'lucide-react'
 import { API_BASE_URL } from '../../lib/api'
 
+type ConnectorStatus = {
+  status: 'connected' | 'disconnected' | 'degraded' | string
+  detail?: string
+}
+
+type ChatConnectorHealth = {
+  overall_status: 'connected' | 'disconnected' | 'degraded' | string
+  slack: ConnectorStatus
+  gmail: ConnectorStatus
+  notion: ConnectorStatus
+}
+
 export default function ChatInterface() {
-  const { messages, streamingMessage, isStreaming } = useChatStore()
-  const { sendMessage, isConnected } = useWebSocket()
+  const { messages, streamingMessage, isStreaming, currentSessionId, sessionSourcePrefs, toggleSourcePreference } = useChatStore()
+  const { sendMessage, isConnected, connectionStatus } = useWebSocket()
+  const [connectorHealth, setConnectorHealth] = useState<ChatConnectorHealth | null>(null)
   const [showHistory, setShowHistory] = useState(() => {
     if (typeof window === 'undefined') return true
     const raw = window.localStorage.getItem('workforce-chat-show-history')
@@ -32,6 +45,30 @@ export default function ChatInterface() {
     window.localStorage.setItem('workforce-chat-show-quick-actions', String(showQuickActions))
   }, [showQuickActions])
   
+  useEffect(() => {
+    const fetchConnectorHealth = async () => {
+      try {
+        const res = await fetch(`${API_BASE_URL}/api/chat/connectors/status`, {
+          credentials: 'include',
+        })
+        if (!res.ok) return
+        const data = (await res.json()) as ChatConnectorHealth
+        setConnectorHealth(data)
+      } catch {
+        // Best-effort; header will just show WebSocket status on failure.
+      }
+    }
+
+    // Fetch on mount and whenever WebSocket connection state changes
+    fetchConnectorHealth()
+  }, [isConnected, connectionStatus])
+  
+  const currentSourcePrefs = sessionSourcePrefs[currentSessionId] || {
+    slack: true,
+    gmail: true,
+    notion: true,
+  }
+
   const handleSendMessage = async (content: string, files?: File[]) => {
     const currentSessionId = useChatStore.getState().currentSessionId
     let fullMessage = content
@@ -83,6 +120,14 @@ export default function ChatInterface() {
     sendMessage(messageToSend)
   }
 
+  const handleRerunLastQuestion = () => {
+    const state = useChatStore.getState()
+    const sessionMessages = state.sessionMessages[currentSessionId] || []
+    const lastUserMessage = [...sessionMessages].reverse().find((m) => m.role === 'user')
+    if (!lastUserMessage) return
+    void handleSendMessage(lastUserMessage.content)
+  }
+
   const handleQuickAction = (prompt: string) => {
     handleSendMessage(prompt)
   }
@@ -91,7 +136,7 @@ export default function ChatInterface() {
     <div className="flex h-full bg-background">
       {/* History sidebar */}
       <aside
-        className={`w-64 border-r border-border bg-gray-900 transition-all ${
+        className={`w-64 border-r border-border bg-secondary transition-all ${
           showHistory ? 'block' : 'hidden lg:block'
         }`}
       >
@@ -123,19 +168,100 @@ export default function ChatInterface() {
                     GPT-5 nano
                   </span>
                 </h1>
-                <p className="text-sm text-muted-foreground">
-                  {isConnected ? (
-                    <span className="flex items-center gap-1">
-                      <span className="h-2 w-2 rounded-full bg-green-500" />
-                      Connected · Ready for automation
+                <div className="text-sm text-muted-foreground space-y-1 mt-0.5">
+                  <div className="flex items-center gap-2">
+                    <span
+                      className={`h-2 w-2 rounded-full ${
+                        isConnected ? 'bg-green-500' : connectionStatus === 'connecting' ? 'bg-yellow-500' : 'bg-red-500'
+                      }`}
+                    />
+                    <span>
+                      {isConnected
+                        ? 'Chat connection: Connected'
+                        : connectionStatus === 'connecting'
+                          ? 'Chat connection: Connecting…'
+                          : 'Chat connection: Disconnected'}
                     </span>
-                  ) : (
-                    <span className="flex items-center gap-1">
-                      <span className="h-2 w-2 rounded-full bg-red-500" />
-                      Disconnected
-                    </span>
+                  </div>
+                  {connectorHealth && (
+                    <div className="flex flex-wrap items-center gap-3 text-xs">
+                      <span className="flex items-center gap-1">
+                        <span
+                          className={`h-2 w-2 rounded-full ${
+                            connectorHealth.slack.status === 'connected' ? 'bg-green-500' : 'bg-yellow-500'
+                          }`}
+                        />
+                        <span>
+                          Slack: {connectorHealth.slack.status === 'connected' ? 'Connected' : 'Disconnected'}
+                        </span>
+                      </span>
+                      <span className="flex items-center gap-1">
+                        <span
+                          className={`h-2 w-2 rounded-full ${
+                            connectorHealth.gmail.status === 'connected' ? 'bg-green-500' : 'bg-yellow-500'
+                          }`}
+                        />
+                        <span>
+                          Gmail: {connectorHealth.gmail.status === 'connected' ? 'Connected' : 'Disconnected'}
+                        </span>
+                      </span>
+                      <span className="flex items-center gap-1">
+                        <span
+                          className={`h-2 w-2 rounded-full ${
+                            connectorHealth.notion.status === 'connected' ? 'bg-green-500' : 'bg-yellow-500'
+                          }`}
+                        />
+                        <span>
+                          Notion: {connectorHealth.notion.status === 'connected' ? 'Connected' : 'Disconnected'}
+                        </span>
+                      </span>
+                    </div>
                   )}
-                </p>
+                  <div className="flex flex-wrap items-center gap-2 pt-1 text-xs">
+                    <span className="text-muted-foreground/80">Sources in this chat:</span>
+                    <button
+                      type="button"
+                      onClick={() => toggleSourcePreference('slack')}
+                      className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium transition-colors ${
+                        currentSourcePrefs.slack
+                          ? 'border-blue-500 bg-blue-500/10 text-blue-500'
+                          : 'border-border bg-background text-muted-foreground'
+                      }`}
+                    >
+                      Slack
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => toggleSourcePreference('gmail')}
+                      className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium transition-colors ${
+                        currentSourcePrefs.gmail
+                          ? 'border-emerald-500 bg-emerald-500/10 text-emerald-500'
+                          : 'border-border bg-background text-muted-foreground'
+                      }`}
+                    >
+                      Gmail
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => toggleSourcePreference('notion')}
+                      className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium transition-colors ${
+                        currentSourcePrefs.notion
+                          ? 'border-purple-500 bg-purple-500/10 text-purple-500'
+                          : 'border-border bg-background text-muted-foreground'
+                      }`}
+                    >
+                      Notion
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleRerunLastQuestion}
+                      disabled={isStreaming || !messages.some((m) => m.role === 'user')}
+                      className="ml-1 inline-flex items-center rounded-full border border-border bg-background px-2 py-0.5 text-[11px] font-medium text-foreground hover:bg-muted disabled:opacity-50"
+                    >
+                      Re-run last question with these sources
+                    </button>
+                  </div>
+                </div>
               </div>
             </div>
           </div>

@@ -2,52 +2,29 @@
 .env
 .env.local
 
-# Python
+# Python bytecode / cache
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
 
 # Virtual environments
 venv/
 env/
 ENV/
-.venv
+.venv/
 
-# Database
+# Databases
 *.db
 *.sqlite
 *.sqlite3
 
-# Data files
-data/
-raw_exports/
-files/
-*.json.gz
-
-# Credentials and tokens
+# Credentials and tokens (keep secrets out of git)
 google-credentials.json
 credentials.json
 *.pickle
 token.json
 
-# IDE
+# IDE / OS-specific
 .vscode/
 .idea/
 *.swp
@@ -59,12 +36,12 @@ token.json
 logs/
 *.log
 
-# Testing
+# Testing artifacts
 .pytest_cache/
 .coverage
 htmlcov/
 
-# Misc
+# Misc caches / temp
 .cache/
 temp/
 tmp/

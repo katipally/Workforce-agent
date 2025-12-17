@@ -1,5 +1,8 @@
 # 🤖 Workforce AI Agent
 
+rm -rf node_modules package-lock.json
+npm install
+
 ## 🔄 Complete Integration (Nov 2025)
 
 **Pipeline → PostgreSQL → Embeddings → RAG → Chat flow is now fully automated:**

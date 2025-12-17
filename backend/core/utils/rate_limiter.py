@@ -1,5 +1,6 @@
 """Rate limiting for Slack API calls."""
 import asyncio
+import os
 import time
 from collections import defaultdict
 from typing import Dict, Optional, Callable, Any
@@ -9,12 +10,49 @@ from functools import wraps
 
 from .logger import get_logger
 
-# Default rate limits if not configured
+# Slack API rate limit tiers (requests per minute)
+# For non-Marketplace apps, conversations.history and conversations.replies are severely limited
+# See: https://api.slack.com/apis/rate-limits
+_SLACK_SPECIAL_RATE_LIMIT = int(os.getenv("SPECIAL_RATE_LIMIT", "1"))  # 1 req/min for non-Marketplace
+
+_SLACK_RATE_LIMITS = {
+    # Tier 1 - Most restricted (1 req/min for non-Marketplace)
+    "conversations.history": _SLACK_SPECIAL_RATE_LIMIT,
+    "conversations.replies": _SLACK_SPECIAL_RATE_LIMIT,
+    # Tier 2 - Moderate (20 req/min)
+    "conversations.list": 20,
+    "files.list": 20,
+    "reactions.list": 20,
+    "users.list": 20,
+    # Tier 3 - Good (50 req/min)
+    "chat.postMessage": 50,
+    "chat.update": 50,
+    "chat.delete": 50,
+    "conversations.info": 50,
+    "conversations.members": 50,
+    "files.info": 50,
+    "reactions.add": 50,
+    "reactions.remove": 50,
+    "users.conversations": 50,
+    # Tier 4 - Highest (100 req/min)
+    "api.test": 100,
+    "auth.test": 100,
+    "users.info": 100,
+    "team.info": 100,
+    "emoji.list": 100,
+    "bots.info": 100,
+}
+
 def get_rate_limit_for_method(method: str) -> tuple:
     """Get rate limit for a method. Returns (calls, period_seconds)."""
+    # Check Slack-specific limits first
+    if method in _SLACK_RATE_LIMITS:
+        return (_SLACK_RATE_LIMITS[method], 60)
+    
+    # Generic defaults for non-Slack APIs
     defaults = {
         "default": (100, 60),  # 100 calls per minute
-        "slack_api": (50, 60),  # 50 calls per minute for Slack
+        "slack_api": (50, 60),  # 50 calls per minute for Slack (generic)
         "gmail_api": (250, 60),  # 250 calls per minute for Gmail
         "notion_api": (3, 1),  # 3 calls per second for Notion
     }
@@ -62,10 +100,17 @@ class RateLimiter:
             wait_time = self._get_wait_time(method, max_calls)
             
             if wait_time > 0:
-                logger.debug(
-                    f"Rate limit approaching for {method}. "
-                    f"Waiting {wait_time:.2f}s (limit: {max_calls}/min)"
-                )
+                # Use INFO level for long waits so user can see progress
+                if wait_time > 5:
+                    logger.info(
+                        f"Rate limit for {method}: waiting {wait_time:.0f}s "
+                        f"(limit: {max_calls}/min). This is normal for Slack's strict rate limits."
+                    )
+                else:
+                    logger.debug(
+                        f"Rate limit approaching for {method}. "
+                        f"Waiting {wait_time:.2f}s (limit: {max_calls}/min)"
+                    )
                 time.sleep(wait_time)
             
             # Record this request
