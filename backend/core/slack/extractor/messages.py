@@ -1,13 +1,21 @@
 """Message extractor."""
-from typing import Optional, List, Callable, Dict
+import os
+from typing import Optional, List, Callable, Dict, Any
 from tqdm import tqdm
 import time
+from datetime import datetime
 
 from .base_extractor import BaseExtractor
 from utils.logger import get_logger
+from utils.rate_limiter import get_rate_limit_for_method
 from config import Config
 
 logger = get_logger(__name__)
+
+# Get rate limit for conversations.history to calculate ETA
+_HISTORY_RATE_LIMIT, _ = get_rate_limit_for_method("conversations.history")
+# For non-Marketplace apps, Slack caps limit param at 15 messages per request
+_SLACK_MAX_LIMIT_NON_MARKETPLACE = int(os.getenv("SLACK_MAX_LIMIT_NON_MARKETPLACE", "15"))
 
 
 class MessageExtractor(BaseExtractor):
@@ -43,16 +51,22 @@ class MessageExtractor(BaseExtractor):
         messages_list = []
         latest_ts = None
         
-        # Note: conversations.history has strict rate limits (1 req/min for non-Marketplace)
-        logger.warning(
-            "conversations.history has rate limit of 1 req/min for non-Marketplace apps. "
-            "This may take a while..."
+        # Calculate effective limit (Slack caps at 15 for non-Marketplace apps)
+        configured_limit = int(getattr(Config, "SLACK_CONVERSATIONS_HISTORY_LIMIT", 15))
+        effective_limit = min(configured_limit, _SLACK_MAX_LIMIT_NON_MARKETPLACE)
+        
+        # Rate limit info for ETA calculation
+        seconds_per_request = 60 / _HISTORY_RATE_LIMIT  # e.g., 60s for 1 req/min
+        
+        logger.info(
+            f"conversations.history rate limit: {_HISTORY_RATE_LIMIT} req/min, "
+            f"{effective_limit} messages/page. Each page takes ~{seconds_per_request:.0f}s."
         )
         
-        # Paginate through messages
+        # Paginate through messages with progress tracking
         params = {
             "channel": channel_id,
-            "limit": max(1, min(int(getattr(Config, "SLACK_CONVERSATIONS_HISTORY_LIMIT", 15)), 200)),
+            "limit": max(1, min(configured_limit, 200)),
         }
         
         if oldest:
@@ -60,10 +74,17 @@ class MessageExtractor(BaseExtractor):
         if latest:
             params["latest"] = latest
         
-        for message in self._paginate(
+        # Track pagination progress
+        pages_fetched = 0
+        fetch_start_time = time.time()
+        
+        for message in self._paginate_with_progress(
             "conversations.history",
             "conversations_history",
             "messages",
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+            seconds_per_request=seconds_per_request,
             **params
         ):
             if cancel_check and cancel_check():
@@ -74,14 +95,18 @@ class MessageExtractor(BaseExtractor):
             if not latest_ts or ts > latest_ts:
                 latest_ts = ts
         
-        logger.info(f"Fetched {len(messages_list)} messages. Saving to database...")
+        fetch_duration = time.time() - fetch_start_time
+        logger.info(f"Fetched {len(messages_list)} messages in {fetch_duration:.1f}s. Saving to database...")
 
         if progress_callback:
             progress_callback(
                 {
-                    "stage": "fetched",
+                    "stage": "saving",
+                    "stage_description": "Saving messages to database",
                     "total_messages": len(messages_list),
-                    "progress": 0.4 if messages_list else 0.6,
+                    "processed_messages": 0,
+                    "progress": 0.85,
+                    "eta_seconds": 5,  # Saving is fast
                 }
             )
         
@@ -113,9 +138,12 @@ class MessageExtractor(BaseExtractor):
                             progress_callback(
                                 {
                                     "stage": "saving",
+                                    "stage_description": f"Saving messages to database ({i}/{len(messages_list)})",
                                     "processed_messages": i,
                                     "total_messages": len(messages_list),
-                                    "progress": 0.4 + 0.55 * frac,
+                                    "messages_fetched": len(messages_list),
+                                    "progress": 0.85 + 0.1 * frac,
+                                    "eta_seconds": max(1, int((len(messages_list) - i) / 100)),  # ~100 msgs/sec
                                 }
                             )
                     except Exception as e:
@@ -131,8 +159,10 @@ class MessageExtractor(BaseExtractor):
             progress_callback(
                 {
                     "stage": "completed",
+                    "stage_description": "Sync complete",
                     "processed_messages": len(messages_list),
                     "total_messages": len(messages_list),
+                    "messages_fetched": len(messages_list),
                     "progress": 1.0,
                 }
             )

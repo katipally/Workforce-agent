@@ -3,7 +3,7 @@
 Implements action tools for Slack, Gmail, and Notion operations.
 """
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timedelta
 from langchain_core.tools import Tool, StructuredTool
 from pydantic.v1 import BaseModel, Field
@@ -35,6 +35,7 @@ from slack.sender.file_sender import FileSender
 from gmail.client import GmailClient
 from notion_export.client import NotionClient
 from database.db_manager import DatabaseManager
+from database.models import NotionPage
 from settings.service import get_workspace_settings_view, get_effective_slack_bot_token
 from utils.logger import get_logger
 
@@ -64,6 +65,110 @@ def _normalize_notion_id(page_id: str) -> Optional[str]:
         return simple
 
     return None
+
+
+def _strip_notion_title_prefix(title: str) -> str:
+    try:
+        return re.sub(r"^\[[^\]]+\]\s*", "", (title or "").strip()).strip()
+    except Exception:
+        return (title or "").strip()
+
+
+def _extract_notion_title_prefix(title: str) -> Optional[str]:
+    try:
+        m = re.match(r"^\[([^\]]+)\]\s*", (title or "").strip())
+        if not m:
+            return None
+        return (m.group(1) or "").strip().lower() or None
+    except Exception:
+        return None
+
+
+def _notion_title_match_score(query: str, title: str) -> int:
+    q = (query or "").strip().lower()
+    t = (title or "").strip().lower()
+    if not q or not t:
+        return 0
+
+    q_stripped = _strip_notion_title_prefix(q)
+    t_stripped = _strip_notion_title_prefix(t)
+    q_prefix = _extract_notion_title_prefix(q)
+    t_prefix = _extract_notion_title_prefix(t)
+
+    if t == q:
+        return 100
+    if t_stripped == q:
+        return 98
+    if t == q_stripped:
+        return 96
+    if t_stripped == q_stripped:
+        score = 94
+        if q_prefix and t_prefix and q_prefix == t_prefix:
+            score += 3
+        # If the user included a [prefix] and the title does NOT match it,
+        # strongly penalize to avoid picking un-prefixed duplicates.
+        if q_prefix and (not t_prefix or t_prefix != q_prefix):
+            score -= 15
+        return max(score, 0)
+
+    score = 0
+    if q_prefix and t_prefix and q_prefix == t_prefix:
+        score += 12
+
+    if q in t:
+        score = max(score, 75)
+    if q_stripped and q_stripped in t:
+        score = max(score, 72)
+    if q in t_stripped:
+        score = max(score, 70)
+    if q_stripped and q_stripped in t_stripped:
+        score = max(score, 68)
+
+    if t.startswith(q):
+        score = max(score, 80)
+    if q_stripped and t.startswith(q_stripped):
+        score = max(score, 78)
+    if t_stripped.startswith(q):
+        score = max(score, 77)
+    if q_stripped and t_stripped.startswith(q_stripped):
+        score = max(score, 76)
+
+    return score
+
+
+def _resolve_notion_property_name(
+    schema: Dict[str, Any],
+    requested: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    req = (requested or "").strip()
+    if not req:
+        return None, "❌ property_name is required"
+
+    if req in schema:
+        return req, None
+
+    lowered = req.lower()
+    case_insensitive = [k for k in schema.keys() if k.lower() == lowered]
+    if len(case_insensitive) == 1:
+        return case_insensitive[0], None
+    if len(case_insensitive) > 1:
+        options = ", ".join(case_insensitive[:10])
+        return None, (
+            f"❌ Property name '{requested}' is ambiguous (multiple columns differ only by case). "
+            f"Please pick one of: {options}"
+        )
+
+    # Suggestions by substring
+    suggestions = [k for k in schema.keys() if lowered in k.lower()]
+    suggestions = suggestions[:10]
+    if suggestions:
+        opts = "\n".join(f"- {s}" for s in suggestions)
+        return None, (
+            f"❌ Property '{requested}' not found. Did you mean one of these?\n{opts}"
+        )
+
+    available = ", ".join(list(schema.keys())[:50])
+    return None, f"❌ Property '{requested}' not found. Available: {available}"
 
 
 # Pydantic models for tool inputs
@@ -615,7 +720,7 @@ class WorkforceTools:
             logger.error(f"Error reading Slack channels from DB: {e}", exc_info=True)
             return f"❌ Error reading Slack channels: {str(e)}"
     
-    def get_channel_messages(self, channel: str, limit: int = 100) -> str:
+    def get_channel_messages(self, channel: str, limit: int = 100, workflow_mode: bool = False) -> str:
         """Get messages from a specific Slack channel from the local database.
         
         Args:
@@ -639,8 +744,8 @@ class WorkforceTools:
             normalized = self._normalize_slack_channel(channel)
 
             with self.db.get_session() as session:
-                # Find channel in local synced Slack data
-                ch = (
+                # Find channel(s) in local synced Slack data
+                matches = (
                     session.query(Channel)
                     .filter(
                         or_(
@@ -649,16 +754,58 @@ class WorkforceTools:
                             Channel.channel_id == channel,
                         )
                     )
-                    .first()
+                    .all()
                 )
 
-                if not ch:
+                if not matches:
                     logger.warning("Channel '%s' not found in local Slack DB", channel)
                     return (
                         f"❌ Channel '{channel}' not found in synced Slack data. "
                         f"Try running the Slack sync pipeline for that workspace."
                     )
 
+                # If user passed a name that matches multiple channels, force selection.
+                looks_like_id = str(channel or "").startswith("C") or str(channel or "").startswith("G")
+                if (not looks_like_id) and len(matches) > 1:
+                    # Prefer non-archived channels first
+                    try:
+                        matches.sort(key=lambda c: (bool(getattr(c, "is_archived", False)), str(getattr(c, "workspace_id", "")), str(getattr(c, "channel_id", ""))))
+                    except Exception:
+                        pass
+
+                    if workflow_mode:
+                        import json
+                        options = [
+                            {
+                                "label": f"#{getattr(c, 'name', '') or 'unknown'} ({getattr(c, 'workspace_id', '')})",
+                                "value": getattr(c, "channel_id", ""),
+                                "meta": {"workspace_id": getattr(c, "workspace_id", None), "is_private": getattr(c, "is_private", None)},
+                            }
+                            for c in matches[:20]
+                        ]
+                        return json.dumps(
+                            {
+                                "__workforce_conflict__": True,
+                                "title": f"Multiple Slack channels match '{channel}'",
+                                "message": "Select the correct channel.",
+                                "options": options,
+                                "patch_key": "channel",
+                            },
+                            ensure_ascii=False,
+                        )
+
+                    lines = [
+                        f"❌ Multiple Slack channels match '{channel}'.",
+                        "Please re-run using the exact channel ID:",
+                        "",
+                    ]
+                    for c in matches[:20]:
+                        lines.append(
+                            f"- #{getattr(c, 'name', '') or 'unknown'} (ID: `{getattr(c, 'channel_id', '')}`; workspace: {getattr(c, 'workspace_id', '')})"
+                        )
+                    return "\n".join(lines)
+
+                ch = matches[0]
                 channel_id = ch.channel_id
                 logger.info(f"Found channel in DB: id={channel_id}, name={ch.name}")
 
@@ -717,7 +864,7 @@ class WorkforceTools:
         messages = self.get_channel_messages(channel, limit)
         return f"Channel Summary Request:\n{messages}\n\nPlease provide a summary of the key topics, decisions, and action items discussed."
     
-    def search_slack_messages(self, query: str, channel: Optional[str] = None, limit: int = 10) -> str:
+    def search_slack_messages(self, query: str, channel: Optional[str] = None, limit: int = 10, workflow_mode: bool = False) -> str:
         """Search Slack messages in the database.
         
         Args:
@@ -741,12 +888,52 @@ class WorkforceTools:
                     if err:
                         return f"❌ {err}"
                     normalized = self._normalize_slack_channel(channel)
-                    db_query = db_query.filter(
-                        or_(
-                            Channel.name == normalized,
-                            Channel.channel_id == channel,
+
+                    looks_like_id = str(channel or "").startswith("C") or str(channel or "").startswith("G")
+                    if not looks_like_id:
+                        matches = (
+                            session.query(Channel)
+                            .filter(or_(Channel.name == normalized, Channel.name_normalized == normalized))
+                            .all()
                         )
-                    )
+                        if not matches:
+                            return f"❌ Channel '{channel}' not found in synced Slack data."
+                        if len(matches) > 1:
+                            if workflow_mode:
+                                import json
+                                options = [
+                                    {
+                                        "label": f"#{getattr(c, 'name', '') or 'unknown'} ({getattr(c, 'workspace_id', '')})",
+                                        "value": getattr(c, "channel_id", ""),
+                                        "meta": {"workspace_id": getattr(c, "workspace_id", None), "is_private": getattr(c, "is_private", None)},
+                                    }
+                                    for c in matches[:20]
+                                ]
+                                return json.dumps(
+                                    {
+                                        "__workforce_conflict__": True,
+                                        "title": f"Multiple Slack channels match '{channel}'",
+                                        "message": "Select the correct channel to search.",
+                                        "options": options,
+                                        "patch_key": "channel",
+                                    },
+                                    ensure_ascii=False,
+                                )
+
+                            lines = [
+                                f"❌ Multiple Slack channels match '{channel}'.",
+                                "Please re-run using the exact channel ID:",
+                                "",
+                            ]
+                            for c in matches[:20]:
+                                lines.append(
+                                    f"- #{getattr(c, 'name', '') or 'unknown'} (ID: `{getattr(c, 'channel_id', '')}`; workspace: {getattr(c, 'workspace_id', '')})"
+                                )
+                            return "\n".join(lines)
+
+                        db_query = db_query.filter(Message.channel_id == matches[0].channel_id)
+                    else:
+                        db_query = db_query.filter(Message.channel_id == channel)
                 
                 # Text search
                 if query:
@@ -1109,7 +1296,7 @@ class WorkforceTools:
 
             headers = {
                 "Authorization": f"Bearer {Config.NOTION_TOKEN}",
-                "Notion-Version": "2022-06-28",
+                "Notion-Version": Config.NOTION_VERSION,
                 "Content-Type": "application/json",
             }
 
@@ -1204,7 +1391,7 @@ class WorkforceTools:
             # Use Notion search API to list pages, ordered by last edited time
             headers = {
                 "Authorization": f"Bearer {Config.NOTION_TOKEN}",
-                "Notion-Version": "2022-06-28",
+                "Notion-Version": Config.NOTION_VERSION,
                 "Content-Type": "application/json",
             }
 
@@ -1265,13 +1452,13 @@ class WorkforceTools:
 
             headers = {
                 "Authorization": f"Bearer {Config.NOTION_TOKEN}",
-                "Notion-Version": "2022-06-28",
+                "Notion-Version": Config.NOTION_VERSION,
                 "Content-Type": "application/json",
             }
 
             payload = {
                 "page_size": min(max(limit, 1), 100),
-                "filter": {"property": "object", "value": "database"},
+                "filter": {"property": "object", "value": "data_source"},
                 "sort": {"direction": "descending", "timestamp": "last_edited_time"},
             }
 
@@ -1840,6 +2027,12 @@ class WorkforceTools:
             
             # Build filter if specified
             filter_obj = None
+            if filter_property and filter_value:
+                resolved_filter, filter_err = _resolve_notion_property_name(schema, filter_property)
+                if filter_err:
+                    return filter_err
+                filter_property = resolved_filter or filter_property
+
             if filter_property and filter_value and filter_property in schema:
                 prop_type = schema[filter_property].get("type")
                 if prop_type in ("title", "rich_text"):
@@ -1875,8 +2068,34 @@ class WorkforceTools:
                     if original_id and original_id != normalized_id:
                         logger.info(f"Found original database: {original_id}")
                         normalized_id = original_id
-                        db_meta = original_db
-                        schema = db_meta.get("properties", {})
+                        db_meta = self.notion_client.get_database(normalized_id) or original_db
+                        schema = db_meta.get("properties", {}) if db_meta else {}
+
+                        # Rebuild filter using updated schema (if any)
+                        filter_obj = None
+                        if filter_property and filter_value:
+                            resolved_filter, filter_err = _resolve_notion_property_name(schema, filter_property)
+                            if filter_err:
+                                return filter_err
+                            filter_property = resolved_filter or filter_property
+                            if filter_property in schema:
+                                prop_type = schema[filter_property].get("type")
+                                if prop_type in ("title", "rich_text"):
+                                    filter_obj = {
+                                        "property": filter_property,
+                                        prop_type: {"contains": filter_value},
+                                    }
+                                elif prop_type == "select":
+                                    filter_obj = {
+                                        "property": filter_property,
+                                        "select": {"equals": filter_value},
+                                    }
+                                elif prop_type == "status":
+                                    filter_obj = {
+                                        "property": filter_property,
+                                        "status": {"equals": filter_value},
+                                    }
+
                         entries = self.notion_client.query_database(
                             normalized_id,
                             filter_obj=filter_obj,
@@ -1959,7 +2178,12 @@ class WorkforceTools:
             if not self.notion_client or not self.notion_client.test_connection():
                 return "❌ Notion not connected"
             
-            search_lower = search_text.lower()
+            raw_query = (search_text or "").strip()
+            if not database_hint:
+                inferred_hint = _extract_notion_title_prefix(raw_query)
+                if inferred_hint:
+                    database_hint = inferred_hint
+            search_lower = raw_query.lower()
             found_entries = []
             
             # Get all databases
@@ -2001,32 +2225,62 @@ class WorkforceTools:
                             title_col = col_name
                             break
                     
+                    db_matches = []
                     for entry in entries:
                         formatted = self.notion_client.format_database_entry(entry)
                         props = formatted["properties"]
-                        
-                        # Check if search_text matches any property
-                        for col, val in props.items():
-                            if val and search_lower in str(val).lower():
-                                found_entries.append({
-                                    "database_id": db_id,
-                                    "database_title": db_title,
-                                    "entry_id": entry.get("id"),
-                                    "entry_title": props.get(title_col, "Entry") if title_col else "Entry",
-                                    "properties": props,
-                                    "title_col": title_col,
-                                })
+
+                        entry_title = props.get(title_col, "Entry") if title_col else "Entry"
+                        title_score = _notion_title_match_score(raw_query, str(entry_title))
+
+                        prop_match = False
+                        if search_lower:
+                            for _, val in props.items():
+                                if val and search_lower in str(val).lower():
+                                    prop_match = True
+                                    break
+
+                        if title_score >= 68 or prop_match:
+                            db_matches.append({
+                                "database_id": db_id,
+                                "database_title": db_title,
+                                "entry_id": entry.get("id"),
+                                "entry_title": entry_title,
+                                "properties": props,
+                                "title_col": title_col,
+                                "match_score": title_score,
+                                "last_edited_time": entry.get("last_edited_time"),
+                                "url": entry.get("url"),
+                            })
+
+                    if db_matches:
+                        found_entries.extend(db_matches)
+
+                        # If we found a strong match, stop scanning more databases.
+                        try:
+                            if max(int(m.get("match_score") or 0) for m in db_matches) >= 98:
                                 break
+                        except Exception:
+                            break
                 except Exception as db_err:
                     logger.debug(f"Could not query database {db_id}: {db_err}")
                     continue
                 
-                # If we found matches, don't search more databases
-                if found_entries:
-                    break
+                # Otherwise, keep scanning more databases for a better match.
             
             if not found_entries:
                 return f"❌ Could not find any entry matching '{search_text}' in your Notion databases."
+
+            try:
+                found_entries.sort(
+                    key=lambda e: (
+                        int(e.get("match_score") or 0),
+                        str(e.get("last_edited_time") or ""),
+                    ),
+                    reverse=True,
+                )
+            except Exception:
+                pass
             
             # Format output with all needed IDs
             lines = [
@@ -2039,6 +2293,8 @@ class WorkforceTools:
                 lines.append(f"- **Database**: {entry['database_title']}")
                 lines.append(f"- **Database ID**: `{entry['database_id']}`")
                 lines.append(f"- **Entry ID**: `{entry['entry_id']}`")
+                if entry.get("url"):
+                    lines.append(f"- **URL**: {entry['url']}")
                 lines.append("")
                 lines.append("**Properties:**")
                 for prop_name, prop_val in entry["properties"].items():
@@ -2051,12 +2307,15 @@ class WorkforceTools:
             if found_entries:
                 entry = found_entries[0]
                 lines.append("")
-                lines.append("💡 **To update this entry**, use `update_notion_entry_by_name` with:")
-                lines.append(f"- `database_id`: `{entry['database_id']}`")
-                lines.append(f"- `entry_name`: `{entry['entry_title']}`")
+                lines.append("💡 **To update this EXACT entry (recommended)**, use `update_notion_database_entry` with:")
+                lines.append(f"- `entry_id`: `{entry['entry_id']}`")
                 lines.append("- `property_name`: (the property you want to change)")
                 lines.append("- `new_value`: (the new value)")
-            
+                lines.append("")
+                lines.append("💡 **Alternative (name-based)**: `update_notion_entry_by_name` with:")
+                lines.append(f"- `database_id`: `{entry['database_id']}`")
+                lines.append(f"- `entry_name`: `{entry['entry_title']}`")
+
             return "\n".join(lines)
             
         except Exception as e:
@@ -2221,6 +2480,8 @@ class WorkforceTools:
             if not self.notion_client or not self.notion_client.test_connection():
                 return "❌ Notion not connected"
 
+            old_value = None
+
             normalized_id = _normalize_notion_id(entry_id)
             if not normalized_id:
                 return "❌ Invalid entry_id. Please pass a Notion page ID or full Notion URL."
@@ -2228,7 +2489,7 @@ class WorkforceTools:
             import requests
             headers = {
                 "Authorization": f"Bearer {Config.NOTION_TOKEN}",
-                "Notion-Version": "2022-06-28",
+                "Notion-Version": Config.NOTION_VERSION,
             }
 
             # Get the page to find its parent database and determine property type
@@ -2243,18 +2504,33 @@ class WorkforceTools:
             parent = page_data.get("parent", {})
 
             # If it's a database item, get the database schema
-            if parent.get("type") == "database_id":
+            if parent.get("type") in {"database_id", "data_source_id"}:
                 db_id = parent.get("database_id")
                 db_meta = self.notion_client.get_database(db_id)
                 if db_meta:
                     schema = db_meta.get("properties", {})
-                    if property_name not in schema:
-                        available = ", ".join(schema.keys())
-                        return f"❌ Property '{property_name}' not found. Available: {available}"
+
+                    resolved_prop, prop_err = _resolve_notion_property_name(schema, property_name)
+                    if prop_err:
+                        return prop_err
+                    property_name = resolved_prop or property_name
+
+                    # Extract old value from the live page payload
+                    try:
+                        old_prop = (page_data.get("properties", {}) or {}).get(property_name)
+                        old_value = self.notion_client.extract_property_value(old_prop) if old_prop else None
+                    except Exception:
+                        old_value = None
 
                     # Auto-detect property type if not provided
                     if not property_type:
                         property_type = schema[property_name].get("type")
+
+            else:
+                return (
+                    "❌ This page is not a database row (parent is not a database). "
+                    "Use a page-content tool (e.g., update_notion_page_content) instead."
+                )
 
             if not property_type:
                 property_type = "rich_text"  # Default fallback
@@ -2269,12 +2545,100 @@ class WorkforceTools:
             result = self.notion_client.update_database_entry(normalized_id, properties)
 
             if result:
-                return f"✅ Updated '{property_name}' to '{new_value}' for entry {normalized_id}"
+                old_str = "<empty>" if old_value is None or old_value == "" or old_value == [] else str(old_value)
+                return (
+                    f"✅ Updated Notion entry `{normalized_id}`\n"
+                    f"- **{property_name}**: {old_str} → {new_value}"
+                )
             else:
                 return f"❌ Failed to update entry. Check that you have edit access."
 
         except Exception as e:
             logger.error(f"Error updating database entry: {e}", exc_info=True)
+            return f"❌ Error: {str(e)}"
+
+    def update_notion_database_entry_properties(self, entry_id: str, updates_json: str) -> str:
+        try:
+            if not self.notion_client or not self.notion_client.test_connection():
+                return "❌ Notion not connected"
+
+            normalized_id = _normalize_notion_id(entry_id)
+            if not normalized_id:
+                return "❌ Invalid entry_id. Please pass a Notion page ID or full Notion URL."
+
+            try:
+                updates = json.loads(updates_json or "{}")
+            except Exception:
+                return "❌ Invalid updates_json. It must be a JSON object mapping property names to simple values."
+
+            if not isinstance(updates, dict) or not updates:
+                return "❌ updates_json must be a non-empty JSON object"
+
+            import requests
+            headers = {
+                "Authorization": f"Bearer {Config.NOTION_TOKEN}",
+                "Notion-Version": Config.NOTION_VERSION,
+            }
+
+            page_resp = requests.get(
+                f"https://api.notion.com/v1/pages/{normalized_id}",
+                headers=headers,
+                timeout=30,
+            )
+            if page_resp.status_code != 200:
+                return f"❌ Could not find entry {entry_id}"
+
+            page_data = page_resp.json() or {}
+            parent = page_data.get("parent", {}) or {}
+            if parent.get("type") not in {"database_id", "data_source_id"}:
+                return "❌ This page is not a database row (parent is not a database)."
+
+            db_id = parent.get("database_id")
+            if not db_id:
+                return "❌ Could not determine parent database_id for this entry."
+
+            db_meta = self.notion_client.get_database(db_id)
+            if not db_meta:
+                return f"❌ Could not fetch database schema for {db_id}"
+
+            schema = (db_meta.get("properties") or {}) if isinstance(db_meta, dict) else {}
+            if not schema:
+                return "❌ Database schema is empty or unavailable."
+
+            live_props = (page_data.get("properties") or {}) if isinstance(page_data, dict) else {}
+
+            properties_payload: Dict[str, Any] = {}
+            changes: List[str] = []
+            for raw_name, raw_val in updates.items():
+                resolved_name, err = _resolve_notion_property_name(schema, str(raw_name))
+                if err:
+                    return err
+
+                prop_name = resolved_name or str(raw_name)
+                prop_type = (schema.get(prop_name) or {}).get("type") or "rich_text"
+
+                old_val = None
+                try:
+                    old_val = self.notion_client.extract_property_value(live_props.get(prop_name))
+                except Exception:
+                    old_val = None
+
+                prop_update = self.notion_client.build_property_update(prop_type, raw_val)
+                if not prop_update:
+                    return f"❌ Property type '{prop_type}' is not supported for updates"
+
+                properties_payload[prop_name] = prop_update
+                old_str = "<empty>" if old_val is None or old_val == "" or old_val == [] else str(old_val)
+                changes.append(f"- {prop_name}: {old_str} → {raw_val}")
+
+            ok = self.notion_client.update_database_entry(normalized_id, properties_payload)
+            if not ok:
+                return "❌ Failed to update entry. Check that you have edit access."
+
+            return "✅ Updated Notion entry properties\n" + "\n".join(changes)
+
+        except Exception as e:
+            logger.error("Error updating Notion entry properties: %s", e, exc_info=True)
             return f"❌ Error: {str(e)}"
 
     def get_notion_page_content(
@@ -2320,7 +2684,7 @@ class WorkforceTools:
 
             headers = {
                 "Authorization": f"Bearer {Config.NOTION_TOKEN}",
-                "Notion-Version": "2022-06-28",
+                "Notion-Version": Config.NOTION_VERSION,
             }
 
             text_lines: List[str] = []
@@ -2687,7 +3051,7 @@ class WorkforceTools:
 
             headers = {
                 "Authorization": f"Bearer {Config.NOTION_TOKEN}",
-                "Notion-Version": "2022-06-28",
+                "Notion-Version": Config.NOTION_VERSION,
                 "Content-Type": "application/json",
             }
 
@@ -2829,7 +3193,7 @@ class WorkforceTools:
                 f"https://api.notion.com/v1/pages/{page_id}",
                 headers={
                     "Authorization": f"Bearer {Config.NOTION_TOKEN}",
-                    "Notion-Version": "2022-06-28",
+                    "Notion-Version": Config.NOTION_VERSION,
                     "Content-Type": "application/json"
                 },
                 json={
@@ -2855,6 +3219,7 @@ class WorkforceTools:
         filter_json: Optional[str] = None,
         page_size: int = 100,
         search_text: Optional[str] = None,
+        sort_json: Optional[str] = None,
     ) -> str:
         """Query a Notion database and list matching rows with ALL properties.
         
@@ -2863,6 +3228,7 @@ class WorkforceTools:
             filter_json: Optional Notion filter object as JSON string
             page_size: Maximum number of rows to return (default 100)
             search_text: Optional text to search for in entry names/titles
+            sort_json: Optional Notion sort array as JSON string, e.g. '[{"property":"Date","direction":"descending"}]'
         """
         try:
             if not self.notion_client or not self.notion_client.test_connection():
@@ -2893,6 +3259,14 @@ class WorkforceTools:
                 except json.JSONDecodeError:
                     return "❌ Invalid filter_json. It must be valid JSON representing a Notion filter object."
 
+            # Build sort if provided
+            sort_obj = None
+            if sort_json:
+                try:
+                    sort_obj = json.loads(sort_json)
+                except json.JSONDecodeError:
+                    return "❌ Invalid sort_json. It must be valid JSON representing a Notion sorts array."
+
             # Order columns: title first, then others
             title_col = None
             other_cols = []
@@ -2907,6 +3281,7 @@ class WorkforceTools:
             entries = self.notion_client.query_database(
                 normalized_id,
                 filter_obj=filter_obj,
+                sorts=sort_obj,
                 max_results=min(max(page_size, 1), 500),  # Get up to 500 entries
             )
 
@@ -2991,7 +3366,7 @@ class WorkforceTools:
                 f"https://api.notion.com/v1/pages/{page_id}",
                 headers={
                     "Authorization": f"Bearer {Config.NOTION_TOKEN}",
-                    "Notion-Version": "2022-06-28",
+                    "Notion-Version": Config.NOTION_VERSION,
                     "Content-Type": "application/json",
                 },
                 json={"properties": properties},
@@ -3015,6 +3390,8 @@ class WorkforceTools:
         property_name: str,
         new_value: Any,
         property_type: Optional[str] = None,
+        entry_id: Optional[str] = None,
+        workflow_mode: bool = False,
     ) -> str:
         """Find a database entry by name/title and update a specific property.
         
@@ -3057,6 +3434,86 @@ class WorkforceTools:
                 if col_schema.get("type") == "title":
                     title_col = col_name
                     break
+
+            def build_properties_payload(detected_type: str) -> Dict[str, Any]:
+                properties_payload: Dict[str, Any] = {}
+                if detected_type == "number":
+                    try:
+                        num_val = float(new_value) if "." in str(new_value) else int(new_value)
+                    except (ValueError, TypeError):
+                        num_val = new_value
+                    properties_payload[property_name] = {"number": num_val}
+                elif detected_type == "rich_text":
+                    properties_payload[property_name] = {
+                        "rich_text": [{"text": {"content": str(new_value)}}]
+                    }
+                elif detected_type == "title":
+                    properties_payload[property_name] = {
+                        "title": [{"text": {"content": str(new_value)}}]
+                    }
+                elif detected_type == "select":
+                    properties_payload[property_name] = {"select": {"name": str(new_value)}}
+                elif detected_type == "status":
+                    properties_payload[property_name] = {"status": {"name": str(new_value)}}
+                elif detected_type == "multi_select":
+                    if isinstance(new_value, list):
+                        properties_payload[property_name] = {
+                            "multi_select": [{"name": str(v)} for v in new_value]
+                        }
+                    else:
+                        properties_payload[property_name] = {
+                            "multi_select": [{"name": str(new_value)}]
+                        }
+                elif detected_type == "checkbox":
+                    bool_val = (
+                        new_value
+                        if isinstance(new_value, bool)
+                        else str(new_value).lower() in ("true", "yes", "1")
+                    )
+                    properties_payload[property_name] = {"checkbox": bool_val}
+                elif detected_type == "url":
+                    properties_payload[property_name] = {"url": str(new_value)}
+                elif detected_type == "email":
+                    properties_payload[property_name] = {"email": str(new_value)}
+                elif detected_type == "phone_number":
+                    properties_payload[property_name] = {"phone_number": str(new_value)}
+                elif detected_type == "date":
+                    date_str = str(new_value)
+                    properties_payload[property_name] = {"date": {"start": date_str}}
+                else:
+                    properties_payload[property_name] = {
+                        "rich_text": [{"text": {"content": str(new_value)}}]
+                    }
+                return properties_payload
+
+            normalized_entry_id = _normalize_notion_id(entry_id) if entry_id else None
+            if entry_id and not normalized_entry_id:
+                return "❌ Invalid entry_id."
+
+            prop_schema = schema.get(property_name, {})
+            detected_type = prop_schema.get("type") or property_type or "rich_text"
+            properties_payload = build_properties_payload(detected_type)
+
+            if normalized_entry_id:
+                response = requests.patch(
+                    f"https://api.notion.com/v1/pages/{normalized_entry_id}",
+                    headers={
+                        "Authorization": f"Bearer {Config.NOTION_TOKEN}",
+                        "Notion-Version": Config.NOTION_VERSION,
+                        "Content-Type": "application/json",
+                    },
+                    json={"properties": properties_payload},
+                    timeout=30,
+                )
+                if response.status_code == 200:
+                    return (
+                        f"✅ Updated '{entry_name}'\n"
+                        f"- **{property_name}** → {new_value}\n"
+                        f"- Entry ID: `{normalized_entry_id}`"
+                    )
+                error_text = response.text[:300]
+                logger.error(f"Notion update error {response.status_code}: {error_text}")
+                return f"❌ Notion API error {response.status_code}: {error_text}"
             
             # Query database to find the entry
             entries = self.notion_client.query_database(normalized_id, max_results=500)
@@ -3064,48 +3521,106 @@ class WorkforceTools:
             if not entries:
                 return f"❌ No entries found in database"
             
-            # Find matching entry by name
-            matching_entry = None
+            # Find best matching entry by name (score-based to avoid wrong row)
             raw_name = (entry_name or "").strip()
-            entry_name_lower = raw_name.lower()
-            candidates: List[str] = []
-            if entry_name_lower:
-                candidates.append(entry_name_lower)
-                try:
-                    stripped = re.sub(r"^\[[^\]]+\]\s*", "", entry_name_lower).strip()
-                    if stripped and stripped not in candidates:
-                        candidates.append(stripped)
-                except Exception:
-                    pass
+            if not raw_name:
+                return "❌ entry_name is required"
+
+            scored: List[Dict[str, Any]] = []
+            raw_lower = raw_name.lower()
+            raw_stripped = _strip_notion_title_prefix(raw_lower)
             for entry in entries:
                 formatted = self.notion_client.format_database_entry(entry)
-                props = formatted.get("properties", {}) if isinstance(formatted, dict) else {}
-                
-                # Check title column
-                if title_col:
-                    title_val = props.get(title_col, "")
-                    title_lower = str(title_val).lower() if title_val else ""
-                    if title_lower:
-                        for c in candidates:
-                            if c and (c in title_lower or title_lower in c):
-                                matching_entry = entry
+                props = formatted["properties"]
+
+                title_val = str(props.get(title_col, "")) if title_col else ""
+                score = _notion_title_match_score(raw_name, title_val) if title_val else 0
+
+                # Only use property matches as a weaker fallback.
+                if score < 68:
+                    try:
+                        prop_hit = False
+                        for _, v in props.items():
+                            if not v:
+                                continue
+                            v_lower = str(v).lower()
+                            if raw_lower and raw_lower in v_lower:
+                                prop_hit = True
                                 break
-                        if matching_entry:
-                            break
-                
-                # Also check any text property that contains the name
-                for _, val in props.items():
-                    if not val:
-                        continue
-                    v_lower = str(val).lower()
-                    for c in candidates:
-                        if c and (c in v_lower or v_lower in c):
-                            matching_entry = entry
-                            break
-                    if matching_entry:
-                        break
-                if matching_entry:
-                    break
+                            if raw_stripped and raw_stripped in v_lower:
+                                prop_hit = True
+                                break
+                        if prop_hit:
+                            score = max(score, 60)
+                    except Exception:
+                        pass
+
+                if score > 0:
+                    scored.append(
+                        {
+                            "entry": entry,
+                            "entry_id": entry.get("id"),
+                            "entry_title": title_val or "Entry",
+                            "score": score,
+                            "last_edited_time": entry.get("last_edited_time"),
+                            "url": entry.get("url"),
+                        }
+                    )
+
+            if not scored:
+                return f"❌ Could not find entry '{entry_name}' in database"
+
+            try:
+                scored.sort(
+                    key=lambda e: (
+                        int(e.get("score") or 0),
+                        str(e.get("last_edited_time") or ""),
+                    ),
+                    reverse=True,
+                )
+            except Exception:
+                pass
+
+            best_score = int(scored[0].get("score") or 0)
+            if best_score < 68:
+                return f"❌ Could not find entry '{entry_name}' in database"
+
+            tied = [e for e in scored if int(e.get("score") or 0) == best_score]
+            if len(tied) > 1 and best_score < 98:
+                if workflow_mode:
+                    import json
+                    options = []
+                    for cand in tied[:10]:
+                        options.append(
+                            {
+                                "label": str(cand.get("entry_title") or "Entry"),
+                                "value": str(cand.get("entry_id") or ""),
+                                "meta": {"url": cand.get("url")},
+                            }
+                        )
+                    return json.dumps(
+                        {
+                            "__workforce_conflict__": True,
+                            "title": f"Multiple Notion rows match '{entry_name}'",
+                            "message": "Select the correct row to update.",
+                            "options": options,
+                            "patch_key": "entry_id",
+                        },
+                        ensure_ascii=False,
+                    )
+
+                lines = [
+                    f"❌ Multiple entries match '{entry_name}' equally well.",
+                    "Please re-run with the exact row page_id using `entry_id`:",
+                    "",
+                ]
+                for cand in tied[:10]:
+                    lines.append(f"- {cand.get('entry_title')} (Row Page ID: `{cand.get('entry_id')}`)")
+                    if cand.get("url"):
+                        lines.append(f"  URL: {cand.get('url')}")
+                return "\n".join(lines)
+
+            matching_entry = scored[0]["entry"]
             
             if not matching_entry:
                 return f"❌ Could not find entry '{entry_name}' in database"
@@ -3114,76 +3629,14 @@ class WorkforceTools:
             if not entry_id:
                 return f"❌ Entry found but has no ID"
             
-            # Get the property schema to determine type
-            prop_schema = schema.get(property_name, {})
-            detected_type = prop_schema.get("type") or property_type or "rich_text"
-            
-            # Build the proper Notion property update payload
-            properties_payload = {}
-            
-            if detected_type == "number":
-                try:
-                    num_val = float(new_value) if "." in str(new_value) else int(new_value)
-                except (ValueError, TypeError):
-                    num_val = new_value
-                properties_payload[property_name] = {"number": num_val}
-                
-            elif detected_type == "rich_text":
-                properties_payload[property_name] = {
-                    "rich_text": [{"text": {"content": str(new_value)}}]
-                }
-                
-            elif detected_type == "title":
-                properties_payload[property_name] = {
-                    "title": [{"text": {"content": str(new_value)}}]
-                }
-                
-            elif detected_type == "select":
-                properties_payload[property_name] = {"select": {"name": str(new_value)}}
-                
-            elif detected_type == "status":
-                properties_payload[property_name] = {"status": {"name": str(new_value)}}
-                
-            elif detected_type == "multi_select":
-                if isinstance(new_value, list):
-                    properties_payload[property_name] = {
-                        "multi_select": [{"name": str(v)} for v in new_value]
-                    }
-                else:
-                    properties_payload[property_name] = {
-                        "multi_select": [{"name": str(new_value)}]
-                    }
-                    
-            elif detected_type == "checkbox":
-                bool_val = new_value if isinstance(new_value, bool) else str(new_value).lower() in ("true", "yes", "1")
-                properties_payload[property_name] = {"checkbox": bool_val}
-                
-            elif detected_type == "url":
-                properties_payload[property_name] = {"url": str(new_value)}
-                
-            elif detected_type == "email":
-                properties_payload[property_name] = {"email": str(new_value)}
-                
-            elif detected_type == "phone_number":
-                properties_payload[property_name] = {"phone_number": str(new_value)}
-                
-            elif detected_type == "date":
-                # Handle date - expect ISO format or simple date string
-                date_str = str(new_value)
-                properties_payload[property_name] = {"date": {"start": date_str}}
-                
-            else:
-                # Default to rich_text
-                properties_payload[property_name] = {
-                    "rich_text": [{"text": {"content": str(new_value)}}]
-                }
+            properties_payload = properties_payload
             
             # Execute the update
             response = requests.patch(
                 f"https://api.notion.com/v1/pages/{entry_id}",
                 headers={
                     "Authorization": f"Bearer {Config.NOTION_TOKEN}",
-                    "Notion-Version": "2022-06-28",
+                    "Notion-Version": Config.NOTION_VERSION,
                     "Content-Type": "application/json",
                 },
                 json={"properties": properties_payload},
@@ -3194,7 +3647,17 @@ class WorkforceTools:
                 # Get the entry name for confirmation
                 formatted = self.notion_client.format_database_entry(matching_entry)
                 entry_title = formatted["properties"].get(title_col, entry_name) if title_col else entry_name
-                return f"✅ Updated '{entry_title}':\n- **{property_name}**: {new_value}\n- Entry ID: `{entry_id}`"
+                old_value = None
+                try:
+                    old_value = formatted.get("properties", {}).get(property_name)
+                except Exception:
+                    old_value = None
+                old_str = "<empty>" if old_value is None or old_value == "" or old_value == [] else str(old_value)
+                return (
+                    f"✅ Updated '{entry_title}'\n"
+                    f"- **{property_name}**: {old_str} → {new_value}\n"
+                    f"- Entry ID: `{entry_id}`"
+                )
             else:
                 error_text = response.text[:300]
                 logger.error(f"Notion update error {response.status_code}: {error_text}")
@@ -3210,6 +3673,8 @@ class WorkforceTools:
         entry_name: str,
         content: str,
         mode: str = "replace",
+        entry_id: Optional[str] = None,
+        workflow_mode: bool = False,
     ) -> str:
         try:
             if not self.notion_client or not self.notion_client.test_connection():
@@ -3248,30 +3713,99 @@ class WorkforceTools:
                         candidates.append(stripped)
                 except Exception:
                     pass
-            matching_entry = None
-
+            scored: List[Dict[str, Any]] = []
+            raw_stripped = _strip_notion_title_prefix(entry_name_lower)
             for entry in entries:
                 formatted = self.notion_client.format_database_entry(entry)
                 props = formatted.get("properties", {}) if isinstance(formatted, dict) else {}
 
-                if title_col:
-                    title_val = props.get(title_col, "")
-                    if title_val and entry_name_lower in str(title_val).lower():
-                        matching_entry = entry
-                        break
+                title_val = str(props.get(title_col, "")) if title_col else ""
+                score = _notion_title_match_score(raw_name, title_val) if title_val else 0
 
-                for _, val in props.items():
-                    if not val:
-                        continue
-                    v_lower = str(val).lower()
-                    for c in candidates:
-                        if c and (c in v_lower or v_lower in c):
-                            matching_entry = entry
-                            break
-                    if matching_entry:
-                        break
-                if matching_entry:
-                    break
+                if score < 68:
+                    try:
+                        prop_hit = False
+                        for _, v in props.items():
+                            if not v:
+                                continue
+                            v_lower = str(v).lower()
+                            if entry_name_lower and entry_name_lower in v_lower:
+                                prop_hit = True
+                                break
+                            if raw_stripped and raw_stripped in v_lower:
+                                prop_hit = True
+                                break
+                        if prop_hit:
+                            score = max(score, 60)
+                    except Exception:
+                        pass
+
+                if score > 0:
+                    scored.append(
+                        {
+                            "entry": entry,
+                            "entry_id": entry.get("id"),
+                            "entry_title": title_val or "Entry",
+                            "score": score,
+                            "last_edited_time": entry.get("last_edited_time"),
+                            "url": entry.get("url"),
+                        }
+                    )
+
+            if not scored:
+                return f"❌ Could not find entry '{entry_name}' in database"
+
+            try:
+                scored.sort(
+                    key=lambda e: (
+                        int(e.get("score") or 0),
+                        str(e.get("last_edited_time") or ""),
+                    ),
+                    reverse=True,
+                )
+            except Exception:
+                pass
+
+            best_score = int(scored[0].get("score") or 0)
+            if best_score < 68:
+                return f"❌ Could not find entry '{entry_name}' in database"
+
+            tied = [e for e in scored if int(e.get("score") or 0) == best_score]
+            if len(tied) > 1 and best_score < 98:
+                if workflow_mode:
+                    import json
+                    options = []
+                    for cand in tied[:10]:
+                        options.append(
+                            {
+                                "label": str(cand.get("entry_title") or "Entry"),
+                                "value": str(cand.get("entry_id") or ""),
+                                "meta": {"url": cand.get("url")},
+                            }
+                        )
+                    return json.dumps(
+                        {
+                            "__workforce_conflict__": True,
+                            "title": f"Multiple Notion rows match '{entry_name}'",
+                            "message": "Select the correct row to update.",
+                            "options": options,
+                            "patch_key": "entry_id",
+                        },
+                        ensure_ascii=False,
+                    )
+
+                lines = [
+                    f"❌ Multiple entries match '{entry_name}' equally well.",
+                    "Please use `update_notion_database_entry` with the exact `entry_id` from below:",
+                    "",
+                ]
+                for cand in tied[:5]:
+                    lines.append(f"- {cand.get('entry_title')} (Entry ID: `{cand.get('entry_id')}`)")
+                    if cand.get("url"):
+                        lines.append(f"  URL: {cand.get('url')}")
+                return "\n".join(lines)
+
+            matching_entry = scored[0]["entry"]
 
             if not matching_entry:
                 return f"❌ Could not find entry '{entry_name}' in database"
@@ -3307,8 +3841,6 @@ class WorkforceTools:
             Success message with new entry ID or error
         """
         try:
-            import requests
-            
             if not self.notion_client or not self.notion_client.test_connection():
                 return "❌ Notion not connected"
             
@@ -3377,28 +3909,16 @@ class WorkforceTools:
                     }
             
             # Create the page (entry)
-            response = requests.post(
-                "https://api.notion.com/v1/pages",
-                headers={
-                    "Authorization": f"Bearer {Config.NOTION_TOKEN}",
-                    "Notion-Version": "2022-06-28",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "parent": {"database_id": normalized_id},
-                    "properties": properties_payload,
-                },
-                timeout=30,
+            new_entry = self.notion_client.create_database_entry(
+                database_id=normalized_id,
+                properties=properties_payload,
             )
-            
-            if response.status_code == 200:
-                new_entry = response.json()
+
+            if new_entry and isinstance(new_entry, dict):
                 entry_id = new_entry.get("id")
                 return f"✅ Created new database entry!\n- Entry ID: `{entry_id}`\n- Properties: {list(properties.keys())}"
-            else:
-                error_text = response.text[:300]
-                logger.error(f"Notion create error {response.status_code}: {error_text}")
-                return f"❌ Notion API error {response.status_code}: {error_text}"
+
+            return "❌ Failed to create entry. Check integration access and ensure the database/data source is shared."
                 
         except Exception as e:
             logger.error(f"Error creating Notion entry: {e}", exc_info=True)
@@ -3429,7 +3949,7 @@ class WorkforceTools:
                 f"https://api.notion.com/v1/pages/{normalized_id}",
                 headers={
                     "Authorization": f"Bearer {Config.NOTION_TOKEN}",
-                    "Notion-Version": "2022-06-28",
+                    "Notion-Version": Config.NOTION_VERSION,
                     "Content-Type": "application/json",
                 },
                 json={"archived": True},
@@ -3446,6 +3966,707 @@ class WorkforceTools:
             logger.error(f"Error archiving Notion entry: {e}", exc_info=True)
             return f"❌ Error: {str(e)}"
     
+    # ========================================
+    # NOTION ADVANCED TOOLS - Dec 2025
+    # ========================================
+
+    def get_notion_structured_context(
+        self,
+        page_id: str,
+        include_blocks: bool = True,
+        include_database_rows: bool = True,
+        max_depth: int = 3,
+    ) -> str:
+        """Get structured JSON context of a Notion page or database for precise AI operations.
+        
+        Returns complete metadata, block tree with IDs (for pages), or schema + rows (for databases).
+        This is the preferred tool for understanding Notion content before making edits.
+        
+        Args:
+            page_id: Notion page or database ID
+            include_blocks: Whether to include block tree with IDs (for pages)
+            include_database_rows: Whether to include all rows (for databases)
+            max_depth: Maximum block recursion depth
+        
+        Returns:
+            JSON string with structured context including all IDs for targeted updates
+        """
+        try:
+            if not self.notion_client or not self.notion_client.test_connection():
+                return json.dumps({"error": "Notion not connected"})
+            
+            normalized_id = _normalize_notion_id(page_id)
+            if not normalized_id:
+                return json.dumps({"error": "Invalid page_id"})
+            
+            # Check if it's a database first
+            db_meta = self.notion_client.get_database(normalized_id)
+            
+            if db_meta:
+                # It's a database - return schema and optionally rows
+                schema = db_meta.get("properties", {})
+                title_parts = db_meta.get("title", [])
+                db_title = "".join(t.get("plain_text", "") for t in title_parts) or "Untitled Database"
+                
+                result = {
+                    "type": "database",
+                    "id": normalized_id,
+                    "title": db_title,
+                    "url": db_meta.get("url"),
+                    "icon": db_meta.get("icon"),
+                    "cover": db_meta.get("cover"),
+                    "schema": {},
+                }
+                
+                # Build schema with property types and options
+                for prop_name, prop_schema in schema.items():
+                    prop_type = prop_schema.get("type")
+                    prop_info = {"type": prop_type, "id": prop_schema.get("id")}
+                    
+                    # Include options for select/multi_select/status
+                    if prop_type in ("select", "multi_select"):
+                        options = prop_schema.get(prop_type, {}).get("options", [])
+                        prop_info["options"] = [{"name": o.get("name"), "color": o.get("color")} for o in options]
+                    elif prop_type == "status":
+                        status_config = prop_schema.get("status", {})
+                        prop_info["options"] = [{"name": o.get("name"), "color": o.get("color")} for o in status_config.get("options", [])]
+                        prop_info["groups"] = [{"name": g.get("name"), "option_ids": g.get("option_ids", [])} for g in status_config.get("groups", [])]
+                    elif prop_type == "relation":
+                        rel_config = prop_schema.get("relation", {})
+                        prop_info["database_id"] = rel_config.get("database_id")
+                    
+                    result["schema"][prop_name] = prop_info
+                
+                # Include rows if requested
+                if include_database_rows:
+                    entries = self.notion_client.query_database(normalized_id, max_results=500)
+                    rows = []
+                    for entry in entries:
+                        formatted = self.notion_client.format_database_entry(entry)
+                        rows.append({
+                            "id": formatted["id"],
+                            "url": formatted["url"],
+                            "properties": formatted["properties"],
+                        })
+                    result["rows"] = rows
+                    result["row_count"] = len(rows)
+                
+                return json.dumps(result, ensure_ascii=False, indent=2)
+            
+            # It's a page - get page metadata and blocks
+            import requests
+            headers = {
+                "Authorization": f"Bearer {Config.NOTION_TOKEN}",
+                "Notion-Version": Config.NOTION_VERSION,
+            }
+            
+            # Get page metadata
+            page_resp = requests.get(
+                f"https://api.notion.com/v1/pages/{normalized_id}",
+                headers=headers,
+                timeout=30,
+            )
+            
+            if page_resp.status_code != 200:
+                return json.dumps({"error": f"Could not retrieve page: {page_resp.status_code}"})
+            
+            page_data = page_resp.json()
+            
+            # Extract title from properties
+            title = "Untitled"
+            for prop in page_data.get("properties", {}).values():
+                if prop.get("type") == "title":
+                    title_parts = prop.get("title", [])
+                    title = "".join(t.get("plain_text", "") for t in title_parts) or "Untitled"
+                    break
+            
+            result = {
+                "type": "page",
+                "id": normalized_id,
+                "title": title,
+                "url": page_data.get("url"),
+                "icon": page_data.get("icon"),
+                "cover": page_data.get("cover"),
+                "parent": page_data.get("parent"),
+                "created_time": page_data.get("created_time"),
+                "last_edited_time": page_data.get("last_edited_time"),
+            }
+            
+            # Include blocks if requested
+            if include_blocks:
+                blocks = self.notion_client.get_block_children(normalized_id, max_depth=max_depth)
+                result["blocks"] = self._simplify_blocks_for_context(blocks)
+                result["block_count"] = len(blocks)
+            
+            return json.dumps(result, ensure_ascii=False, indent=2)
+            
+        except Exception as e:
+            logger.error(f"Error getting structured Notion context: {e}", exc_info=True)
+            return json.dumps({"error": str(e)})
+
+    def _simplify_blocks_for_context(self, blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Simplify block data for AI context, keeping essential info and IDs."""
+        simplified = []
+        for block in blocks:
+            block_type = block.get("type")
+            block_id = block.get("id")
+            
+            simple_block = {
+                "id": block_id,
+                "type": block_type,
+            }
+            
+            # Extract text content for text blocks
+            if block_type in ("paragraph", "heading_1", "heading_2", "heading_3", 
+                              "bulleted_list_item", "numbered_list_item", "quote", "callout"):
+                block_data = block.get(block_type, {})
+                rich_text = block_data.get("rich_text", [])
+                text = "".join(rt.get("plain_text", "") for rt in rich_text)
+                simple_block["text"] = text
+                
+            # Extract to_do specific info
+            elif block_type == "to_do":
+                block_data = block.get("to_do", {})
+                rich_text = block_data.get("rich_text", [])
+                text = "".join(rt.get("plain_text", "") for rt in rich_text)
+                simple_block["text"] = text
+                simple_block["checked"] = block_data.get("checked", False)
+                
+            # Extract toggle info
+            elif block_type == "toggle":
+                block_data = block.get("toggle", {})
+                rich_text = block_data.get("rich_text", [])
+                text = "".join(rt.get("plain_text", "") for rt in rich_text)
+                simple_block["text"] = text
+                
+            # Extract code block info
+            elif block_type == "code":
+                block_data = block.get("code", {})
+                rich_text = block_data.get("rich_text", [])
+                code = "".join(rt.get("plain_text", "") for rt in rich_text)
+                simple_block["code"] = code
+                simple_block["language"] = block_data.get("language")
+                
+            # Extract child database info
+            elif block_type == "child_database":
+                simple_block["title"] = block.get("child_database", {}).get("title")
+                
+            # Extract child page info
+            elif block_type == "child_page":
+                simple_block["title"] = block.get("child_page", {}).get("title")
+            
+            # Include children if present
+            if "_children" in block:
+                simple_block["children"] = self._simplify_blocks_for_context(block["_children"])
+            
+            simplified.append(simple_block)
+        
+        return simplified
+
+    def update_notion_database_schema(
+        self,
+        database_id: str,
+        add_columns: Optional[Dict[str, str]] = None,
+        rename_columns: Optional[Dict[str, str]] = None,
+        remove_columns: Optional[List[str]] = None,
+    ) -> str:
+        """Update a Notion database schema (add/rename/remove columns).
+        
+        Args:
+            database_id: The database ID to update
+            add_columns: Dict of column name -> type (e.g., {"Notes": "rich_text", "Priority": "select"})
+                        Supported types: title, rich_text, number, select, multi_select, date, 
+                        people, files, checkbox, url, email, phone_number, relation
+            rename_columns: Dict of old name -> new name
+            remove_columns: List of column names to remove
+        
+        Returns:
+            Success message with details or error
+        """
+        try:
+            if not self.notion_client or not self.notion_client.test_connection():
+                return "❌ Notion not connected"
+            
+            normalized_id = _normalize_notion_id(database_id)
+            if not normalized_id:
+                return "❌ Invalid database_id"
+            
+            properties_updates = {}
+            changes_made = []
+            
+            # Add new columns
+            if add_columns:
+                for col_name, col_type in add_columns.items():
+                    if col_type in ("title", "rich_text", "number", "checkbox", "url", "email", "phone_number", "date", "files", "people"):
+                        properties_updates[col_name] = {col_type: {}}
+                        changes_made.append(f"Added column '{col_name}' ({col_type})")
+                    elif col_type in ("select", "multi_select"):
+                        properties_updates[col_name] = {col_type: {"options": []}}
+                        changes_made.append(f"Added column '{col_name}' ({col_type})")
+                    else:
+                        return f"❌ Unsupported column type: {col_type}"
+            
+            # Rename columns
+            if rename_columns:
+                for old_name, new_name in rename_columns.items():
+                    properties_updates[old_name] = {"name": new_name}
+                    changes_made.append(f"Renamed '{old_name}' → '{new_name}'")
+            
+            # Remove columns
+            if remove_columns:
+                for col_name in remove_columns:
+                    properties_updates[col_name] = None
+                    changes_made.append(f"Removed column '{col_name}'")
+            
+            if not properties_updates:
+                return "❌ No changes specified"
+            
+            result = self.notion_client.update_database_schema(normalized_id, properties_updates)
+            
+            if result:
+                return f"✅ Database schema updated:\n" + "\n".join(f"  - {c}" for c in changes_made)
+            else:
+                return "❌ Failed to update database schema"
+                
+        except Exception as e:
+            logger.error(f"Error updating database schema: {e}", exc_info=True)
+            return f"❌ Error: {str(e)}"
+
+    def update_notion_todo_checked(
+        self,
+        block_id: str,
+        checked: bool,
+    ) -> str:
+        """Update a to_do block's checked status.
+        
+        Args:
+            block_id: The to_do block ID (get from get_notion_structured_context)
+            checked: Whether the to_do should be checked (True/False)
+        
+        Returns:
+            Success message or error
+        """
+        try:
+            if not self.notion_client or not self.notion_client.test_connection():
+                return "❌ Notion not connected"
+            
+            normalized_id = _normalize_notion_id(block_id)
+            if not normalized_id:
+                return "❌ Invalid block_id"
+            
+            # Get current block to verify it's a to_do
+            block = self.notion_client.get_block(normalized_id)
+            if not block:
+                return f"❌ Could not find block {block_id}"
+            
+            if block.get("type") != "to_do":
+                return f"❌ Block is not a to_do block (type: {block.get('type')})"
+            
+            # Get current state for logging
+            old_checked = block.get("to_do", {}).get("checked", False)
+            text = "".join(rt.get("plain_text", "") for rt in block.get("to_do", {}).get("rich_text", []))
+            
+            if old_checked == checked:
+                status = "checked" if checked else "unchecked"
+                return f"ℹ️ To-do is already {status}: {text}"
+            
+            result = self.notion_client.update_todo_checked(normalized_id, checked)
+            
+            if result:
+                action = "checked" if checked else "unchecked"
+                return f"✅ To-do {action}: {text}\n  - Block ID: `{normalized_id}`"
+            else:
+                return "❌ Failed to update to_do block"
+                
+        except Exception as e:
+            logger.error(f"Error updating to_do block: {e}", exc_info=True)
+            return f"❌ Error: {str(e)}"
+
+    def update_notion_block_text(
+        self,
+        block_id: str,
+        new_text: str,
+    ) -> str:
+        """Update the text content of a Notion block.
+        
+        Works with: paragraph, heading_1, heading_2, heading_3, bulleted_list_item,
+        numbered_list_item, to_do, toggle, quote blocks.
+        
+        Args:
+            block_id: The block ID to update (get from get_notion_structured_context)
+            new_text: The new text content
+        
+        Returns:
+            Success message with before/after or error
+        """
+        try:
+            if not self.notion_client or not self.notion_client.test_connection():
+                return "❌ Notion not connected"
+            
+            normalized_id = _normalize_notion_id(block_id)
+            if not normalized_id:
+                return "❌ Invalid block_id"
+            
+            # Get current block
+            block = self.notion_client.get_block(normalized_id)
+            if not block:
+                return f"❌ Could not find block {block_id}"
+            
+            block_type = block.get("type")
+            supported_types = {"paragraph", "heading_1", "heading_2", "heading_3", 
+                              "bulleted_list_item", "numbered_list_item", "to_do", "toggle", "quote"}
+            
+            if block_type not in supported_types:
+                return f"❌ Block type '{block_type}' does not support text updates"
+            
+            # Get old text for logging
+            old_text = "".join(rt.get("plain_text", "") for rt in block.get(block_type, {}).get("rich_text", []))
+            
+            # Build update payload
+            block_data = {
+                "rich_text": [{"type": "text", "text": {"content": new_text}}]
+            }
+            
+            # Preserve checked status for to_do blocks
+            if block_type == "to_do":
+                block_data["checked"] = block.get("to_do", {}).get("checked", False)
+            
+            result = self.notion_client.update_block(normalized_id, block_type, block_data)
+            
+            if result:
+                return (
+                    f"✅ Updated {block_type} block:\n"
+                    f"  - Block ID: `{normalized_id}`\n"
+                    f"  - Before: {old_text[:100]}{'...' if len(old_text) > 100 else ''}\n"
+                    f"  - After: {new_text[:100]}{'...' if len(new_text) > 100 else ''}"
+                )
+            else:
+                return "❌ Failed to update block"
+                
+        except Exception as e:
+            logger.error(f"Error updating block text: {e}", exc_info=True)
+            return f"❌ Error: {str(e)}"
+
+    def get_notion_page_outline(
+        self,
+        page_id: str,
+        max_depth: int = 2,
+    ) -> str:
+        """Return a lightweight outline of a Notion page with block IDs.
+
+        Focuses on toggle sections and toggleable headings so an agent can decide
+        what to update without requiring a full deep block dump.
+        """
+        try:
+            normalized_id = _normalize_notion_id(page_id)
+            if not normalized_id:
+                return json.dumps({"error": "Invalid page_id"})
+
+            blocks: List[Dict[str, Any]] = []
+            try:
+                with self.db.get_session() as session:
+                    db_page = session.query(NotionPage).filter_by(page_id=normalized_id).first()
+                    cached_blocks = getattr(db_page, "blocks_data", None) if db_page else None
+                    if isinstance(cached_blocks, list) and cached_blocks:
+                        blocks = cached_blocks
+            except Exception:
+                blocks = []
+
+            if not blocks:
+                if not self.notion_client or not self.notion_client.test_connection():
+                    return json.dumps({"error": "Notion not connected"})
+                blocks = self.notion_client.get_block_children(normalized_id, max_depth=max_depth)
+
+            def _rt_text(rt_list: List[Dict[str, Any]]) -> str:
+                return "".join((rt.get("plain_text") or "") for rt in (rt_list or [])).strip()
+
+            def _block_title(b: Dict[str, Any]) -> str:
+                btype = b.get("type")
+                if btype == "toggle":
+                    return _rt_text((b.get("toggle") or {}).get("rich_text", []))
+                if btype in {"heading_1", "heading_2", "heading_3"}:
+                    return _rt_text((b.get(btype) or {}).get("rich_text", []))
+                return ""
+
+            sections: List[Dict[str, Any]] = []
+            stack: List[Tuple[Dict[str, Any], int]] = [(b, 0) for b in (blocks or [])]
+            while stack:
+                b, depth = stack.pop(0)
+                btype = b.get("type")
+                bid = b.get("id")
+                if not bid:
+                    continue
+
+                is_toggleable_heading = False
+                if btype in {"heading_1", "heading_2", "heading_3"}:
+                    heading_obj = b.get(btype) or {}
+                    is_toggleable_heading = bool(heading_obj.get("is_toggleable"))
+
+                if btype == "toggle" or is_toggleable_heading:
+                    title = _block_title(b)
+                    sections.append(
+                        {
+                            "id": bid,
+                            "type": btype,
+                            "title": title,
+                            "depth": depth,
+                            "has_children": bool(b.get("has_children")),
+                        }
+                    )
+
+                children = b.get("_children") or []
+                for child in children:
+                    stack.append((child, depth + 1))
+
+            return json.dumps(
+                {
+                    "type": "page_outline",
+                    "page_id": normalized_id,
+                    "section_count": len(sections),
+                    "sections": sections,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        except Exception as e:
+            logger.error("Error getting Notion page outline: %s", e, exc_info=True)
+            return json.dumps({"error": str(e)})
+
+    def upsert_notion_toggle_section(
+        self,
+        page_id: str,
+        section_title: str,
+        content: str,
+        replace_children: bool = True,
+        workflow_mode: bool = False,
+        confirmed: bool = False,
+        max_depth: int = 3,
+    ) -> str:
+        """Create or update a toggle section in a Notion page safely.
+
+        - Finds an existing toggle (or toggleable heading) by title, case-insensitive.
+        - Replaces ONLY that section's children (archives existing children) if replace_children=True.
+        - Creates the toggle section if missing.
+
+        This tool is intended to update page body content without disturbing other sections.
+        """
+        try:
+            if (not workflow_mode) and (not confirmed):
+                preview = (content or "").strip().replace("\n", " ")
+                preview = preview[:140] + ("..." if len(preview) > 140 else "")
+                return (
+                    "⚠️ This will update a Notion page section body. "
+                    "Please confirm to proceed.\n"
+                    f"- Page: {page_id}\n"
+                    f"- Section: {section_title}\n"
+                    f"- Replace children: {replace_children}\n"
+                    f"- Content preview: {preview}"
+                )
+
+            if not Config.NOTION_TOKEN:
+                return "❌ NOTION_TOKEN is not configured."
+
+            if not self.notion_client or not self.notion_client.test_connection():
+                return "❌ Notion not connected"
+
+            import requests
+
+            normalized_page_id = _normalize_notion_id(page_id)
+            if not normalized_page_id:
+                return "❌ Invalid page_id"
+
+            title_norm = (section_title or "").strip().lower()
+            if not title_norm:
+                return "❌ section_title is required"
+
+            headers = {
+                "Authorization": f"Bearer {Config.NOTION_TOKEN}",
+                "Notion-Version": Config.NOTION_VERSION,
+                "Content-Type": "application/json",
+            }
+
+            def _rt_text(rt_list: List[Dict[str, Any]]) -> str:
+                return "".join((rt.get("plain_text") or "") for rt in (rt_list or [])).strip()
+
+            def _block_title(b: Dict[str, Any]) -> str:
+                btype = b.get("type")
+                if btype == "toggle":
+                    return _rt_text((b.get("toggle") or {}).get("rich_text", []))
+                if btype in {"heading_1", "heading_2", "heading_3"}:
+                    return _rt_text((b.get(btype) or {}).get("rich_text", []))
+                return ""
+
+            def _is_toggleable_heading(b: Dict[str, Any]) -> bool:
+                btype = b.get("type")
+                if btype not in {"heading_1", "heading_2", "heading_3"}:
+                    return False
+                heading_obj = b.get(btype) or {}
+                return bool(heading_obj.get("is_toggleable"))
+
+            def _markdown_to_children_blocks(md: str) -> List[Dict[str, Any]]:
+                raw = (md or "").strip()
+                if not raw:
+                    return []
+
+                blocks_out: List[Dict[str, Any]] = []
+
+                def mk_rich_text(text: str) -> List[Dict[str, Any]]:
+                    t = (text or "").strip()
+                    if not t:
+                        return []
+                    # Very small inline link support: [label](url)
+                    import re
+                    m = re.fullmatch(r"\[(.+?)\]\((https?://[^\s)]+)\)", t)
+                    if m:
+                        label, url = m.group(1), m.group(2)
+                        return [
+                            {
+                                "type": "text",
+                                "text": {"content": label, "link": {"url": url}},
+                            }
+                        ]
+                    return [{"type": "text", "text": {"content": t}}]
+
+                lines = raw.split("\n")
+                for line in lines:
+                    l = (line or "").rstrip()
+                    if not l.strip():
+                        continue
+
+                    stripped = l.lstrip()
+                    if stripped.startswith(("- ", "* ")):
+                        text = stripped[2:].strip()
+                        blocks_out.append(
+                            {
+                                "object": "block",
+                                "type": "bulleted_list_item",
+                                "bulleted_list_item": {"rich_text": mk_rich_text(text)},
+                            }
+                        )
+                        continue
+
+                    import re
+                    mnum = re.match(r"^(\d+)\.\s+(.*)$", stripped)
+                    if mnum:
+                        text = (mnum.group(2) or "").strip()
+                        blocks_out.append(
+                            {
+                                "object": "block",
+                                "type": "numbered_list_item",
+                                "numbered_list_item": {"rich_text": mk_rich_text(text)},
+                            }
+                        )
+                        continue
+
+                    blocks_out.append(
+                        {
+                            "object": "block",
+                            "type": "paragraph",
+                            "paragraph": {"rich_text": mk_rich_text(stripped)},
+                        }
+                    )
+
+                return blocks_out
+
+            # 1) Find existing section block by title
+            blocks = self.notion_client.get_block_children(normalized_page_id, max_depth=max_depth)
+            found_block_id: Optional[str] = None
+            queue: List[Dict[str, Any]] = list(blocks or [])
+            while queue:
+                b = queue.pop(0)
+                btype = b.get("type")
+                bid = b.get("id")
+                if bid and (btype == "toggle" or _is_toggleable_heading(b)):
+                    t = _block_title(b).strip().lower()
+                    if t == title_norm:
+                        found_block_id = bid
+                        break
+                for child in (b.get("_children") or []):
+                    queue.append(child)
+
+            children_blocks = _markdown_to_children_blocks(content)
+            if not children_blocks:
+                return "❌ No section content to write"
+
+            # 2) If missing, create a new toggle block at the page root
+            if not found_block_id:
+                toggle_block = {
+                    "object": "block",
+                    "type": "toggle",
+                    "toggle": {
+                        "rich_text": [{"type": "text", "text": {"content": section_title.strip()}}]
+                    },
+                    "children": children_blocks,
+                }
+                resp = requests.patch(
+                    f"https://api.notion.com/v1/blocks/{normalized_page_id}/children",
+                    headers=headers,
+                    json={"children": [toggle_block]},
+                    timeout=30,
+                )
+                if resp.status_code != 200:
+                    return f"❌ Notion API error {resp.status_code}: {resp.text[:300]}"
+                created = (resp.json() or {}).get("results", []) or []
+                new_id = (created[0].get("id") if created else None) or "<unknown>"
+                return f"✅ Created toggle section '{section_title}' on page `{normalized_page_id}` (block_id: `{new_id}`)"
+
+            # 3) Update existing section: optionally archive existing children, then append new children
+            archived = 0
+            if replace_children:
+                cursor: Optional[str] = None
+                while True:
+                    params: Dict[str, Any] = {"page_size": 100}
+                    if cursor:
+                        params["start_cursor"] = cursor
+                    resp = requests.get(
+                        f"https://api.notion.com/v1/blocks/{found_block_id}/children",
+                        headers=headers,
+                        params=params,
+                        timeout=30,
+                    )
+                    if resp.status_code != 200:
+                        break
+                    data = resp.json() or {}
+                    results = data.get("results", []) or []
+                    for child in results:
+                        cid = child.get("id")
+                        if not cid:
+                            continue
+                        patch = requests.patch(
+                            f"https://api.notion.com/v1/blocks/{cid}",
+                            headers=headers,
+                            json={"archived": True},
+                            timeout=30,
+                        )
+                        if patch.status_code == 200:
+                            archived += 1
+                    if not data.get("has_more"):
+                        break
+                    cursor = data.get("next_cursor")
+
+            created = 0
+            for i in range(0, len(children_blocks), 100):
+                batch = children_blocks[i : i + 100]
+                put = requests.patch(
+                    f"https://api.notion.com/v1/blocks/{found_block_id}/children",
+                    headers=headers,
+                    json={"children": batch},
+                    timeout=30,
+                )
+                if put.status_code != 200:
+                    return f"❌ Failed to write section children ({put.status_code}): {put.text[:300]}"
+                created += len(batch)
+
+            return (
+                f"✅ Updated section '{section_title}' (block_id: `{found_block_id}`). "
+                f"Archived {archived} child block(s), added {created} block(s)."
+            )
+
+        except Exception as e:
+            logger.error("Error upserting Notion toggle section: %s", e, exc_info=True)
+            return f"❌ Error: {str(e)}"
+
     # ========================================
     # CRITICAL NEW TOOLS - Nov 2025 Features
     # ========================================
@@ -4133,37 +5354,73 @@ Subject: {subject}
         """
         try:
             import requests
-            
-            # Create paragraph blocks from content
-            paragraphs = content.split('\n\n')
-            blocks = []
+            if not Config.NOTION_TOKEN:
+                return "❌ NOTION_TOKEN is not configured. Please set it in your environment."
+
+            normalized_id = _normalize_notion_id(page_id)
+            if not normalized_id:
+                return "❌ Invalid Notion page_id. Please pass a Notion page ID or full Notion URL."
+
+            raw = content or ""
+            # Notion text content has practical limits; keep chunks comfortably under 2000 chars.
+            max_text_len = 1800
+            paragraphs = raw.split("\n\n")
+
+            blocks: List[Dict[str, Any]] = []
             for para in paragraphs:
-                if para.strip():
-                    blocks.append({
-                        "object": "block",
-                        "type": "paragraph",
-                        "paragraph": {
-                            "rich_text": [{
-                                "type": "text",
-                                "text": {"content": para.strip()}
-                            }]
+                p = (para or "").strip()
+                if not p:
+                    continue
+                while len(p) > max_text_len:
+                    chunk = p[:max_text_len]
+                    blocks.append(
+                        {
+                            "object": "block",
+                            "type": "paragraph",
+                            "paragraph": {
+                                "rich_text": [
+                                    {"type": "text", "text": {"content": chunk}}
+                                ]
+                            },
                         }
-                    })
-            
-            response = requests.patch(
-                f"https://api.notion.com/v1/blocks/{page_id}/children",
-                headers={
-                    "Authorization": f"Bearer {Config.NOTION_TOKEN}",
-                    "Notion-Version": "2022-06-28",
-                    "Content-Type": "application/json"
-                },
-                json={"children": blocks}
-            )
-            
-            if response.status_code == 200:
-                return f"✅ Content appended to Notion page"
-            else:
-                return f"❌ Error {response.status_code}: {response.text}"
+                    )
+                    p = p[max_text_len:]
+                if p:
+                    blocks.append(
+                        {
+                            "object": "block",
+                            "type": "paragraph",
+                            "paragraph": {
+                                "rich_text": [
+                                    {"type": "text", "text": {"content": p}}
+                                ]
+                            },
+                        }
+                    )
+
+            if not blocks:
+                return "❌ No content to append."
+
+            headers = {
+                "Authorization": f"Bearer {Config.NOTION_TOKEN}",
+                "Notion-Version": Config.NOTION_VERSION,
+                "Content-Type": "application/json",
+            }
+
+            created = 0
+            for i in range(0, len(blocks), 100):
+                batch = blocks[i : i + 100]
+                resp = requests.patch(
+                    f"https://api.notion.com/v1/blocks/{normalized_id}/children",
+                    headers=headers,
+                    json={"children": batch},
+                    timeout=30,
+                )
+                if resp.status_code != 200:
+                    return f"❌ Notion API error {resp.status_code}: {resp.text[:300]}"
+                created += len(batch)
+
+            return f"✅ Content appended to Notion page. Added {created} block(s)."
         except Exception as e:
             logger.error(f"Error appending to page: {e}")
             return f"❌ Error: {str(e)}"
@@ -4194,7 +5451,7 @@ Subject: {subject}
                 "https://api.notion.com/v1/search",
                 headers={
                     "Authorization": f"Bearer {Config.NOTION_TOKEN}",
-                    "Notion-Version": "2022-06-28",
+                    "Notion-Version": Config.NOTION_VERSION,
                     "Content-Type": "application/json",
                 },
                 json=payload,
@@ -4205,8 +5462,8 @@ Subject: {subject}
             
             raw_results = response.json().get("results", []) or []
 
-            # Only keep actual pages and databases
-            results = [r for r in raw_results if r.get("object") in ("page", "database")]
+            # Only keep actual pages and databases/data_sources
+            results = [r for r in raw_results if r.get("object") in ("page", "database", "data_source")]
 
             if not results:
                 return f"No Notion pages or databases found matching '{query}'"

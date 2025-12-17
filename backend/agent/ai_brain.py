@@ -13,6 +13,7 @@ from typing import List, Dict, Any, Optional, AsyncIterator
 from openai import AsyncOpenAI
 import sys
 from pathlib import Path
+import inspect
 
 # Setup paths
 current_dir = Path(__file__).parent
@@ -167,9 +168,11 @@ You have access to many powerful tools (60+ as of Nov 2025) to interact with the
 - User asks for summary → Get data first with tools, then summarize in your response
 
 ### NOTION DATABASE OPERATIONS (MOST IMPORTANT - USE THESE)
-- User asks "get info about X" → Use `find_notion_entry(search_text="X")` - this searches ALL databases and returns full details with database_id ready for updates
-- User asks "update X's value to Y" → If you already have database_id from earlier search, use `update_notion_entry_by_name` directly. Otherwise, first use `find_notion_entry` to get the database_id
-- User says "yes" or "proceed" after you showed the change → IMMEDIATELY call `update_notion_entry_by_name` with confirmed=true
+- User asks "get info about X" → Use `find_notion_entry(search_text="X")` - this searches ALL databases and returns full details including entry_id.
+- **If multiple entries are returned** → DO NOT GUESS. Ask the user to pick exactly which entry to work on (by number or by entry_id/URL).
+- User asks "update X's value to Y" → Prefer updating by exact entry_id using `update_notion_database_entry`. If you don't have entry_id yet, call `find_notion_entry`.
+- When preparing the update summary, use the property name EXACTLY as it appears in the database schema (case-insensitive exact is allowed; otherwise ask user to pick).
+- User says "yes"/"proceed" after you showed the change → IMMEDIATELY call `update_notion_database_entry` (preferred) or `update_notion_entry_by_name` with confirmed=true.
 - User asks "add a new entry" → Use `add_notion_database_entry`
 - User asks "delete entry X" → Use `delete_notion_database_entry`
 
@@ -255,7 +258,7 @@ When you query a database and find an entry:
 ### SMART DATA RETRIEVAL
 When searching for something:
 - If first search doesn't find exact match, try broader search
-- If you find multiple matches, pick the BEST one (most relevant) and proceed
+- If you find multiple matches for Notion entries/pages, ALWAYS ask the user which one to use (do not pick automatically)
 - Don't list options unless absolutely necessary
 
 Now, BE THE AUTONOMOUS AGENT and help the user efficiently!"""
@@ -294,6 +297,14 @@ class WorkforceAIBrain:
         
         logger.info(f"✓ AI Brain initialized with model: {model}")
         logger.info(f"Available tools: {len(self.tools)}")
+
+    async def close(self) -> None:
+        try:
+            client = getattr(self, "client", None)
+            if client and hasattr(client, "close"):
+                await client.close()
+        except Exception:
+            return
     
     def _define_tools(self) -> List[Dict[str, Any]]:
         """Define tools in OpenAI function calling format."""
@@ -309,6 +320,46 @@ class WorkforceAIBrain:
                         "required": []
                     }
                 }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "upsert_notion_toggle_section",
+                    "description": "Safely create or update a toggle/dropdown section inside a Notion page by section title. Only edits that section's children and preserves the rest of the page.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "page_id": {
+                                "type": "string",
+                                "description": "Notion page ID to update",
+                            },
+                            "section_title": {
+                                "type": "string",
+                                "description": "Section/toggle title (e.g., 'General Information', 'Use Cases')",
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "Content to put inside the section (supports basic markdown: paragraphs, bullets, numbered lists)",
+                            },
+                            "replace_children": {
+                                "type": "boolean",
+                                "description": "If true, archive existing children inside the section and replace with new content (default true)",
+                                "default": True,
+                            },
+                            "max_depth": {
+                                "type": "integer",
+                                "description": "Max depth to search for the section (default 3)",
+                                "default": 3,
+                            },
+                            "confirmed": {
+                                "type": "boolean",
+                                "description": "Set true to execute the edit after preview/confirmation.",
+                                "default": False,
+                            },
+                        },
+                        "required": ["page_id", "section_title", "content"],
+                    },
+                },
             },
             {
                 "type": "function",
@@ -536,6 +587,28 @@ class WorkforceAIBrain:
             {
                 "type": "function",
                 "function": {
+                    "name": "get_notion_page_outline",
+                    "description": "Get a lightweight outline of a Notion page with toggle/heading sections and their block IDs. Use this before editing dropdown/toggle sections.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "page_id": {
+                                "type": "string",
+                                "description": "Notion page ID to outline",
+                            },
+                            "max_depth": {
+                                "type": "integer",
+                                "description": "Max outline depth (default 2)",
+                                "default": 2,
+                            },
+                        },
+                        "required": ["page_id"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "query_notion_database",
                     "description": "Query a Notion database and list matching rows with ALL properties. Use search_text to find specific entries (e.g., 'CCHP Health Plan') and get their full details in JSON format.",
                     "parameters": {
@@ -649,6 +722,41 @@ class WorkforceAIBrain:
             {
                 "type": "function",
                 "function": {
+                    "name": "update_notion_database_entry",
+                    "description": "Update a Notion database entry by exact entry_id (most precise; avoids wrong row when names are similar).",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "entry_id": {
+                                "type": "string",
+                                "description": "Notion database row page ID (entry_id)"
+                            },
+                            "property_name": {
+                                "type": "string",
+                                "description": "Property/column name to update (e.g., 'Estimated Value Annually', 'Status')"
+                            },
+                            "new_value": {
+                                "type": "string",
+                                "description": "New value to set (number, text, date, etc.)"
+                            },
+                            "property_type": {
+                                "type": "string",
+                                "description": "Optional property type hint (title, rich_text, number, select, status, date, checkbox, url, email)",
+                                "nullable": True
+                            },
+                            "confirmed": {
+                                "type": "boolean",
+                                "description": "MUST be true ONLY after user explicitly confirmed the update.",
+                                "default": False
+                            }
+                        },
+                        "required": ["entry_id", "property_name", "new_value"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "add_notion_database_entry",
                     "description": "Add a new entry/row to a Notion database. Provide property names and values as a JSON object.",
                     "parameters": {
@@ -743,6 +851,125 @@ class WorkforceAIBrain:
                             }
                         },
                         "required": ["query"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_notion_structured_context",
+                    "description": "Get structured JSON context of a Notion page or database with all block IDs for precise edits. Use this before making targeted updates like checking to-dos or updating specific blocks.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "page_id": {
+                                "type": "string",
+                                "description": "Notion page or database ID"
+                            },
+                            "include_blocks": {
+                                "type": "boolean",
+                                "description": "Include block tree with IDs (for pages)",
+                                "default": True
+                            },
+                            "include_database_rows": {
+                                "type": "boolean",
+                                "description": "Include all rows (for databases)",
+                                "default": True
+                            },
+                            "max_depth": {
+                                "type": "integer",
+                                "description": "Maximum block recursion depth",
+                                "default": 3
+                            }
+                        },
+                        "required": ["page_id"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "update_notion_database_schema",
+                    "description": "Add, rename, or remove columns in a Notion database schema.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "database_id": {
+                                "type": "string",
+                                "description": "Database ID to update"
+                            },
+                            "add_columns": {
+                                "type": "object",
+                                "description": "Dict of column_name: type (rich_text, number, select, multi_select, checkbox, date, url, email, files, people)"
+                            },
+                            "rename_columns": {
+                                "type": "object",
+                                "description": "Dict of old_name: new_name"
+                            },
+                            "remove_columns": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "List of column names to remove"
+                            },
+                            "confirmed": {
+                                "type": "boolean",
+                                "description": "MUST be true ONLY after user explicitly confirmed the schema change.",
+                                "default": False
+                            }
+                        },
+                        "required": ["database_id"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "update_notion_todo_checked",
+                    "description": "Check or uncheck a to-do item in Notion. Use get_notion_structured_context first to get block IDs.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "block_id": {
+                                "type": "string",
+                                "description": "The to_do block ID (get from get_notion_structured_context)"
+                            },
+                            "checked": {
+                                "type": "boolean",
+                                "description": "True to check, False to uncheck"
+                            },
+                            "confirmed": {
+                                "type": "boolean",
+                                "description": "MUST be true ONLY after user explicitly confirmed the action.",
+                                "default": False
+                            }
+                        },
+                        "required": ["block_id", "checked"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "update_notion_block_text",
+                    "description": "Update the text content of a specific Notion block. Use get_notion_structured_context first to get block IDs.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "block_id": {
+                                "type": "string",
+                                "description": "The block ID to update (get from get_notion_structured_context)"
+                            },
+                            "new_text": {
+                                "type": "string",
+                                "description": "New text content for the block"
+                            },
+                            "confirmed": {
+                                "type": "boolean",
+                                "description": "MUST be true ONLY after user explicitly confirmed the edit.",
+                                "default": False
+                            }
+                        },
+                        "required": ["block_id", "new_text"]
                     }
                 }
             },
@@ -1007,6 +1234,75 @@ class WorkforceAIBrain:
                     }
                 }
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_gmail_labels",
+                    "description": "Get all Gmail labels/folders in the user's mailbox.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_email_thread",
+                    "description": "Get all messages in an email thread by thread ID.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "thread_id": {"type": "string", "description": "Gmail thread ID"}
+                        },
+                        "required": ["thread_id"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "mark_email_read",
+                    "description": "Mark an email as read.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "message_id": {"type": "string", "description": "Gmail message ID"}
+                        },
+                        "required": ["message_id"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "archive_email",
+                    "description": "Archive an email (remove from inbox).",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "message_id": {"type": "string", "description": "Gmail message ID"}
+                        },
+                        "required": ["message_id"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "add_gmail_label",
+                    "description": "Add a label to an email.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "message_id": {"type": "string", "description": "Gmail message ID"},
+                            "label_name": {"type": "string", "description": "Label name to add"}
+                        },
+                        "required": ["message_id", "label_name"]
+                    }
+                }
+            },
             # NEW SLACK TOOLS - Nov 2025
             {
                 "type": "function",
@@ -1193,6 +1489,65 @@ class WorkforceAIBrain:
                         "type": "object",
                         "properties": {},
                         "required": []
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_thread_replies",
+                    "description": "Get all replies in a Slack thread. Use when user asks about thread replies or wants to see a conversation within a thread.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "channel": {"type": "string", "description": "Channel ID where the thread is"},
+                            "thread_ts": {"type": "string", "description": "Timestamp of the parent message (thread_ts)"}
+                        },
+                        "required": ["channel", "thread_ts"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "add_slack_reaction",
+                    "description": "Add an emoji reaction to a Slack message.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "channel": {"type": "string", "description": "Channel ID"},
+                            "timestamp": {"type": "string", "description": "Message timestamp"},
+                            "emoji": {"type": "string", "description": "Emoji name without colons (e.g., 'thumbsup', 'heart')"}
+                        },
+                        "required": ["channel", "timestamp", "emoji"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_slack_user_info",
+                    "description": "Get detailed information about a Slack user including profile, email, and status.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "user_id": {"type": "string", "description": "Slack user ID (e.g., U01234ABCD)"}
+                        },
+                        "required": ["user_id"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_slack_channel_info",
+                    "description": "Get detailed information about a Slack channel including topic, purpose, and member count.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "channel_id": {"type": "string", "description": "Slack channel ID"}
+                        },
+                        "required": ["channel_id"]
                     }
                 }
             },
@@ -1429,6 +1784,7 @@ class WorkforceAIBrain:
             "update_project_notion_page": "updating a Notion project page",
             "update_notion_database_item": "updating a Notion database item",
             "update_notion_entry_by_name": "updating a Notion database entry",
+            "update_notion_database_entry": "updating a Notion database entry",
             "add_notion_database_entry": "adding a new Notion database entry",
             "delete_notion_database_entry": "deleting a Notion database entry",
         }
@@ -1513,6 +1869,12 @@ class WorkforceAIBrain:
                     include_subpages=arguments.get("include_subpages", False),
                     max_depth=3,
                     max_blocks=arguments.get("max_blocks", 500),
+                )
+
+            elif tool_name == "get_notion_page_outline":
+                result = self.tools_handler.get_notion_page_outline(
+                    page_id=arguments.get("page_id", ""),
+                    max_depth=arguments.get("max_depth", 2),
                 )
             
             elif tool_name == "update_notion_page_content":
@@ -1617,6 +1979,30 @@ class WorkforceAIBrain:
                     file_paths=arguments.get("file_paths", "")
                 )
             
+            elif tool_name == "get_gmail_labels":
+                result = self.tools_handler.get_gmail_labels()
+            
+            elif tool_name == "get_email_thread":
+                result = self.tools_handler.get_email_thread(
+                    thread_id=arguments.get("thread_id", "")
+                )
+            
+            elif tool_name == "mark_email_read":
+                result = self.tools_handler.mark_email_read(
+                    message_id=arguments.get("message_id", "")
+                )
+            
+            elif tool_name == "archive_email":
+                result = self.tools_handler.archive_email(
+                    message_id=arguments.get("message_id", "")
+                )
+            
+            elif tool_name == "add_gmail_label":
+                result = self.tools_handler.add_gmail_label(
+                    message_id=arguments.get("message_id", ""),
+                    label_name=arguments.get("label_name", "")
+                )
+            
             # NEW SLACK TOOLS - Nov 2025
             elif tool_name == "upload_file_to_slack":
                 result = self.tools_handler.upload_file_to_slack(
@@ -1676,6 +2062,29 @@ class WorkforceAIBrain:
             elif tool_name == "list_all_slack_users":
                 result = self.tools_handler.list_all_slack_users()
             
+            elif tool_name == "get_thread_replies":
+                result = self.tools_handler.get_thread_replies(
+                    channel=arguments.get("channel", ""),
+                    thread_ts=arguments.get("thread_ts", "")
+                )
+            
+            elif tool_name == "add_slack_reaction":
+                result = self.tools_handler.add_slack_reaction(
+                    channel=arguments.get("channel", ""),
+                    timestamp=arguments.get("timestamp", ""),
+                    emoji=arguments.get("emoji", "")
+                )
+            
+            elif tool_name == "get_slack_user_info":
+                result = self.tools_handler.get_slack_user_info(
+                    user_id=arguments.get("user_id", "")
+                )
+            
+            elif tool_name == "get_slack_channel_info":
+                result = self.tools_handler.get_slack_channel_info(
+                    channel_id=arguments.get("channel_id", "")
+                )
+            
             # NEW NOTION TOOLS - Nov 2025
             elif tool_name == "append_to_notion_page":
                 result = self.tools_handler.append_to_notion_page(
@@ -1720,6 +2129,14 @@ class WorkforceAIBrain:
                     property_name=arguments.get("property_name", ""),
                     new_value=arguments.get("new_value", ""),
                 )
+
+            elif tool_name == "update_notion_database_entry":
+                result = self.tools_handler.update_notion_database_entry(
+                    entry_id=arguments.get("entry_id", ""),
+                    property_name=arguments.get("property_name", ""),
+                    new_value=arguments.get("new_value", ""),
+                    property_type=arguments.get("property_type"),
+                )
             
             elif tool_name == "add_notion_database_entry":
                 props_json = arguments.get("properties_json", "{}")
@@ -1736,6 +2153,64 @@ class WorkforceAIBrain:
                 result = self.tools_handler.delete_notion_database_entry(
                     entry_id=arguments.get("entry_id", ""),
                 )
+            
+            elif tool_name == "get_notion_structured_context":
+                result = self.tools_handler.get_notion_structured_context(
+                    page_id=arguments.get("page_id", ""),
+                    include_blocks=arguments.get("include_blocks", True),
+                    include_database_rows=arguments.get("include_database_rows", True),
+                    max_depth=arguments.get("max_depth", 3),
+                )
+
+            elif tool_name == "upsert_notion_toggle_section":
+                result = self.tools_handler.upsert_notion_toggle_section(
+                    page_id=arguments.get("page_id", ""),
+                    section_title=arguments.get("section_title", ""),
+                    content=arguments.get("content", ""),
+                    replace_children=bool(arguments.get("replace_children", True)),
+                    max_depth=int(arguments.get("max_depth", 3) or 3),
+                    confirmed=bool(arguments.get("confirmed", False)),
+                )
+            
+            elif tool_name == "update_notion_database_schema":
+                if not arguments.get("confirmed"):
+                    add_cols = arguments.get("add_columns", {})
+                    rename_cols = arguments.get("rename_columns", {})
+                    remove_cols = arguments.get("remove_columns", [])
+                    changes = []
+                    if add_cols:
+                        changes.append(f"Add columns: {add_cols}")
+                    if rename_cols:
+                        changes.append(f"Rename columns: {rename_cols}")
+                    if remove_cols:
+                        changes.append(f"Remove columns: {remove_cols}")
+                    result = f"⚠️ Schema change requires confirmation:\n" + "\n".join(changes) + "\n\nPlease confirm to proceed."
+                else:
+                    result = self.tools_handler.update_notion_database_schema(
+                        database_id=arguments.get("database_id", ""),
+                        add_columns=arguments.get("add_columns"),
+                        rename_columns=arguments.get("rename_columns"),
+                        remove_columns=arguments.get("remove_columns"),
+                    )
+            
+            elif tool_name == "update_notion_todo_checked":
+                if not arguments.get("confirmed"):
+                    action = "check" if arguments.get("checked") else "uncheck"
+                    result = f"⚠️ To {action} this to-do item, please confirm."
+                else:
+                    result = self.tools_handler.update_notion_todo_checked(
+                        block_id=arguments.get("block_id", ""),
+                        checked=arguments.get("checked", False),
+                    )
+            
+            elif tool_name == "update_notion_block_text":
+                if not arguments.get("confirmed"):
+                    result = f"⚠️ Update block text to: '{arguments.get('new_text', '')[:100]}...'\nPlease confirm to proceed."
+                else:
+                    result = self.tools_handler.update_notion_block_text(
+                        block_id=arguments.get("block_id", ""),
+                        new_text=arguments.get("new_text", ""),
+                    )
             
             # PROJECT TRACKING TOOLS
             elif tool_name == "track_project":
@@ -1856,6 +2331,7 @@ class WorkforceAIBrain:
                 "get_slack_user_info",
                 "get_slack_channel_info",
                 "get_thread_replies",
+                "add_slack_reaction",
                 "upload_file_to_slack",
                 "pin_slack_message",
                 "unpin_slack_message",
@@ -1878,11 +2354,16 @@ class WorkforceAIBrain:
                 "get_unread_email_count",
                 "advanced_gmail_search",
                 "get_complete_email_thread",
+                "get_email_thread",
                 "search_email_threads",
                 "get_recent_email_thread_between_people",
                 "list_gmail_attachments_for_message",
                 "download_gmail_attachment",
                 "send_gmail_with_attachments",
+                "get_gmail_labels",
+                "mark_email_read",
+                "archive_email",
+                "add_gmail_label",
             }
 
             notion_tools = {
@@ -1898,8 +2379,14 @@ class WorkforceAIBrain:
                 "update_notion_database_item",
                 "find_notion_entry",
                 "update_notion_entry_by_name",
+                "update_notion_database_entry",
                 "add_notion_database_entry",
                 "delete_notion_database_entry",
+                # Advanced Notion tools - Dec 2025
+                "get_notion_structured_context",
+                "update_notion_database_schema",
+                "update_notion_todo_checked",
+                "update_notion_block_text",
             }
 
             project_workspace_tools = {
@@ -2215,9 +2702,21 @@ class WorkforceAIBrain:
                         "model": self.model,
                         "messages": messages + [{"role": "user", "content": summary_prompt}],
                     }
-                    # gpt-5 models use max_completion_tokens; older models use max_tokens
-                    if self.model.startswith("gpt-5"):
+
+                    # Token param compatibility across OpenAI SDK versions
+                    create_fn = self.client.chat.completions.create
+                    try:
+                        sig = inspect.signature(create_fn)
+                        supports_max_completion = "max_completion_tokens" in sig.parameters
+                        supports_extra_body = "extra_body" in sig.parameters
+                    except Exception:
+                        supports_max_completion = False
+                        supports_extra_body = False
+
+                    if self.model.startswith("gpt-5") and supports_max_completion:
                         summary_kwargs["max_completion_tokens"] = 300
+                    elif self.model.startswith("gpt-5") and supports_extra_body:
+                        summary_kwargs["extra_body"] = {"max_completion_tokens": 300}
                     else:
                         summary_kwargs["max_tokens"] = 300
                         summary_kwargs["temperature"] = 0.3

@@ -81,6 +81,8 @@ interface NotionPageContentState {
   attachments?: { id?: string; type: string; name?: string; url?: string | null }[]
   loading?: boolean
   error?: string | null
+  message?: string | null
+  cached?: boolean
   isDatabase?: boolean
   database?: DatabaseData
   childDatabases?: DatabaseData[]
@@ -106,6 +108,15 @@ export default function PipelinesInterface() {
   const [slackChannelRunChannelId, setSlackChannelRunChannelId] = useState<string | null>(null)
   const [slackChannelRunStatus, setSlackChannelRunStatus] = useState<string | null>(null)
   const [slackChannelProgress, setSlackChannelProgress] = useState<number | null>(null)
+  const [slackChannelStats, setSlackChannelStats] = useState<{
+    stage?: string
+    stage_description?: string
+    pages_fetched?: number
+    messages_fetched?: number
+    total_messages?: number
+    eta_seconds?: number
+    rate_limit_info?: string
+  } | null>(null)
   const [slackMessages, setSlackMessages] = useState<SlackMessage[]>([])
   // Channel list search
   const [slackSearchQuery, setSlackSearchQuery] = useState('')
@@ -376,10 +387,24 @@ export default function PipelinesInterface() {
         const progressVal =
           data?.stats?.progress != null ? Math.min(1, Math.max(0, data.stats.progress)) : null
         setSlackChannelProgress(progressVal)
+        
+        // Extract detailed stats for ETA display
+        if (data?.stats) {
+          setSlackChannelStats({
+            stage: data.stats.stage,
+            stage_description: data.stats.stage_description,
+            pages_fetched: data.stats.pages_fetched,
+            messages_fetched: data.stats.messages_fetched,
+            total_messages: data.stats.total_messages,
+            eta_seconds: data.stats.eta_seconds,
+            rate_limit_info: data.stats.rate_limit_info,
+          })
+        }
 
         if (['completed', 'failed', 'cancelled'].includes(data.status)) {
           done = true
           setSlackIsRunning(false)
+          setSlackChannelStats(null)
           if (data.finished_at || data.started_at) {
             setSlackLastRunAt(data.finished_at || data.started_at)
           } else {
@@ -407,6 +432,7 @@ export default function PipelinesInterface() {
         console.error('Error polling Slack channel pipeline status:', err)
         setError(err.message || 'Failed to poll channel run status')
         setSlackIsRunning(false)
+        setSlackChannelStats(null)
         done = true
       }
     }
@@ -785,7 +811,7 @@ export default function PipelinesInterface() {
       setNotionIsRunning(true)
       setNotionRunStatus('starting')
 
-      const response = await fetch(`${API_BASE_URL}/api/pipelines/notion/run`, {
+      const response = await fetch(`${API_BASE_URL}/api/pipelines/notion/run?mode=titles`, {
         method: 'POST',
         credentials: 'include',
       })
@@ -798,7 +824,6 @@ export default function PipelinesInterface() {
       const newRunId = data.run_id as string
       setNotionRunId(newRunId)
       setNotionRunStatus(data.status || 'started')
-      setNotionPages([])
 
       pollNotionRunStatus(newRunId)
     } catch (err: any) {
@@ -910,13 +935,14 @@ export default function PipelinesInterface() {
           ...existing,
           loading: true,
           error: null,
+          message: null,
         },
       }
     })
 
     try {
       const response = await fetch(
-        `${API_BASE_URL}/api/notion/page-content?page_id=${encodeURIComponent(pageId)}&include_databases=true`,
+        `${API_BASE_URL}/api/notion/page-content?page_id=${encodeURIComponent(pageId)}&include_databases=true&cache_only=true`,
         {
           credentials: 'include',
         },
@@ -932,6 +958,8 @@ export default function PipelinesInterface() {
           attachments: data.attachments || [],
           loading: false,
           error: null,
+          message: data.message || null,
+          cached: Boolean(data.cached),
           isDatabase: data.is_database || false,
           database: data.database || null,
           childDatabases: data.child_databases || [],
@@ -950,17 +978,109 @@ export default function PipelinesInterface() {
     }
   }
 
+  const refreshNotionPageContent = async (pageId: string) => {
+    setNotionPageContent((prev) => {
+      const existing = prev[pageId]
+      if (existing?.loading) {
+        return prev
+      }
+      return {
+        ...prev,
+        [pageId]: {
+          ...existing,
+          loading: true,
+          error: null,
+          message: null,
+        },
+      }
+    })
+
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/notion/page-content?page_id=${encodeURIComponent(pageId)}&include_databases=true&refresh=true`,
+        {
+          credentials: 'include',
+        },
+      )
+      if (!response.ok) {
+        throw new Error(`Failed to refresh Notion page content: ${response.status}`)
+      }
+      const data = await response.json()
+      setNotionPageContent((prev) => ({
+        ...prev,
+        [pageId]: {
+          content: data.content || '',
+          attachments: data.attachments || [],
+          loading: false,
+          error: null,
+          message: null,
+          cached: true,
+          isDatabase: data.is_database || false,
+          database: data.database || null,
+          childDatabases: data.child_databases || [],
+        },
+      }))
+      await fetchNotionHierarchy()
+    } catch (err: any) {
+      console.error('Error refreshing Notion page content:', err)
+      setNotionPageContent((prev) => ({
+        ...prev,
+        [pageId]: {
+          ...(prev[pageId] || {}),
+          loading: false,
+          error: err.message || 'Failed to refresh Notion page content',
+        },
+      }))
+    }
+  }
+
   // -----------------------------
   // Render helpers
   // -----------------------------
 
+  // Helper to format ETA seconds into human-readable string
+  const formatEta = (seconds: number | undefined) => {
+    if (seconds === undefined || seconds <= 0) return null
+    if (seconds < 60) return `~${seconds}s remaining`
+    const mins = Math.floor(seconds / 60)
+    const secs = seconds % 60
+    return `~${mins}m ${secs}s remaining`
+  }
+
   const renderSlackView = () => {
-    const channelProgressDisplay =
-      slackChannelRunStatus || slackChannelProgress != null
-        ? `Refresh status: ${slackChannelRunStatus || 'running'}${
-            slackChannelProgress != null ? ` · ${(slackChannelProgress * 100).toFixed(0)}%` : ''
-          }`
-        : null
+    // Build detailed progress display for channel refresh
+    let channelProgressDisplay: React.ReactNode = null
+    if (slackChannelRunStatus || slackChannelProgress != null) {
+      const progressPct = slackChannelProgress != null ? `${(slackChannelProgress * 100).toFixed(0)}%` : ''
+      const stageDesc = slackChannelStats?.stage_description || slackChannelRunStatus || 'running'
+      const msgCount = slackChannelStats?.messages_fetched
+      const etaStr = formatEta(slackChannelStats?.eta_seconds)
+      
+      channelProgressDisplay = (
+        <div className="mt-2 p-2 rounded-md bg-blue-950/30 border border-blue-800/50">
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-xs font-medium text-blue-300">{stageDesc}</span>
+            <span className="text-xs text-blue-400">{progressPct}</span>
+          </div>
+          {/* Progress bar */}
+          <div className="h-1.5 bg-blue-900/50 rounded-full overflow-hidden mb-1">
+            <div 
+              className="h-full bg-blue-500 transition-all duration-300" 
+              style={{ width: `${(slackChannelProgress || 0) * 100}%` }}
+            />
+          </div>
+          <div className="flex items-center justify-between text-[10px] text-blue-400/80">
+            {msgCount !== undefined && <span>{msgCount} messages fetched</span>}
+            {etaStr && <span>{etaStr}</span>}
+          </div>
+          {slackChannelStats?.rate_limit_info && (
+            <p className="text-[10px] text-muted-foreground mt-1">
+              ⏱ {slackChannelStats.rate_limit_info}
+            </p>
+          )}
+        </div>
+      )
+    }
 
     const channelListProgressDisplay =
       slackListRefreshing || slackListRunStatus || slackListProgress != null
@@ -1005,9 +1125,7 @@ export default function PipelinesInterface() {
             {slackRunId && (
               <p className="mt-1 text-[11px] text-muted-foreground break-all">Run ID: {slackRunId}</p>
             )}
-            {channelProgressDisplay && (
-              <p className="mt-1 text-[11px] text-muted-foreground">{channelProgressDisplay}</p>
-            )}
+            {channelProgressDisplay}
           </div>
 
           {slackStats && (
@@ -1531,18 +1649,36 @@ export default function PipelinesInterface() {
           </span>
         </summary>
         <div className="px-3 py-2 border-t border-border/40 text-xs text-foreground space-y-2">
-          {page.url && (
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-[11px] text-muted-foreground break-all">ID: {page.id}</span>
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[11px] text-muted-foreground break-all">ID: {page.id}</span>
+            <div className="flex items-center gap-2">
               <button
                 type="button"
-                onClick={() => window.open(page.url as string, '_blank')}
-                className="text-[11px] font-medium text-blue-400 hover:underline"
+                onClick={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  refreshNotionPageContent(page.id)
+                }}
+                disabled={Boolean(contentState?.loading)}
+                className="inline-flex items-center justify-center rounded-md bg-blue-600 px-2 py-1 text-[11px] font-medium text-white shadow-sm hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed"
               >
-                Open in Notion
+                {contentState?.loading ? 'Refreshing…' : 'Refresh'}
               </button>
+              {page.url && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.preventDefault()
+                    e.stopPropagation()
+                    window.open(page.url as string, '_blank')
+                  }}
+                  className="text-[11px] font-medium text-blue-400 hover:underline"
+                >
+                  Open in Notion
+                </button>
+              )}
             </div>
-          )}
+          </div>
           {/* Only show Properties for regular pages, not for databases */}
           {hasProps && !contentState?.isDatabase && (
             <div>
@@ -1564,6 +1700,9 @@ export default function PipelinesInterface() {
           )}
           {!contentState?.loading && contentState?.error && (
             <p className="text-[11px] text-red-400">Failed to load content: {contentState.error}</p>
+          )}
+          {!contentState?.loading && !contentState?.error && contentState?.message && (
+            <p className="text-[11px] text-muted-foreground">{contentState.message}</p>
           )}
           {/* Show database content as table */}
           {!contentState?.loading && contentState?.isDatabase && contentState?.database && (
@@ -1748,7 +1887,7 @@ export default function PipelinesInterface() {
                 disabled={notionIsRunning}
                 className="inline-flex items-center justify-center rounded-md bg-blue-600 px-3 py-1.5 text-sm font-medium text-white shadow-sm hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed"
               >
-                {notionIsRunning ? 'Running…' : 'Run Notion Pipeline'}
+                {notionIsRunning ? 'Refreshing…' : 'Refresh titles'}
               </button>
               {notionIsRunning && notionRunId && (
                 <button
@@ -1790,6 +1929,14 @@ export default function PipelinesInterface() {
               placeholder="Filter pages by title"
               className="flex-1 rounded-md border border-border bg-background px-2 py-1 text-xs"
             />
+            <button
+              type="button"
+              onClick={handleRunNotionPipeline}
+              disabled={notionIsRunning}
+              className="inline-flex items-center justify-center rounded-md bg-blue-600 px-2.5 py-1.5 text-xs font-medium text-white shadow-sm hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed"
+            >
+              {notionIsRunning ? 'Refreshing…' : 'Refresh titles'}
+            </button>
             <span className="text-[11px] text-muted-foreground">{filteredPages.length} pages</span>
           </div>
           <div className="flex-1 overflow-auto border border-border rounded-md bg-card p-2">

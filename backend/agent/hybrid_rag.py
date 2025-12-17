@@ -136,7 +136,7 @@ class HybridRAGEngine:
 
         headers = {
             "Authorization": f"Bearer {token}",
-            "Notion-Version": "2022-06-28",
+            "Notion-Version": Config.NOTION_VERSION,
             "Content-Type": "application/json",
         }
 
@@ -201,7 +201,7 @@ class HybridRAGEngine:
 
         headers = {
             "Authorization": f"Bearer {token}",
-            "Notion-Version": "2022-06-28",
+            "Notion-Version": Config.NOTION_VERSION,
         }
 
         url = f"https://api.notion.com/v1/blocks/{page_id}/children"

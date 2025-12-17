@@ -119,7 +119,7 @@ export function SearchableSelect({
                 {options.map((opt) => (
                   <CommandItem
                     key={opt.value}
-                    value={opt.label}
+                    value={`${opt.label} ${opt.value}`}
                     disabled={opt.disabled}
                     onSelect={() => {
                       if (opt.disabled) return

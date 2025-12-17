@@ -295,8 +295,13 @@ class NotionPage(Base):
     # Display metadata
     title = Column(String(255))
     icon = Column(JSON)
+    cover = Column(JSON)
     url = Column(String(500))
     last_edited_time = Column(DateTime)
+
+    # Deep fetched content (blocks as JSON, database schema)
+    blocks_data = Column(JSON)  # Fetched block children with IDs
+    schema_data = Column(JSON)  # Database schema/properties if object_type='database'
 
     # Raw payload for future enrichment
     raw_data = Column(JSON)

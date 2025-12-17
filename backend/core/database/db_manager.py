@@ -110,8 +110,21 @@ class DatabaseManager:
                 needs_url = "url" not in columns
                 needs_raw = "raw_data" not in columns
                 needs_embedding = "embedding" not in columns
+                needs_icon = "icon" not in columns
+                needs_cover = "cover" not in columns
+                needs_blocks_data = "blocks_data" not in columns
+                needs_schema_data = "schema_data" not in columns
 
-                if needs_object_type or needs_url or needs_raw or needs_embedding:
+                if (
+                    needs_object_type
+                    or needs_url
+                    or needs_raw
+                    or needs_embedding
+                    or needs_icon
+                    or needs_cover
+                    or needs_blocks_data
+                    or needs_schema_data
+                ):
                     dialect = self.engine.dialect.name
                     json_type = "JSON" if dialect == "postgresql" else "TEXT"
 
@@ -131,6 +144,22 @@ class DatabaseManager:
                         if needs_embedding:
                             conn.execute(
                                 text(f"ALTER TABLE notion_pages ADD COLUMN embedding {json_type}")
+                            )
+                        if needs_icon:
+                            conn.execute(
+                                text(f"ALTER TABLE notion_pages ADD COLUMN icon {json_type}")
+                            )
+                        if needs_cover:
+                            conn.execute(
+                                text(f"ALTER TABLE notion_pages ADD COLUMN cover {json_type}")
+                            )
+                        if needs_blocks_data:
+                            conn.execute(
+                                text(f"ALTER TABLE notion_pages ADD COLUMN blocks_data {json_type}")
+                            )
+                        if needs_schema_data:
+                            conn.execute(
+                                text(f"ALTER TABLE notion_pages ADD COLUMN schema_data {json_type}")
                             )
 
                 # Older schemas had a self-referential foreign key on parent_id
@@ -152,6 +181,17 @@ class DatabaseManager:
                                     f"ALTER TABLE notion_pages DROP CONSTRAINT {fk_name}"
                                 )
                             )
+
+            if "notion_workspaces" in table_names:
+                columns = {col["name"] for col in inspector.get_columns("notion_workspaces")}
+                needs_icon = "icon" not in columns
+                if needs_icon:
+                    dialect = self.engine.dialect.name
+                    json_type = "JSON" if dialect == "postgresql" else "TEXT"
+                    with self.engine.begin() as conn:
+                        conn.execute(
+                            text(f"ALTER TABLE notion_workspaces ADD COLUMN icon {json_type}")
+                        )
 
             # Chat sessions table: add owner_user_id for per-user chat history
             if "chat_sessions" in table_names:
@@ -1295,17 +1335,18 @@ class DatabaseManager:
             return workflow
 
     def list_user_workflows(
-        self, owner_user_id: str, limit: int = 100
+        self, owner_user_id: Optional[str] = None, limit: int = 100
     ) -> List[UserWorkflow]:
-        """List user workflows ordered by most recently updated."""
+        """List workflows ordered by most recently updated.
+
+        If owner_user_id is provided, results are scoped to that user.
+        If owner_user_id is None, all workflows are returned (workspace-shared).
+        """
         with self.get_session() as session:
-            return (
-                session.query(UserWorkflow)
-                .filter(UserWorkflow.owner_user_id == owner_user_id)
-                .order_by(UserWorkflow.updated_at.desc())
-                .limit(limit)
-                .all()
-            )
+            query = session.query(UserWorkflow)
+            if owner_user_id:
+                query = query.filter(UserWorkflow.owner_user_id == owner_user_id)
+            return query.order_by(UserWorkflow.updated_at.desc()).limit(limit).all()
 
     def get_user_workflow(
         self, workflow_id: str, owner_user_id: Optional[str] = None

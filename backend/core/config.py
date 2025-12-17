@@ -49,6 +49,13 @@ class Config:
     # Notion credentials
     NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
     NOTION_PARENT_PAGE_ID = os.getenv("NOTION_PARENT_PAGE_ID", "")
+    NOTION_VERSION = os.getenv("NOTION_VERSION", "2025-09-03")
+    
+    # Notion pipeline settings
+    NOTION_PIPELINE_MAX_PAGES = int(os.getenv("NOTION_PIPELINE_MAX_PAGES", "2000"))
+    NOTION_PIPELINE_DEEP_FETCH = os.getenv("NOTION_PIPELINE_DEEP_FETCH", "false").lower() == "true"
+    NOTION_PIPELINE_FETCH_BLOCKS = os.getenv("NOTION_PIPELINE_FETCH_BLOCKS", "false").lower() == "true"
+    NOTION_API_RATE_LIMIT_DELAY = float(os.getenv("NOTION_API_RATE_LIMIT_DELAY", "0.35"))  # seconds between requests
 
     # Google OAuth (app-level)
     GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")

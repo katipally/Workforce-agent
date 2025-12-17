@@ -1494,13 +1494,14 @@ async def chat_message(
     Returns:
         Chat response with answer and sources
     """
+    brain = None
     try:
         brain = await _build_ai_brain_for_user(current_user)
 
         # Collect streaming response into single output
         full_response = ""
         sources = []
-        
+
         prefs_dict = request.source_prefs.dict() if request.source_prefs else None
 
         async for event in brain.stream_query(
@@ -1509,20 +1510,26 @@ async def chat_message(
             user_email=current_user.email,
             source_prefs=prefs_dict,
         ):
-            if event.get('type') == 'token':
-                full_response += event.get('content', '')
-            elif event.get('type') == 'sources':
-                sources = event.get('content', [])
-        
+            if event.get("type") == "token":
+                full_response += event.get("content", "")
+            elif event.get("type") == "sources":
+                sources = event.get("content", [])
+
         return ChatResponse(
             response=full_response,
             sources=sources,
             intent="general"  # AI Brain doesn't expose intent separately
         )
-    
+
     except Exception as e:
         logger.error(f"Error in chat: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        try:
+            if brain and hasattr(brain, "close"):
+                await brain.close()
+        except Exception:
+            pass
 
 
 def _truncate_history(history: List[Dict[str, str]], max_messages: int = 40, max_chars: int = 8000) -> List[Dict[str, str]]:
@@ -1754,8 +1761,13 @@ async def websocket_chat(websocket: WebSocket):
         # Clean shutdown - no error logging for normal disconnects
         logger.debug("WebSocket connection closed")
         try:
+            if brain and hasattr(brain, "close"):
+                await brain.close()
+        except Exception:
+            pass
+        try:
             await websocket.close()
-        except:
+        except Exception:
             pass
 
 
@@ -3663,9 +3675,9 @@ def _serialize_workflow_run(run) -> Dict[str, Any]:
 
 @app.get("/api/v2/workflows")
 async def list_user_workflows(user: AppUser = Depends(get_current_user)):
-    """List all workflows for the current user."""
+    """List all workflows for the workspace (shared)."""
     try:
-        workflows = db_manager.list_user_workflows(user.id)
+        workflows = db_manager.list_user_workflows()
         return {"workflows": [_serialize_user_workflow(wf) for wf in workflows]}
     except Exception as e:
         logger.error(f"Error listing user workflows: {e}", exc_info=True)
@@ -3702,7 +3714,7 @@ async def get_user_workflow(
 ):
     """Get a specific workflow by ID."""
     try:
-        workflow = db_manager.get_user_workflow(workflow_id, user.id)
+        workflow = db_manager.get_user_workflow(workflow_id)
         if not workflow:
             raise HTTPException(status_code=404, detail="Workflow not found")
         return _serialize_user_workflow(workflow)
@@ -3722,7 +3734,7 @@ async def update_user_workflow(
     """Update a workflow's configuration."""
     try:
         updates = {k: v for k, v in req.model_dump().items() if v is not None}
-        workflow = db_manager.update_user_workflow(workflow_id, user.id, **updates)
+        workflow = db_manager.update_user_workflow(workflow_id, None, **updates)
         if not workflow:
             raise HTTPException(status_code=404, detail="Workflow not found")
         return _serialize_user_workflow(workflow)
@@ -3740,7 +3752,7 @@ async def delete_user_workflow(
 ):
     """Delete a workflow and all its runs."""
     try:
-        deleted = db_manager.delete_user_workflow(workflow_id, user.id)
+        deleted = db_manager.delete_user_workflow(workflow_id, None)
         if not deleted:
             raise HTTPException(status_code=404, detail="Workflow not found")
         return {"status": "ok"}
@@ -3758,25 +3770,94 @@ async def run_user_workflow(
 ):
     """Trigger a manual run of a workflow."""
     try:
-        workflow = db_manager.get_user_workflow(workflow_id, user.id)
+        workflow = db_manager.get_user_workflow(workflow_id)
         if not workflow:
             raise HTTPException(status_code=404, detail="Workflow not found")
 
         # Import and run the workflow engine
         from workflows.workflow_engine import WorkflowExecutionEngine
-        engine = WorkflowExecutionEngine(db_manager, user.id)
-        
-        # Run in background thread to avoid blocking
-        result = await _run_in_executor(
-            lambda: asyncio.run(engine.execute_workflow(workflow_id))
-        )
-        
-        return result
+        engine = WorkflowExecutionEngine(db_manager, workflow.owner_user_id)
+
+        # Create a run record immediately so the UI can poll for status/logs.
+        run = db_manager.create_workflow_run(workflow_id)
+        run_id = run.id
+
+        # Run in background thread to avoid blocking the API.
+        loop = asyncio.get_running_loop()
+
+        def _runner():
+            return asyncio.run(engine.execute_workflow(workflow_id, run_id=run_id))
+
+        fut = loop.run_in_executor(None, _runner)
+
+        def _done_callback(f):
+            try:
+                _ = f.result()
+            except Exception as e:  # pragma: no cover
+                logger.error(f"Background workflow run failed (workflow_id={workflow_id}, run_id={run_id}): {e}", exc_info=True)
+
+        fut.add_done_callback(_done_callback)
+
+        return {"run_id": run_id, "status": "running"}
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error running user workflow {workflow_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to run workflow")
+
+
+class WorkflowRunResolveRequest(BaseModel):
+    selection: str
+
+
+@app.post("/api/v2/workflows/{workflow_id}/runs/{run_id}/resolve")
+async def resolve_workflow_run_conflict(
+    workflow_id: str,
+    run_id: str,
+    req: WorkflowRunResolveRequest,
+    user: AppUser = Depends(get_current_user),
+):
+    """Resolve a paused workflow run conflict and resume execution."""
+    try:
+        workflow = db_manager.get_user_workflow(workflow_id)
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+
+        run = db_manager.get_workflow_run(run_id)
+        if not run or run.workflow_id != workflow_id:
+            raise HTTPException(status_code=404, detail="Run not found")
+
+        if run.status != "awaiting_user_input":
+            raise HTTPException(status_code=400, detail="Run is not awaiting user input")
+
+        selection = (req.selection or "").strip()
+        if not selection:
+            raise HTTPException(status_code=400, detail="selection is required")
+
+        from workflows.workflow_engine import WorkflowExecutionEngine
+        engine = WorkflowExecutionEngine(db_manager, workflow.owner_user_id)
+
+        loop = asyncio.get_running_loop()
+
+        def _runner():
+            return asyncio.run(engine.resume_workflow_run(workflow_id, run_id, selection))
+
+        fut = loop.run_in_executor(None, _runner)
+
+        def _done_callback(f):
+            try:
+                _ = f.result()
+            except Exception as e:  # pragma: no cover
+                logger.error(f"Background workflow resume failed (workflow_id={workflow_id}, run_id={run_id}): {e}", exc_info=True)
+
+        fut.add_done_callback(_done_callback)
+
+        return {"run_id": run_id, "status": "running"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error resolving workflow run conflict {run_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to resolve workflow run conflict")
 
 
 @app.get("/api/v2/workflows/{workflow_id}/runs")
@@ -3787,7 +3868,7 @@ async def list_workflow_runs(
 ):
     """List runs for a workflow."""
     try:
-        workflow = db_manager.get_user_workflow(workflow_id, user.id)
+        workflow = db_manager.get_user_workflow(workflow_id)
         if not workflow:
             raise HTTPException(status_code=404, detail="Workflow not found")
 
@@ -3808,7 +3889,7 @@ async def get_workflow_run(
 ):
     """Get details of a specific workflow run."""
     try:
-        workflow = db_manager.get_user_workflow(workflow_id, user.id)
+        workflow = db_manager.get_user_workflow(workflow_id)
         if not workflow:
             raise HTTPException(status_code=404, detail="Workflow not found")
 
@@ -3832,7 +3913,7 @@ async def cancel_workflow_run(
 ):
     """Cancel a running workflow."""
     try:
-        workflow = db_manager.get_user_workflow(workflow_id, user.id)
+        workflow = db_manager.get_user_workflow(workflow_id)
         if not workflow:
             raise HTTPException(status_code=404, detail="Workflow not found")
 
@@ -4858,27 +4939,30 @@ def _run_gmail_pipeline(run_id: str, label_id: str, user_id: str) -> None:
 
     logger.info("Starting Gmail pipeline run %s for label %s (user_id=%s)", run_id, label_id, user_id)
 
-    run_info = gmail_pipeline_runs.get(run_id) or {}
-    gmail_pipeline_runs[run_id] = run_info
-    run_info.setdefault("cancel_requested", False)
-    run_info["status"] = "running"
-    run_info["started_at"] = datetime.utcnow().isoformat()
-    run_info["label_id"] = label_id
-    run_info["user_id"] = user_id
+    run_stats: Dict[str, Any] = {"label_id": label_id}
+    _update_pipeline_run(run_id, status="running", started_at=datetime.utcnow(), stats=run_stats)
 
     creds = _build_google_credentials_for_user_id(user_id)
     if not creds:
-        run_info["status"] = "failed"
-        run_info["finished_at"] = datetime.utcnow().isoformat()
-        run_info["error"] = "Gmail not authorized for user"
+        _update_pipeline_run(
+            run_id,
+            status="failed",
+            finished_at=datetime.utcnow(),
+            error="Gmail not authorized for user",
+            stats=run_stats,
+        )
         logger.error("No valid Gmail credentials for user %s in pipeline run %s", user_id, run_id)
         return
 
     client = GmailClient()
     if not client.init_with_credentials(creds):
-        run_info["status"] = "failed"
-        run_info["finished_at"] = datetime.utcnow().isoformat()
-        run_info["error"] = "Gmail authentication failed"
+        _update_pipeline_run(
+            run_id,
+            status="failed",
+            finished_at=datetime.utcnow(),
+            error="Gmail authentication failed",
+            stats=run_stats,
+        )
         logger.error("Gmail authentication failed for pipeline run %s", run_id)
         return
 
@@ -4927,12 +5011,15 @@ def _run_gmail_pipeline(run_id: str, label_id: str, user_id: str) -> None:
         with db_manager.get_session() as session:
             while not stop and processed_new < max_new_messages:
                 # Cooperative cancellation support
-                if run_info.get("cancel_requested"):
+                if _is_cancel_requested(run_id):
                     session.commit()
-                    run_info["status"] = "cancelled"
-                    run_info["finished_at"] = datetime.utcnow().isoformat()
-                    run_info["message_count"] = len(messages)
-                    gmail_run_messages[run_id] = messages
+                    run_stats["message_count"] = len(messages)
+                    _update_pipeline_run(
+                        run_id,
+                        status="cancelled",
+                        finished_at=datetime.utcnow(),
+                        stats=run_stats,
+                    )
                     logger.info("Gmail pipeline run %s cancelled", run_id)
                     return
 
@@ -5105,9 +5192,13 @@ def _run_gmail_pipeline(run_id: str, label_id: str, user_id: str) -> None:
             session.commit()
 
         gmail_run_messages[run_id] = messages
-        run_info["status"] = "completed"
-        run_info["finished_at"] = datetime.utcnow().isoformat()
-        run_info["message_count"] = len(messages)
+        run_stats["message_count"] = len(messages)
+        _update_pipeline_run(
+            run_id,
+            status="completed",
+            finished_at=datetime.utcnow(),
+            stats=run_stats,
+        )
 
         if newest_ts_ms > last_ts_ms:
             if account_email:
@@ -5136,17 +5227,24 @@ def _run_gmail_pipeline(run_id: str, label_id: str, user_id: str) -> None:
                     source_ids=[label_id],
                     db_manager=db_manager
                 )
-                run_info["embedding_stats"] = embed_stats
+                run_stats["embedding_stats"] = embed_stats
+                _update_pipeline_run(run_id, stats=run_stats)
                 logger.info("✓ Gmail embeddings synced: %s", embed_stats)
             except Exception as embed_error:
                 logger.error(f"Embedding sync failed (non-fatal): {embed_error}")
-                run_info["embedding_error"] = str(embed_error)
+                run_stats["embedding_error"] = str(embed_error)
+                _update_pipeline_run(run_id, stats=run_stats)
 
     except Exception as e:  # pragma: no cover - defensive logging
         logger.error(f"Gmail pipeline run {run_id} failed: {e}", exc_info=True)
-        run_info["status"] = "failed"
-        run_info["finished_at"] = datetime.utcnow().isoformat()
-        run_info["error"] = str(e)
+        run_stats["error"] = str(e)
+        _update_pipeline_run(
+            run_id,
+            status="failed",
+            finished_at=datetime.utcnow(),
+            error=str(e),
+            stats=run_stats,
+        )
 
 
 @app.get("/api/pipelines/gmail/labels")
@@ -5201,14 +5299,16 @@ async def run_gmail_pipeline(label_id: str, current_user: AppUser = Depends(get_
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Gmail not authorized")
 
     run_id = uuid.uuid4().hex
-    gmail_pipeline_runs[run_id] = {
-        "run_id": run_id,
-        "label_id": label_id,
-        "user_id": current_user.id,
-        "status": "pending",
-        "created_at": datetime.utcnow().isoformat(),
-        "cancel_requested": False,
-    }
+
+    with db_manager.get_session() as session:
+        pipeline_run = PipelineRun(
+            run_id=run_id,
+            pipeline_type="gmail",
+            status="pending",
+            config={"label_id": label_id, "user_id": current_user.id},
+        )
+        session.add(pipeline_run)
+        session.commit()
 
     thread = threading.Thread(target=_run_gmail_pipeline, args=(run_id, label_id, current_user.id), daemon=True)
     thread.start()
@@ -5220,10 +5320,15 @@ async def run_gmail_pipeline(label_id: str, current_user: AppUser = Depends(get_
 async def get_gmail_pipeline_status(run_id: str, current_user: AppUser = Depends(get_current_user)):
     """Get the status of a Gmail pipeline run."""
 
-    run = gmail_pipeline_runs.get(run_id)
-    if not run or run.get("user_id") != current_user.id:
+    run = _get_pipeline_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    cfg = run.get("config") or {}
+    if cfg.get("user_id") != current_user.id:
         # Hide existence of other users' runs
         raise HTTPException(status_code=404, detail="Run not found")
+
     return run
 
 
@@ -5231,26 +5336,36 @@ async def get_gmail_pipeline_status(run_id: str, current_user: AppUser = Depends
 async def stop_gmail_pipeline(run_id: str, current_user: AppUser = Depends(get_current_user)):
     """Request cancellation of a Gmail pipeline run."""
 
-    run = gmail_pipeline_runs.get(run_id)
-    if not run or run.get("user_id") != current_user.id:
+    run = _get_pipeline_run(run_id)
+    if not run:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    run["cancel_requested"] = True
+    cfg = run.get("config") or {}
+    if cfg.get("user_id") != current_user.id:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    updates: Dict[str, Any] = {"cancel_requested": True}
     if run.get("status") in ("pending", "running"):
-        run["status"] = "cancelling"
-    run["finished_at"] = datetime.utcnow().isoformat()
-    return run
+        updates["status"] = "cancelling"
+    _update_pipeline_run(run_id, **updates)
+
+    refreshed = _get_pipeline_run(run_id)
+    return refreshed or {"run_id": run_id, "status": "cancelling"}
 
 
 @app.get("/api/pipelines/gmail/messages")
 async def get_gmail_pipeline_messages(run_id: str, current_user: AppUser = Depends(get_current_user)):
     """Return messages for a specific Gmail pipeline run."""
 
-    run = gmail_pipeline_runs.get(run_id)
+    run = _get_pipeline_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    label_id = run.get("label_id")
+    cfg = run.get("config") or {}
+    if cfg.get("user_id") != current_user.id:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    label_id = cfg.get("label_id")
 
     # Always prefer DB-backed messages when available, but fall back to the
     # in-memory run results so the user sees emails immediately after a run
@@ -5593,6 +5708,25 @@ def _summarize_notion_blocks(
     return lines, attachments, child_databases
 
 
+def _flatten_notion_block_tree(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    flat: List[Dict[str, Any]] = []
+    stack: List[Dict[str, Any]] = []
+    for b in blocks or []:
+        if isinstance(b, dict):
+            stack.append(b)
+    while stack:
+        block = stack.pop()
+        if not isinstance(block, dict):
+            continue
+        flat.append(block)
+        children = block.get("_children")
+        if isinstance(children, list) and children:
+            for child in children:
+                if isinstance(child, dict):
+                    stack.append(child)
+    return flat
+
+
 def _query_notion_database_for_api(database_id: str, db_title: Optional[str] = None) -> Dict[str, Any]:
     """Query a Notion database and return its entries formatted for the API.
     
@@ -5678,15 +5812,42 @@ def _query_notion_database_for_api(database_id: str, db_title: Optional[str] = N
             formatted_entries.append(entry_data)
         
         return {
+            "requested_database_id": database_id,
             "database_id": actual_db_id,
             "title": "".join(t.get("plain_text", "") for t in db_meta.get("title", [])) if db_meta else db_title,
             "columns": ordered_columns,
             "entries": formatted_entries,
             "total": len(formatted_entries),
+            "properties": schema,
         }
     except Exception as e:
         logger.error(f"Error querying database {database_id}: {e}")
-        return {"entries": [], "error": str(e)}
+        return {"requested_database_id": database_id, "entries": [], "error": str(e)}
+
+
+def _build_database_schema_cache(
+    *,
+    properties: Dict[str, Any],
+    db_data: Dict[str, Any],
+) -> Dict[str, Any]:
+    schema_data: Dict[str, Any] = {"properties": properties or {}}
+    if isinstance(db_data, dict):
+        if db_data.get("database_id"):
+            schema_data["cached_database_id"] = db_data.get("database_id")
+        if db_data.get("requested_database_id"):
+            schema_data["cached_requested_database_id"] = db_data.get("requested_database_id")
+        if db_data.get("title") is not None:
+            schema_data["cached_title"] = db_data.get("title")
+        if db_data.get("columns") is not None:
+            schema_data["cached_columns"] = db_data.get("columns")
+        if db_data.get("entries") is not None:
+            schema_data["cached_entries"] = db_data.get("entries")
+        if db_data.get("total") is not None:
+            schema_data["cached_total"] = db_data.get("total")
+        if db_data.get("error") is not None:
+            schema_data["cached_error"] = db_data.get("error")
+    schema_data["cached_at"] = datetime.utcnow().isoformat()
+    return schema_data
 
 
 def _persist_notion_pages(
@@ -5753,6 +5914,18 @@ def _persist_notion_pages(
                 db_page.url = p.get("url")
                 db_page.parent_id = p.get("parent_id")
 
+                # Persist icon and cover metadata
+                if p.get("icon") is not None:
+                    db_page.icon = p.get("icon")
+                if p.get("cover") is not None:
+                    db_page.cover = p.get("cover")
+
+                # Persist deep-fetched blocks and schema
+                if p.get("blocks_data") is not None:
+                    db_page.blocks_data = p.get("blocks_data")
+                if p.get("schema_data") is not None:
+                    db_page.schema_data = p.get("schema_data")
+
                 last_edited_str = p.get("last_edited_time")
                 if last_edited_str:
                     try:
@@ -5781,8 +5954,125 @@ def _persist_notion_pages(
         logger.error(f"Failed to persist Notion pages: {e}", exc_info=True)
 
 
-def _run_notion_pipeline(run_id: str) -> None:
+def _fetch_notion_blocks(page_id: str, headers: Dict[str, str], max_depth: int = 3) -> List[Dict[str, Any]]:
+    """Recursively fetch all blocks for a Notion page with rate limiting."""
+    import time
+    all_blocks: List[Dict[str, Any]] = []
+    
+    def fetch_children(block_id: str, depth: int) -> List[Dict[str, Any]]:
+        if depth > max_depth:
+            return []
+        blocks: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
+        
+        while True:
+            time.sleep(Config.NOTION_API_RATE_LIMIT_DELAY)
+            params: Dict[str, Any] = {"page_size": 100}
+            if cursor:
+                params["start_cursor"] = cursor
+            
+            try:
+                resp = requests.get(
+                    f"https://api.notion.com/v1/blocks/{block_id}/children",
+                    headers=headers,
+                    params=params,
+                    timeout=30,
+                )
+                if resp.status_code != 200:
+                    break
+                data = resp.json()
+                results = data.get("results", []) or []
+                
+                for block in results:
+                    block_copy = dict(block)
+                    blocks.append(block_copy)
+                    # Recursively fetch children for blocks that have them
+                    if block.get("has_children"):
+                        child_blocks = fetch_children(block.get("id"), depth + 1)
+                        block_copy["_children"] = child_blocks
+                
+                if not data.get("has_more"):
+                    break
+                cursor = data.get("next_cursor")
+            except Exception as e:
+                logger.warning(f"Error fetching blocks for {block_id}: {e}")
+                break
+        
+        return blocks
+    
+    return fetch_children(page_id, 0)
+
+
+def _fetch_notion_database_schema(database_id: str, headers: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    """Fetch database schema/properties."""
+    import time
+    time.sleep(Config.NOTION_API_RATE_LIMIT_DELAY)
+    try:
+        resp = requests.get(
+            f"https://api.notion.com/v1/databases/{database_id}",
+            headers=headers,
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            db_data = resp.json() or {}
+            data_sources = db_data.get("data_sources") or []
+            ds_id = None
+            if isinstance(data_sources, list) and data_sources:
+                first = data_sources[0]
+                if isinstance(first, dict):
+                    ds_id = first.get("id")
+
+            if ds_id:
+                ds_resp = requests.get(
+                    f"https://api.notion.com/v1/data_sources/{ds_id}",
+                    headers=headers,
+                    timeout=30,
+                )
+                if ds_resp.status_code == 200:
+                    ds_data = ds_resp.json() or {}
+                    return {
+                        "properties": ds_data.get("properties", {}),
+                        "title": db_data.get("title", []),
+                        "description": db_data.get("description", []),
+                        "is_inline": db_data.get("is_inline", False),
+                        "data_source_id": ds_id,
+                    }
+
+            return {
+                "properties": db_data.get("properties", {}),
+                "title": db_data.get("title", []),
+                "description": db_data.get("description", []),
+                "is_inline": db_data.get("is_inline", False),
+            }
+
+        # Also support passing a data_source_id directly (common in 2025+).
+        ds_resp = requests.get(
+            f"https://api.notion.com/v1/data_sources/{database_id}",
+            headers=headers,
+            timeout=30,
+        )
+        if ds_resp.status_code == 200:
+            ds_data = ds_resp.json() or {}
+            parent = ds_data.get("parent") or {}
+            return {
+                "properties": ds_data.get("properties", {}),
+                "title": ds_data.get("title", []),
+                "description": ds_data.get("description", []),
+                "data_source_id": ds_data.get("id") or database_id,
+                "database_id": parent.get("database_id"),
+            }
+    except Exception as e:
+        logger.warning(f"Error fetching database schema for {database_id}: {e}")
+    return None
+
+
+def _run_notion_pipeline(
+    run_id: str,
+    deep_fetch_override: Optional[bool] = None,
+    fetch_blocks_override: Optional[bool] = None,
+) -> None:
     """Background worker to fetch Notion pages under NOTION_PARENT_PAGE_ID."""
+    import time
 
     _update_pipeline_run(run_id, status="running", started_at=datetime.utcnow())
 
@@ -5801,12 +6091,22 @@ def _run_notion_pipeline(run_id: str) -> None:
     workspace_name = Config.WORKSPACE_NAME or "Notion Workspace"
 
     pages: List[Dict[str, Any]] = []
-    max_pages = 500
+    max_pages = Config.NOTION_PIPELINE_MAX_PAGES
+    deep_fetch = (
+        deep_fetch_override
+        if deep_fetch_override is not None
+        else Config.NOTION_PIPELINE_DEEP_FETCH
+    )
+    fetch_blocks = (
+        fetch_blocks_override
+        if fetch_blocks_override is not None
+        else Config.NOTION_PIPELINE_FETCH_BLOCKS
+    )
 
     try:
         headers = {
             "Authorization": f"Bearer {token}",
-            "Notion-Version": "2022-06-28",
+            "Notion-Version": Config.NOTION_VERSION,
             "Content-Type": "application/json",
         }
 
@@ -5867,7 +6167,7 @@ def _run_notion_pipeline(run_id: str) -> None:
 
             for page in results:
                 obj_type = page.get("object")
-                if obj_type not in ("page", "database"):
+                if obj_type not in ("page", "database", "data_source"):
                     continue
 
                 parent_obj = page.get("parent", {}) or {}
@@ -5877,18 +6177,38 @@ def _run_notion_pipeline(run_id: str) -> None:
                     parent_id = parent_obj.get("page_id")
                 elif parent_type == "database_id":
                     parent_id = parent_obj.get("database_id")
+                elif parent_type == "data_source_id":
+                    parent_id = parent_obj.get("database_id") or parent_obj.get("data_source_id")
 
-                pages.append(
-                    {
-                        "id": page.get("id"),
-                        "title": _extract_notion_title(page),
-                        "url": page.get("url"),
-                        "last_edited_time": page.get("last_edited_time"),
-                        "object_type": obj_type,
-                        "parent_id": parent_id,
-                        "raw": page,
-                    }
-                )
+                normalized_obj_type = "database" if obj_type == "data_source" else obj_type
+                page_data: Dict[str, Any] = {
+                    "id": page.get("id"),
+                    "title": _extract_notion_title(page),
+                    "url": page.get("url"),
+                    "last_edited_time": page.get("last_edited_time"),
+                    "object_type": normalized_obj_type,
+                    "parent_id": parent_id,
+                    "icon": page.get("icon"),
+                    "cover": page.get("cover"),
+                    "raw": page,
+                }
+
+                # Deep fetch blocks and schema if enabled
+                if deep_fetch:
+                    page_id = page.get("id")
+                    if obj_type in ("database", "data_source"):
+                        # Fetch database schema (properties live on data source in 2025 API)
+                        schema = _fetch_notion_database_schema(page_id, headers)
+                        if schema:
+                            page_data["schema_data"] = schema
+                    
+                    if fetch_blocks and obj_type == "page":
+                        # Fetch page blocks (skip for databases as they have rows, not blocks)
+                        blocks = _fetch_notion_blocks(page_id, headers, max_depth=3)
+                        if blocks:
+                            page_data["blocks_data"] = blocks
+
+                pages.append(page_data)
 
                 if len(pages) >= max_pages:
                     break
@@ -5899,9 +6219,13 @@ def _run_notion_pipeline(run_id: str) -> None:
             if not data.get("has_more"):
                 break
             start_cursor = data.get("next_cursor")
+            time.sleep(Config.NOTION_API_RATE_LIMIT_DELAY)  # Rate limit between search pages
 
         notion_run_pages[run_id] = pages
         _persist_notion_pages(workspace_id, workspace_name, pages, full_refresh=True)
+
+        global _notion_hierarchy_cache
+        _notion_hierarchy_cache = (0.0, {})
         
         run_stats = {"page_count": len(pages)}
         _update_pipeline_run(
@@ -5941,8 +6265,12 @@ def _run_notion_pipeline(run_id: str) -> None:
 
 
 @app.post("/api/pipelines/notion/run")
-async def run_notion_pipeline():
-    """Trigger a Notion pipeline run to list pages under NOTION_PARENT_PAGE_ID."""
+async def run_notion_pipeline(mode: str = "titles"):
+    """Trigger a Notion pipeline run.
+
+    mode=titles: fast refresh that only persists titles/metadata.
+    mode=deep: optional deep fetch (blocks/schema) based on env.
+    """
 
     run_id = uuid.uuid4().hex
     
@@ -5956,7 +6284,19 @@ async def run_notion_pipeline():
         session.add(pipeline_run)
         session.commit()
 
-    thread = threading.Thread(target=_run_notion_pipeline, args=(run_id,), daemon=True)
+    mode_norm = (mode or "titles").strip().lower()
+    if mode_norm == "deep":
+        deep_fetch_override = True
+        fetch_blocks_override = True
+    else:
+        deep_fetch_override = False
+        fetch_blocks_override = False
+
+    thread = threading.Thread(
+        target=_run_notion_pipeline,
+        args=(run_id, deep_fetch_override, fetch_blocks_override),
+        daemon=True,
+    )
     thread.start()
 
     return {"run_id": run_id, "status": "started"}
@@ -6084,7 +6424,12 @@ async def get_notion_hierarchy():
 
 
 @app.get("/api/notion/page-content")
-async def get_notion_page_content(page_id: str, include_databases: bool = True):
+async def get_notion_page_content(
+    page_id: str,
+    include_databases: bool = True,
+    refresh: bool = False,
+    cache_only: bool = False,
+):
     """Get content of a Notion page including any embedded databases.
     
     Args:
@@ -6098,9 +6443,132 @@ async def get_notion_page_content(page_id: str, include_databases: bool = True):
             detail="NOTION_TOKEN is not configured. Please set it in your environment.",
         )
 
+    global _notion_hierarchy_cache
+
+    if cache_only and not refresh:
+        with db_manager.get_session() as session:
+            db_page = session.query(NotionPage).filter_by(page_id=page_id).first()
+
+            if not db_page:
+                return {
+                    "page_id": page_id,
+                    "content": "",
+                    "attachments": [],
+                    "is_database": False,
+                    "child_databases": [],
+                    "cached": False,
+                    "message": "Not found in local DB. Refresh titles list first.",
+                }
+
+            obj_type = (db_page.object_type or "page").lower()
+            if obj_type == "database":
+                schema = db_page.schema_data or {}
+                props = schema.get("properties") if isinstance(schema, dict) else {}
+                columns = list(props.keys()) if isinstance(props, dict) else []
+
+                cached_columns = schema.get("cached_columns") if isinstance(schema, dict) else None
+                cached_entries = schema.get("cached_entries") if isinstance(schema, dict) else None
+                cached_total = schema.get("cached_total") if isinstance(schema, dict) else None
+                cached_error = schema.get("cached_error") if isinstance(schema, dict) else None
+
+                if isinstance(cached_columns, list) and cached_columns:
+                    columns = cached_columns
+                entries = cached_entries if isinstance(cached_entries, list) else []
+                total = cached_total if isinstance(cached_total, int) else len(entries)
+
+                return {
+                    "page_id": page_id,
+                    "content": "",
+                    "attachments": [],
+                    "is_database": True,
+                    "database": {
+                        "database_id": page_id,
+                        "title": schema.get("cached_title") if isinstance(schema, dict) and schema.get("cached_title") else (db_page.title or "Untitled"),
+                        "columns": columns,
+                        "entries": entries,
+                        "total": total,
+                        "error": cached_error
+                        if cached_error
+                        else ("Not refreshed. Click Refresh to fetch entries." if not entries else None),
+                    },
+                    "child_databases": [],
+                    "cached": bool(entries) or bool(db_page.schema_data),
+                }
+
+            blocks = db_page.blocks_data or []
+            if not blocks:
+                return {
+                    "page_id": page_id,
+                    "content": "",
+                    "attachments": [],
+                    "is_database": False,
+                    "child_databases": [],
+                    "cached": False,
+                    "message": "No cached content. Click Refresh to fetch page data.",
+                }
+
+            flat_blocks = _flatten_notion_block_tree(blocks) if isinstance(blocks, list) else []
+            text_lines, attachments, child_databases = _summarize_notion_blocks(
+                flat_blocks, include_databases=include_databases
+            )
+
+            databases_content: List[Dict[str, Any]] = []
+            if include_databases and child_databases:
+                for db_ref in child_databases:
+                    db_id = db_ref.get("id") if isinstance(db_ref, dict) else None
+                    db_title = db_ref.get("title", "Database") if isinstance(db_ref, dict) else "Database"
+                    if db_id:
+                        cached_db = session.query(NotionPage).filter_by(page_id=db_id).first()
+                        if cached_db and cached_db.schema_data:
+                            schema = cached_db.schema_data or {}
+                            props = schema.get("properties") if isinstance(schema, dict) else {}
+                            columns = list(props.keys()) if isinstance(props, dict) else []
+                            cached_columns = schema.get("cached_columns") if isinstance(schema, dict) else None
+                            cached_entries = schema.get("cached_entries") if isinstance(schema, dict) else None
+                            cached_total = schema.get("cached_total") if isinstance(schema, dict) else None
+                            cached_error = schema.get("cached_error") if isinstance(schema, dict) else None
+                            if isinstance(cached_columns, list) and cached_columns:
+                                columns = cached_columns
+                            entries = cached_entries if isinstance(cached_entries, list) else []
+                            total = cached_total if isinstance(cached_total, int) else len(entries)
+                            databases_content.append(
+                                {
+                                    "database_id": db_id,
+                                    "title": schema.get("cached_title")
+                                    if isinstance(schema, dict) and schema.get("cached_title")
+                                    else (cached_db.title or db_title),
+                                    "columns": columns,
+                                    "entries": entries,
+                                    "total": total,
+                                    "error": cached_error
+                                    if cached_error
+                                    else ("Not refreshed. Click Refresh to fetch entries." if not entries else None),
+                                }
+                            )
+                        else:
+                            databases_content.append(
+                                {
+                                    "database_id": db_id,
+                                    "title": db_title,
+                                    "columns": [],
+                                    "entries": [],
+                                    "total": 0,
+                                    "error": "Not refreshed. Click Refresh to fetch entries.",
+                                }
+                            )
+
+            return {
+                "page_id": page_id,
+                "content": "\n".join(text_lines),
+                "attachments": attachments,
+                "is_database": False,
+                "child_databases": databases_content,
+                "cached": True,
+            }
+
     headers = {
         "Authorization": f"Bearer {token}",
-        "Notion-Version": "2022-06-28",
+        "Notion-Version": Config.NOTION_VERSION,
         "Content-Type": "application/json",
     }
 
@@ -6108,134 +6576,230 @@ async def get_notion_page_content(page_id: str, include_databases: bool = True):
     next_cursor: Optional[str] = None
 
     try:
-        # First check if this page_id is actually a database
-        from core.notion_export.client import NotionClient
-        client = NotionClient(token)
-        db_meta = client.get_database(page_id)
-        
-        if db_meta:
-            # It's a database! Query it directly
-            logger.info(f"Page {page_id} is a database, querying directly")
-            db_data = _query_notion_database_for_api(page_id)
-            
-            # If database has entries, return as database
-            if db_data.get("entries"):
-                return {
-                    "page_id": page_id,
-                    "content": "",
-                    "attachments": [],
-                    "is_database": True,
-                    "database": db_data,
-                    "child_databases": [],
-                }
-            else:
-                # Database exists but no entries - might be a linked view
-                # Try to find the original database by title
-                db_title = db_data.get("title")
-                if db_title:
-                    logger.info(f"Database {page_id} has 0 entries, searching for original by title '{db_title}'")
-                    original_db = client.find_database_by_title(db_title)
-                    if original_db and original_db.get("id") != page_id:
-                        original_id = original_db.get("id")
-                        logger.info(f"Found original database: {original_id}")
-                        db_data = _query_notion_database_for_api(original_id, db_title=db_title)
-                        if db_data.get("entries"):
-                            return {
-                                "page_id": page_id,
-                                "content": "",
-                                "attachments": [],
-                                "is_database": True,
-                                "database": db_data,
-                                "child_databases": [],
-                            }
-                
-                # Still no entries - return what we have
-                return {
-                    "page_id": page_id,
-                    "content": "",
-                    "attachments": [],
-                    "is_database": True,
-                    "database": db_data,
-                    "child_databases": [],
-                }
+        if not refresh:
+            return {
+                "page_id": page_id,
+                "content": "",
+                "attachments": [],
+                "is_database": False,
+                "child_databases": [],
+                "cached": False,
+                "message": "Cache-only mode required unless refresh=true.",
+            }
 
-        # Helper function to recursively fetch blocks
-        def fetch_blocks_recursive(block_id: str, depth: int = 0, max_depth: int = 5) -> List[Dict[str, Any]]:
-            """Recursively fetch all blocks including children (for tables, toggles, etc.)"""
-            if depth > max_depth:
-                return []
-            
-            blocks: List[Dict[str, Any]] = []
-            cursor: Optional[str] = None
-            
-            while True:
-                params: Dict[str, Any] = {"page_size": 100}
-                if cursor:
-                    params["start_cursor"] = cursor
-
-                resp = requests.get(
-                    f"https://api.notion.com/v1/blocks/{block_id}/children",
-                    headers=headers,
-                    params=params,
-                    timeout=30,
-                )
-
-                if resp.status_code != 200:
-                    logger.error(
-                        "Notion blocks API error %s for block %s: %s",
-                        resp.status_code,
-                        block_id,
-                        resp.text[:200],
-                    )
-                    break
-
-                data = resp.json()
-                results = data.get("results", []) or []
-                
-                for block in results:
-                    blocks.append(block)
-                    # Recursively fetch children for blocks that have them
-                    # (tables, toggles, columns, synced_blocks, etc.)
-                    if block.get("has_children"):
-                        child_blocks = fetch_blocks_recursive(block.get("id"), depth + 1, max_depth)
-                        blocks.extend(child_blocks)
-
-                if not data.get("has_more"):
-                    break
-                cursor = data.get("next_cursor")
-                if not cursor:
-                    break
-            
-            return blocks
-
-        # It's a regular page - get blocks recursively
-        all_blocks = fetch_blocks_recursive(page_id)
-
-        text_lines, attachments, child_databases = _summarize_notion_blocks(
-            all_blocks, include_databases=include_databases
+        page_meta_resp = requests.get(
+            f"https://api.notion.com/v1/pages/{page_id}",
+            headers=headers,
+            timeout=30,
         )
-        content = "\n".join(text_lines)
+        if page_meta_resp.status_code == 200:
+            page_meta = page_meta_resp.json()
 
-        # Query any child databases found
-        databases_content = []
-        if include_databases and child_databases:
-            for db_ref in child_databases:
-                db_id = db_ref.get("id")
-                db_title = db_ref.get("title", "Database")
-                if db_id:
-                    # Pass title so we can find original if this is a linked view
-                    db_data = _query_notion_database_for_api(db_id, db_title=db_title)
-                    if not db_data.get("title"):
-                        db_data["title"] = db_title
-                    databases_content.append(db_data)
+            with db_manager.get_session() as session:
+                existing = session.query(NotionPage).filter_by(page_id=page_id).first()
+                workspace_id = (
+                    existing.workspace_id
+                    if existing and existing.workspace_id
+                    else (Config.WORKSPACE_ID or "default-notion-workspace")
+                )
+                ws = session.query(NotionWorkspace).filter_by(workspace_id=workspace_id).first()
+                workspace_name = ws.name if ws and ws.name else (Config.WORKSPACE_NAME or "Notion Workspace")
 
-        return {
-            "page_id": page_id,
-            "content": content,
-            "attachments": attachments,
-            "is_database": False,
-            "child_databases": databases_content,
-        }
+            blocks_tree = _fetch_notion_blocks(page_id, headers, max_depth=3)
+            flat_blocks = _flatten_notion_block_tree(blocks_tree)
+            text_lines, attachments, child_databases = _summarize_notion_blocks(
+                flat_blocks, include_databases=include_databases
+            )
+            content = "\n".join(text_lines)
+
+            databases_content: List[Dict[str, Any]] = []
+            if include_databases and child_databases:
+                for db_ref in child_databases:
+                    db_id = db_ref.get("id")
+                    db_title = db_ref.get("title", "Database")
+                    if db_id:
+                        db_data = _query_notion_database_for_api(db_id, db_title=db_title)
+                        if not db_data.get("title"):
+                            db_data["title"] = db_title
+                        databases_content.append(db_data)
+
+                        # Persist cached database rows/schema so future cache_only requests
+                        # (including subpage expansions) do not require another refresh.
+                        db_properties = db_data.get("properties") if isinstance(db_data, dict) else {}
+                        schema_cache = _build_database_schema_cache(
+                            properties=db_properties if isinstance(db_properties, dict) else {},
+                            db_data=db_data,
+                        )
+
+                        db_page_payload: Dict[str, Any] = {
+                            "id": db_id,
+                            "title": db_data.get("title") or db_title,
+                            "url": None,
+                            "last_edited_time": None,
+                            "object_type": "database",
+                            "parent_id": page_id,
+                            "schema_data": schema_cache,
+                        }
+                        _persist_notion_pages(workspace_id, workspace_name, [db_page_payload], full_refresh=False)
+
+                        resolved_id = db_data.get("database_id") if isinstance(db_data, dict) else None
+                        if resolved_id and resolved_id != db_id:
+                            resolved_payload = dict(db_page_payload)
+                            resolved_payload["id"] = resolved_id
+                            _persist_notion_pages(
+                                workspace_id,
+                                workspace_name,
+                                [resolved_payload],
+                                full_refresh=False,
+                            )
+
+            parent_obj = page_meta.get("parent", {}) or {}
+            parent_type = parent_obj.get("type")
+            parent_id: Optional[str] = None
+            if parent_type == "page_id":
+                parent_id = parent_obj.get("page_id")
+            elif parent_type == "database_id":
+                parent_id = parent_obj.get("database_id")
+
+            page_data: Dict[str, Any] = {
+                "id": page_id,
+                "title": _extract_notion_title(page_meta),
+                "url": page_meta.get("url"),
+                "last_edited_time": page_meta.get("last_edited_time"),
+                "object_type": "page",
+                "parent_id": parent_id,
+                "icon": page_meta.get("icon"),
+                "cover": page_meta.get("cover"),
+                "raw": page_meta,
+                "blocks_data": blocks_tree,
+            }
+            _persist_notion_pages(workspace_id, workspace_name, [page_data], full_refresh=False)
+            _notion_hierarchy_cache = (0.0, {})
+
+            return {
+                "page_id": page_id,
+                "content": content,
+                "attachments": attachments,
+                "is_database": False,
+                "child_databases": databases_content,
+                "refreshed": True,
+            }
+
+        db_meta_resp = requests.get(
+            f"https://api.notion.com/v1/databases/{page_id}",
+            headers=headers,
+            timeout=30,
+        )
+        if db_meta_resp.status_code == 200:
+            db_meta = db_meta_resp.json() or {}
+            db_data = _query_notion_database_for_api(page_id)
+
+            with db_manager.get_session() as session:
+                existing = session.query(NotionPage).filter_by(page_id=page_id).first()
+                workspace_id = (
+                    existing.workspace_id
+                    if existing and existing.workspace_id
+                    else (Config.WORKSPACE_ID or "default-notion-workspace")
+                )
+                ws = session.query(NotionWorkspace).filter_by(workspace_id=workspace_id).first()
+                workspace_name = ws.name if ws and ws.name else (Config.WORKSPACE_NAME or "Notion Workspace")
+
+            parent_obj = db_meta.get("parent", {}) or {}
+            parent_type = parent_obj.get("type")
+            parent_id: Optional[str] = None
+            if parent_type == "page_id":
+                parent_id = parent_obj.get("page_id")
+
+            db_properties = db_data.get("properties") if isinstance(db_data, dict) else {}
+            schema_data = _build_database_schema_cache(
+                properties=db_properties if isinstance(db_properties, dict) else {},
+                db_data=db_data,
+            )
+            schema_data["title"] = db_meta.get("title", [])
+            schema_data["description"] = db_meta.get("description", [])
+            schema_data["is_inline"] = db_meta.get("is_inline", False)
+
+            page_data = {
+                "id": page_id,
+                "title": "".join(t.get("plain_text", "") for t in db_meta.get("title", [])) or "Untitled",
+                "url": db_meta.get("url"),
+                "last_edited_time": db_meta.get("last_edited_time"),
+                "object_type": "database",
+                "parent_id": parent_id,
+                "icon": db_meta.get("icon"),
+                "cover": db_meta.get("cover"),
+                "raw": db_meta,
+                "schema_data": schema_data,
+            }
+            _persist_notion_pages(workspace_id, workspace_name, [page_data], full_refresh=False)
+            _notion_hierarchy_cache = (0.0, {})
+
+            return {
+                "page_id": page_id,
+                "content": "",
+                "attachments": [],
+                "is_database": True,
+                "database": db_data,
+                "child_databases": [],
+                "refreshed": True,
+            }
+
+        ds_meta_resp = requests.get(
+            f"https://api.notion.com/v1/data_sources/{page_id}",
+            headers=headers,
+            timeout=30,
+        )
+        if ds_meta_resp.status_code == 200:
+            ds_meta = ds_meta_resp.json() or {}
+            db_data = _query_notion_database_for_api(page_id)
+
+            with db_manager.get_session() as session:
+                existing = session.query(NotionPage).filter_by(page_id=page_id).first()
+                workspace_id = (
+                    existing.workspace_id
+                    if existing and existing.workspace_id
+                    else (Config.WORKSPACE_ID or "default-notion-workspace")
+                )
+                ws = session.query(NotionWorkspace).filter_by(workspace_id=workspace_id).first()
+                workspace_name = ws.name if ws and ws.name else (Config.WORKSPACE_NAME or "Notion Workspace")
+
+            db_properties = ds_meta.get("properties", {}) if isinstance(ds_meta, dict) else {}
+            schema_data = _build_database_schema_cache(
+                properties=db_properties if isinstance(db_properties, dict) else {},
+                db_data=db_data,
+            )
+            schema_data["title"] = ds_meta.get("title", [])
+            schema_data["description"] = ds_meta.get("description", [])
+
+            parent_obj = ds_meta.get("parent", {}) or {}
+            parent_id = parent_obj.get("database_id")
+
+            page_data = {
+                "id": page_id,
+                "title": "".join(t.get("plain_text", "") for t in ds_meta.get("title", [])) or "Untitled",
+                "url": ds_meta.get("url"),
+                "last_edited_time": ds_meta.get("last_edited_time"),
+                "object_type": "database",
+                "parent_id": parent_id,
+                "icon": ds_meta.get("icon"),
+                "cover": ds_meta.get("cover"),
+                "raw": ds_meta,
+                "schema_data": schema_data,
+            }
+            _persist_notion_pages(workspace_id, workspace_name, [page_data], full_refresh=False)
+            _notion_hierarchy_cache = (0.0, {})
+
+            return {
+                "page_id": page_id,
+                "content": "",
+                "attachments": [],
+                "is_database": True,
+                "database": db_data,
+                "child_databases": [],
+                "refreshed": True,
+            }
+
+        raise HTTPException(status_code=404, detail="Notion page/database not found")
 
     except HTTPException:
         raise
@@ -6257,6 +6821,12 @@ async def startup_event():
 async def shutdown_event():
     """Run on application shutdown."""
     logger.info("Shutting down Workforce AI Agent API...")
+
+    try:
+        if ai_brain and hasattr(ai_brain, "close"):
+            await ai_brain.close()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
