@@ -1,5 +1,6 @@
 """Rate limiting for Slack API calls."""
 import asyncio
+import json
 import os
 import time
 from collections import defaultdict
@@ -8,12 +9,28 @@ from threading import Lock
 from datetime import datetime, timedelta
 from functools import wraps
 
+try:
+    import fcntl  # type: ignore
+except Exception:  # pragma: no cover
+    fcntl = None
+
 from .logger import get_logger
 
 # Slack API rate limit tiers (requests per minute)
 # For non-Marketplace apps, conversations.history and conversations.replies are severely limited
 # See: https://api.slack.com/apis/rate-limits
 _SLACK_SPECIAL_RATE_LIMIT = int(os.getenv("SPECIAL_RATE_LIMIT", "1"))  # 1 req/min for non-Marketplace
+
+_SLACK_FILE_RATE_LIMIT_ENABLED = os.getenv("SLACK_FILE_RATE_LIMIT_ENABLED", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+_SLACK_FILE_RATE_LIMIT_PATH = os.getenv(
+    "SLACK_FILE_RATE_LIMIT_PATH",
+    "/tmp/workforce_slack_rate_limit.json",
+)
+_SLACK_FILE_RATE_LIMIT_METHODS = {"conversations.history", "conversations.replies"}
 
 _SLACK_RATE_LIMITS = {
     # Tier 1 - Most restricted (1 req/min for non-Marketplace)
@@ -90,12 +107,60 @@ class RateLimiter:
         oldest = self._requests[method][0]
         wait_time = (oldest + self._window_seconds) - time.time()
         return max(0, wait_time)
+
+    def _wait_if_needed_file(self, method: str, max_calls: int, period_seconds: int) -> float:
+        if fcntl is None:
+            return 0
+
+        dir_path = os.path.dirname(_SLACK_FILE_RATE_LIMIT_PATH)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
+        with open(_SLACK_FILE_RATE_LIMIT_PATH, "a+") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.seek(0)
+                raw = f.read() or "{}"
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    data = {}
+
+                now = time.time()
+                last = float(data.get(method, 0) or 0)
+                interval = float(period_seconds) / max(1, int(max_calls))
+                wait_time = max(0.0, (last + interval) - now)
+
+                if wait_time > 0:
+                    if wait_time > 5:
+                        logger.info(
+                            f"Rate limit for {method}: waiting {wait_time:.0f}s "
+                            f"(global lock; limit: {max_calls}/{period_seconds}s)."
+                        )
+                    time.sleep(wait_time)
+
+                data[method] = time.time()
+                f.seek(0)
+                f.truncate()
+                f.write(json.dumps(data))
+                f.flush()
+                os.fsync(f.fileno())
+
+                return float(wait_time)
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
     
     def wait_if_needed(self, method: str) -> float:
         """Wait if rate limit would be exceeded. Returns wait time."""
         # get_rate_limit_for_method returns (max_calls, period_seconds)
         max_calls, _ = get_rate_limit_for_method(method)
-        
+
+        if (
+            _SLACK_FILE_RATE_LIMIT_ENABLED
+            and method in _SLACK_FILE_RATE_LIMIT_METHODS
+            and max_calls <= 2
+        ):
+            return self._wait_if_needed_file(method, max_calls, self._window_seconds)
+
         with self._locks[method]:
             wait_time = self._get_wait_time(method, max_calls)
             

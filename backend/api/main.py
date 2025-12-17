@@ -4335,12 +4335,34 @@ def _run_slack_channel_pipeline(
     # Stats container
     stats: Dict[str, Any] = {"channel_id": channel_id, "progress": 0.0}
 
-    def progress_cb(payload: Dict[str, float]):
+    last_persist_at = 0.0
+    last_persist_stage: Optional[str] = None
+    last_persist_progress: Optional[float] = None
+
+    def progress_cb(payload: Dict[str, Any]):
         # payload keys: stage, progress, total_messages, processed_messages
+        nonlocal last_persist_at, last_persist_stage, last_persist_progress
         stats.update(payload)
         if _is_cancel_requested(run_id):
             raise PipelineCancelled()
-        _update_pipeline_run(run_id, stats=stats)
+        now = time.monotonic()
+        stage = stats.get("stage")
+        progress = stats.get("progress")
+
+        should_persist = False
+        if stage != last_persist_stage:
+            should_persist = True
+        elif isinstance(progress, (int, float)) and isinstance(last_persist_progress, (int, float)):
+            if abs(float(progress) - float(last_persist_progress)) >= 0.01:
+                should_persist = True
+        elif now - last_persist_at >= 2.0:
+            should_persist = True
+
+        if should_persist:
+            last_persist_at = now
+            last_persist_stage = stage
+            last_persist_progress = float(progress) if isinstance(progress, (int, float)) else None
+            _update_pipeline_run(run_id, stats=stats)
 
     try:
         count = extractor.extract_channel_history(
@@ -4459,6 +4481,22 @@ async def run_slack_channel_pipeline(
     """Trigger an incremental Slack pipeline run for a single channel."""
     if not channel_id:
         raise HTTPException(status_code=400, detail="channel_id is required")
+
+    with db_manager.get_session() as session:
+        existing_runs = (
+            session.query(PipelineRun)
+            .filter(
+                PipelineRun.pipeline_type == "slack_channel",
+                PipelineRun.status.in_(["pending", "running"]),
+            )
+            .order_by(PipelineRun.created_at.desc())
+            .limit(50)
+            .all()
+        )
+        for run in existing_runs:
+            cfg = run.config or {}
+            if cfg.get("channel_id") == channel_id:
+                return {"run_id": run.run_id, "status": run.status}
 
     run_id = uuid.uuid4().hex
 

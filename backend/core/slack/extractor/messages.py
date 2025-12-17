@@ -1,5 +1,6 @@
 """Message extractor."""
 import os
+import sys
 from typing import Optional, List, Callable, Dict, Any
 from tqdm import tqdm
 import time
@@ -110,11 +111,47 @@ class MessageExtractor(BaseExtractor):
                 }
             )
         
-        # Save messages with progress bar
+        # Save messages
         commit_batch_size = max(1, int(getattr(Config, "BATCH_SIZE", 100)))
         progress_step = max(1, len(messages_list) // 20) if messages_list else 1
+        use_tqdm = sys.stderr.isatty()
         with self.db_manager.get_session() as session:
-            with tqdm(total=len(messages_list), desc=f"Saving messages") as pbar:
+            if use_tqdm:
+                with tqdm(total=len(messages_list), desc=f"Saving messages") as pbar:
+                    for i, message in enumerate(messages_list, 1):
+                        try:
+                            if cancel_check and cancel_check():
+                                logger.info("Message extraction cancelled during save loop")
+                                raise KeyboardInterrupt()
+                            self.db_manager.save_message(message, channel_id, session=session, commit=False)
+                            count += 1
+                            pbar.update(1)
+
+                            # Extract threads if present
+                            if include_threads and message.get("reply_count", 0) > 0:
+                                thread_ts = message.get("ts")
+                                thread_count = self.extract_thread_replies(channel_id, thread_ts)
+                                logger.debug(f"Extracted {thread_count} thread replies")
+
+                            if i % commit_batch_size == 0:
+                                session.commit()
+
+                            if progress_callback and (i % progress_step == 0 or i == len(messages_list)):
+                                frac = i / len(messages_list) if len(messages_list) else 1.0
+                                progress_callback(
+                                    {
+                                        "stage": "saving",
+                                        "stage_description": f"Saving messages to database ({i}/{len(messages_list)})",
+                                        "processed_messages": i,
+                                        "total_messages": len(messages_list),
+                                        "messages_fetched": len(messages_list),
+                                        "progress": 0.85 + 0.1 * frac,
+                                        "eta_seconds": max(1, int((len(messages_list) - i) / 100)),
+                                    }
+                                )
+                        except Exception as e:
+                            logger.error(f"Failed to save message: {e}")
+            else:
                 for i, message in enumerate(messages_list, 1):
                     try:
                         if cancel_check and cancel_check():
@@ -122,7 +159,6 @@ class MessageExtractor(BaseExtractor):
                             raise KeyboardInterrupt()
                         self.db_manager.save_message(message, channel_id, session=session, commit=False)
                         count += 1
-                        pbar.update(1)
 
                         # Extract threads if present
                         if include_threads and message.get("reply_count", 0) > 0:
@@ -143,13 +179,13 @@ class MessageExtractor(BaseExtractor):
                                     "total_messages": len(messages_list),
                                     "messages_fetched": len(messages_list),
                                     "progress": 0.85 + 0.1 * frac,
-                                    "eta_seconds": max(1, int((len(messages_list) - i) / 100)),  # ~100 msgs/sec
+                                    "eta_seconds": max(1, int((len(messages_list) - i) / 100)),
                                 }
                             )
                     except Exception as e:
                         logger.error(f"Failed to save message: {e}")
 
-                session.commit()
+            session.commit()
         
         # Update sync status
         if latest_ts:
