@@ -2500,6 +2500,129 @@ def _run_project_sync(
     owner_user_id: str,
     account_email: str,
 ) -> None:
+    """Run project sync using OpenAI embeddings stored in project_chunks.
+    
+    This creates a project-scoped vector index that supports:
+    - Incremental updates (add/update/delete via content_hash)
+    - Semantic search via pgvector
+    - Proper scoping to selected sources only
+    """
+    from agent.project_sync import ProjectSyncService
+    
+    _update_pipeline_run(
+        run_id,
+        status="running",
+        started_at=datetime.utcnow(),
+        stats={
+            "project_id": project_id,
+            "progress": 0.0,
+            "heartbeat_at": datetime.utcnow().isoformat(),
+        },
+    )
+
+    stats: Dict[str, Any] = {
+        "project_id": project_id,
+        "stage": "starting",
+        "progress": 0.0,
+        "slack_chunks": 0,
+        "gmail_chunks": 0,
+        "notion_chunks": 0,
+        "total_chunks": 0,
+        "deleted_stale": 0,
+    }
+
+    def _check_cancel() -> bool:
+        return _is_cancel_requested(run_id)
+
+    def _progress_callback(payload: Dict[str, Any]) -> None:
+        nonlocal stats
+        stats.update(payload.get("stats", {}))
+        stats["stage"] = payload.get("stage", stats.get("stage"))
+        stats["progress"] = payload.get("progress", stats.get("progress"))
+        stats["heartbeat_at"] = datetime.utcnow().isoformat()
+        _update_pipeline_run(run_id, stats=stats)
+
+    try:
+        project = db_manager.get_project(project_id, owner_user_id=owner_user_id)
+        if not project:
+            _update_pipeline_run(
+                run_id,
+                status="failed",
+                finished_at=datetime.utcnow(),
+                error="Project not found",
+                stats=stats,
+            )
+            return
+
+        sources = db_manager.get_project_sources(project_id)
+        slack_channel_ids = [s.source_id for s in sources if s.source_type == "slack_channel"]
+        gmail_label_ids = [s.source_id for s in sources if s.source_type == "gmail_label"]
+        notion_page_ids = [s.source_id for s in sources if s.source_type == "notion_page"]
+
+        if not (slack_channel_ids or gmail_label_ids or notion_page_ids):
+            _update_pipeline_run(
+                run_id,
+                status="failed",
+                finished_at=datetime.utcnow(),
+                error="No sources configured for this project",
+                stats=stats,
+            )
+            return
+
+        # Use ProjectSyncService for OpenAI embeddings + project_chunks
+        sync_service = ProjectSyncService(db_manager=db_manager)
+        
+        sync_result = sync_service.sync_project(
+            project_id=project_id,
+            slack_channel_ids=slack_channel_ids,
+            gmail_label_ids=gmail_label_ids,
+            notion_page_ids=notion_page_ids,
+            gmail_account_email=account_email,
+            progress_callback=_progress_callback,
+            cancel_check=_check_cancel,
+        )
+        
+        stats.update(sync_result)
+        stats["stage"] = "completed"
+        stats["progress"] = 1.0
+        
+        _update_pipeline_run(
+            run_id,
+            status="completed",
+            finished_at=datetime.utcnow(),
+            stats=stats,
+        )
+        
+        try:
+            db_manager.update_project(
+                project_id,
+                owner_user_id=owner_user_id,
+                last_project_sync_at=datetime.utcnow(),
+            )
+        except Exception:
+            pass
+
+    except PipelineCancelled:
+        stats["stage"] = "cancelled"
+        _update_pipeline_run(run_id, status="cancelled", finished_at=datetime.utcnow(), stats=stats)
+    except InterruptedError:
+        stats["stage"] = "cancelled"
+        _update_pipeline_run(run_id, status="cancelled", finished_at=datetime.utcnow(), stats=stats)
+    except KeyboardInterrupt:
+        stats["stage"] = "cancelled"
+        _update_pipeline_run(run_id, status="cancelled", finished_at=datetime.utcnow(), stats=stats)
+    except Exception as e:  # pragma: no cover
+        logger.error(f"Project sync failed: {e}", exc_info=True)
+        _update_pipeline_run(run_id, status="failed", finished_at=datetime.utcnow(), error=str(e), stats=stats)
+
+
+def _run_project_sync_legacy(
+    run_id: str,
+    project_id: str,
+    owner_user_id: str,
+    account_email: str,
+) -> None:
+    """Legacy project sync that embeds into source tables (kept for reference)."""
     _update_pipeline_run(
         run_id,
         status="running",
@@ -3016,6 +3139,43 @@ async def stop_project_sync(run_id: str, current_user: AppUser = Depends(get_cur
     return {"run_id": run_id, "status": "cancelling"}
 
 
+@app.get("/api/projects/{project_id}/chunks/stats")
+async def get_project_chunk_stats(
+    project_id: str,
+    current_user: AppUser = Depends(get_current_user),
+):
+    """Get statistics about synced chunks for a project.
+    
+    Returns chunk counts by source type and last sync timestamp.
+    """
+    project = db_manager.get_project(project_id, owner_user_id=current_user.id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    stats = db_manager.get_project_chunk_stats(project_id)
+    return {
+        "project_id": project_id,
+        "total_chunks": stats.get("total_chunks", 0),
+        "chunks_by_source": stats.get("chunks_by_source", {}),
+        "last_sync_version": stats.get("last_sync_version"),
+        "last_project_sync_at": project.last_project_sync_at.isoformat() if project.last_project_sync_at else None,
+    }
+
+
+@app.delete("/api/projects/{project_id}/chunks")
+async def clear_project_chunks(
+    project_id: str,
+    current_user: AppUser = Depends(get_current_user),
+):
+    """Clear all synced chunks for a project (for full re-sync)."""
+    project = db_manager.get_project(project_id, owner_user_id=current_user.id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    deleted = db_manager.clear_project_chunks(project_id)
+    return {"project_id": project_id, "deleted_chunks": deleted}
+
+
 @app.post("/api/projects/{project_id}/auto-summary/run")
 async def run_project_auto_summary(
     project_id: str,
@@ -3262,6 +3422,7 @@ async def chat_project(
         result = await _run_in_executor(
             engine.query_project,
             user_query=query,
+            project_id=project_id,  # Use project_chunks vector search
             channel_ids=slack_channel_ids,
             label_ids=gmail_label_ids,
             notion_page_ids=notion_page_ids,
@@ -3293,6 +3454,195 @@ async def chat_project(
     except Exception as e:  # pragma: no cover - defensive logging
         logger.error(f"Error in project chat for {project_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Project chat failed")
+
+
+@app.post("/api/chat/project/{project_id}/stream")
+async def chat_project_stream(
+    project_id: str,
+    payload: ProjectChatRequest,
+    current_user: AppUser = Depends(get_current_user),
+):
+    """Stream project chat using same AI Brain as main chat, with project RAG context.
+    
+    This endpoint provides the same experience as the main chat WebSocket,
+    but scoped to the project's synced data sources.
+    """
+    query = payload.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Query must not be empty")
+
+    project = db_manager.get_project(project_id, owner_user_id=current_user.id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    session_id = _project_chat_session_id(project_id, current_user.id)
+    try:
+        existing_session = db_manager.get_chat_session(session_id, owner_user_id=current_user.id)
+        if not existing_session:
+            db_manager.create_chat_session(
+                session_id,
+                title=f"Project: {project.name}",
+                owner_user_id=current_user.id,
+            )
+    except Exception:
+        logger.warning("Failed ensuring project chat session exists", exc_info=True)
+
+    conversation_history: List[Dict[str, str]] = []
+    try:
+        history = await _run_in_executor(db_manager.get_chat_history, session_id, 100)
+        conversation_history = _truncate_history(history)
+    except Exception:
+        conversation_history = payload.conversation_history or []
+
+    try:
+        await _run_in_executor(db_manager.add_chat_message, session_id, "user", query)
+    except Exception:
+        logger.warning("Failed to save project chat user message", exc_info=True)
+
+    # Get RAG engine for project context retrieval
+    engine = await get_rag_engine()
+    
+    # Get project sources for scoping
+    sources_list = db_manager.get_project_sources(project_id)
+    slack_channel_ids = [s.source_id for s in sources_list if s.source_type == "slack_channel"]
+    gmail_label_ids = [s.source_id for s in sources_list if s.source_type == "gmail_label"]
+    notion_page_ids = [s.source_id for s in sources_list if s.source_type == "notion_page"]
+
+    async def _gen():
+        assistant_text = ""
+        retrieved_sources: List[Dict[str, Any]] = []
+        
+        try:
+            # Retrieve project context first (non-streaming)
+            rag_result = await _run_in_executor(
+                engine.query_project,
+                user_query=query,
+                project_id=project_id,
+                channel_ids=slack_channel_ids,
+                label_ids=gmail_label_ids,
+                notion_page_ids=notion_page_ids,
+                project_name=project.name,
+                conversation_history=conversation_history,
+                force_search=True,
+                gmail_account_email=current_user.email,
+            )
+            
+            retrieved_sources = rag_result.get("sources", [])
+            
+            # Send sources immediately
+            yield json.dumps({"type": "sources", "content": retrieved_sources}, default=str) + "\n"
+            
+            # Build context from retrieved sources
+            context_parts = []
+            for src in retrieved_sources[:10]:
+                src_type = (src.get("type") or "").lower()
+                text = (src.get("text") or "").strip()[:600]
+                if not text:
+                    continue
+                meta = src.get("metadata") or {}
+                
+                if src_type == "slack":
+                    channel = meta.get("channel") or meta.get("channel_id") or ""
+                    user = meta.get("user") or ""
+                    header = f"[Slack #{channel}"
+                    if user:
+                        header += f" - {user}"
+                    header += "]"
+                    context_parts.append(f"{header}\n{text}")
+                elif src_type == "gmail":
+                    sender = meta.get("from") or ""
+                    subject = meta.get("subject") or ""
+                    header = f"[Email"
+                    if sender:
+                        header += f" from {sender}"
+                    if subject:
+                        header += f": {subject}"
+                    header += "]"
+                    context_parts.append(f"{header}\n{text}")
+                elif src_type == "notion":
+                    title = meta.get("title") or ""
+                    header = f"[Notion"
+                    if title:
+                        header += f": {title}"
+                    header += "]"
+                    context_parts.append(f"{header}\n{text}")
+                else:
+                    context_parts.append(text)
+            
+            context_str = "\n\n".join(context_parts) if context_parts else ""
+            
+            # System message - defines AI behavior for project chat
+            system_message = f"""You are a helpful assistant for the project "{project.name}".
+
+Your role:
+- Answer questions about this project based on synced Slack messages, emails, and Notion pages
+- Be conversational and natural - respond like a knowledgeable team member
+- Give precise, accurate answers - don't ramble or list everything you know
+- If asked about status, updates, or progress - summarize the key points concisely
+- If the user makes a statement (like "I paused the project"), acknowledge it and relate it to what you know
+- Remember the conversation context - refer back to previous messages when relevant
+
+Project context from synced sources:
+{context_str if context_str else "(No relevant data found in synced sources)"}"""
+
+            # Use direct OpenAI streaming
+            from openai import AsyncOpenAI
+            client = AsyncOpenAI()
+            
+            # Build messages: system + conversation history + current query
+            messages = [{"role": "system", "content": system_message}]
+            
+            # Add conversation history (actual user/assistant turns)
+            if conversation_history:
+                for msg in conversation_history[-10:]:
+                    role = msg.get("role", "user")
+                    content = msg.get("content", "")
+                    if role in ["user", "assistant"] and content:
+                        messages.append({"role": role, "content": content})
+            
+            # Add current user query
+            messages.append({"role": "user", "content": query})
+            
+            # Stream response
+            response = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                stream=True,
+                max_tokens=800,
+                temperature=0.7,
+            )
+            
+            async for chunk in response:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if delta and delta.content:
+                    assistant_text += delta.content
+                    yield json.dumps({"type": "token", "content": delta.content}, default=str) + "\n"
+            
+            # Save assistant message
+            try:
+                await _run_in_executor(
+                    db_manager.add_chat_message,
+                    session_id,
+                    "assistant",
+                    assistant_text,
+                    retrieved_sources,
+                )
+            except Exception:
+                logger.warning("Failed to save project chat assistant message", exc_info=True)
+            
+            yield json.dumps({"type": "done", "content": ""}, default=str) + "\n"
+                    
+        except Exception as e:
+            logger.error(f"Error in streaming project chat for {project_id}: {e}", exc_info=True)
+            yield json.dumps({"type": "error", "content": str(e)}) + "\n"
+
+    # Headers to prevent nginx/proxy buffering which breaks streaming
+    headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",  # Disables nginx buffering
+        "Connection": "keep-alive",
+    }
+    return StreamingResponse(_gen(), media_type="application/x-ndjson", headers=headers)
 
 
 @app.get("/api/projects/{project_id}/chat/history")

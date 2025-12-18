@@ -19,6 +19,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 import numpy as np
 import os
 import sys
+import asyncio
 from pathlib import Path
 import requests
 from sqlalchemy import or_, cast
@@ -94,6 +95,10 @@ class HybridRAGEngine:
             temperature=base_temperature,
             streaming=True
         )
+
+        # Lazily created, but cached per-engine to avoid re-initializing the
+        # OpenAI client on every project-chat request.
+        self._openai_embedding_service = None
         
         # Initialize tools with user_id for Gmail OAuth support
         self.tools = WorkforceTools(user_id=user_id)
@@ -437,6 +442,163 @@ class HybridRAGEngine:
         
         logger.info(f"Vector search found {len(results[:limit])} results")
         return results[:limit]
+    
+    def _retrieve_from_project_chunks(
+        self,
+        project_id: str,
+        user_query: str,
+        top_k: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve context from project_chunks using OpenAI embeddings + pgvector.
+        
+        This is the primary retrieval method for project-scoped RAG.
+        Uses OpenAI text-embedding-3-small for query embedding and
+        pgvector cosine similarity for search.
+        """
+        try:
+            # Generate query embedding with OpenAI (cached client)
+            embedding_service = self._get_openai_embedding_service()
+            query_embedding = embedding_service.embed_text(user_query)
+            
+            # Search project chunks
+            results = self.db.search_project_chunks_by_embedding(
+                project_id=project_id,
+                query_embedding=query_embedding,
+                top_k=top_k,
+            )
+            
+            # Convert to standard context format
+            context = []
+            for r in results:
+                source_type = r.get("source_type", "unknown")
+                metadata = r.get("metadata") or {}
+                
+                context.append({
+                    "type": source_type,
+                    "text": r.get("chunk_text", ""),
+                    "score": r.get("score", 0),
+                    "metadata": metadata,
+                })
+            
+            return context
+            
+        except Exception as e:
+            logger.error(f"Error retrieving from project chunks: {e}", exc_info=True)
+            return []
+
+    def _get_openai_embedding_service(self):
+        if self._openai_embedding_service is None:
+            from .openai_embeddings import OpenAIEmbeddingService
+
+            self._openai_embedding_service = OpenAIEmbeddingService()
+        return self._openai_embedding_service
+
+    async def stream_project_answer(
+        self,
+        user_query: str,
+        project_id: str,
+        project_name: Optional[str] = None,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+        gmail_account_email: Optional[str] = None,
+        top_k: int = 10,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """Stream a project-scoped answer (tokens + sources) for SSE/WebSocket.
+
+        This avoids intent classification and yields:
+        - {type: 'sources', content: [...]}
+        - {type: 'token', content: '...'}
+        - {type: 'done'}
+        """
+        # Retrieval first (not streamed). Do this in an executor because it
+        # performs a sync embeddings call + sync DB query.
+        loop = asyncio.get_running_loop()
+        context = await loop.run_in_executor(
+            None,
+            lambda: self._retrieve_from_project_chunks(
+                project_id=project_id,
+                user_query=user_query,
+                top_k=top_k,
+            ),
+        )
+
+        yield {"type": "sources", "content": context}
+
+        # Build prompt (reuse same formatting as query_project)
+        context_str = ''
+        if context:
+            lines: List[str] = []
+            for doc in context:
+                doc_type = (doc.get('type') or '').lower()
+                text = (doc.get('text') or '')[:300]
+                meta = doc.get('metadata') or {}
+
+                if doc_type == 'slack':
+                    channel = meta.get('channel') or meta.get('channel_id') or 'unknown-channel'
+                    user = meta.get('user') or meta.get('user_id') or 'someone'
+                    prefix = f"[SLACK #{channel} | {user}]"
+                elif doc_type == 'gmail':
+                    sender = meta.get('from') or meta.get('from_address') or 'Unknown sender'
+                    subject = meta.get('subject') or 'No subject'
+                    prefix = f"[GMAIL {sender} – {subject}]"
+                elif doc_type == 'notion':
+                    title = meta.get('title') or 'Untitled page'
+                    prefix = f"[NOTION {title}]"
+                else:
+                    prefix = f"[{(doc.get('type') or '').upper()}]"
+
+                lines.append(f"{prefix} {text}...")
+
+            context_str = '\n\n'.join(lines)
+
+        history_str = ''
+        if conversation_history:
+            trimmed = conversation_history[-10:]
+            history_lines = []
+            for msg in trimmed:
+                role = msg.get('role', 'user')
+                content = msg.get('content', '')
+                prefix = 'User' if role == 'user' else 'Assistant'
+                history_lines.append(f"{prefix}: {content}")
+            history_str = '\n'.join(history_lines)
+
+        project_label = project_name or 'this project'
+
+        system_prompt = (
+            "You are a helpful project assistant for a cross-application project. "
+            "You ONLY use the provided context from Slack, Gmail, and Notion that "
+            "belongs to this project's synced data sources.\n\n"
+            "IMPORTANT RULES:\n"
+            "1. Answer ONLY based on the provided context from the synced sources.\n"
+            "2. If the exact information requested is not found in the context, "
+            "say clearly: 'The exact information was not found in the synced sources.' "
+            "Then provide any related information you DID find that might be helpful.\n"
+            "3. Never make up information or use knowledge outside the provided context.\n"
+            "4. Always cite which source (Slack, Gmail, or Notion) your information comes from.\n"
+            "5. Keep answers concise and focused on this project.\n"
+            "6. For speed, keep the answer under ~120 words unless the user asks for more detail."
+        )
+
+        user_prompt_parts = [
+            f"Project: {project_label}",
+            f"Question: {user_query}",
+        ]
+        if history_str:
+            user_prompt_parts.append("Recent conversation history:\n" + history_str)
+        if context_str:
+            user_prompt_parts.append("Context:\n" + context_str)
+
+        user_prompt = '\n\n'.join(user_prompt_parts) + '\n\nAnswer based on the project context above.'
+
+        async for chunk in self.llm.astream(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_prompt),
+            ]
+        ):
+            if getattr(chunk, "content", None):
+                yield {"type": "token", "content": chunk.content}
+
+        yield {"type": "done", "content": ""}
     
     def _keyword_search(
         self,
@@ -1108,6 +1270,7 @@ Answer the question based on the context above. Be concise and accurate."""
     def query_project(
         self,
         user_query: str,
+        project_id: Optional[str] = None,
         channel_ids: Optional[List[str]] = None,
         label_ids: Optional[List[str]] = None,
         notion_page_ids: Optional[List[str]] = None,
@@ -1116,29 +1279,47 @@ Answer the question based on the context above. Be concise and accurate."""
         force_search: bool = False,
         gmail_account_email: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Project-scoped query that only uses data from mapped sources.
+        """Project-scoped query that only uses data from synced project chunks.
 
-        This reuses the same ChatGPT (ChatOpenAI) model as the global RAG
-        but restricts retrieval to Slack channels, Gmail labels, and Notion
-        pages associated with a given project.
+        Uses OpenAI embeddings + pgvector for semantic search over the
+        project's synced data. Falls back to raw DB queries if no chunks exist.
         """
 
-        intent = self._classify_intent(user_query)
+        # IMPORTANT: project chat always calls with force_search=True.
+        # Avoid an extra LLM round-trip for intent classification.
         if force_search:
-            # Bypass intent classification when the caller knows this is a
-            # retrieval-style query (e.g. internal summarization tasks).
             intent = 'search'
+        else:
+            intent = self._classify_intent(user_query)
 
         context: List[Dict[str, Any]] = []
+        used_vector_search = False
+        
         if intent in ['search', 'hybrid']:
-            context = self._retrieve_context_scoped(
-                user_query,
-                channel_ids=channel_ids or [],
-                label_ids=label_ids or [],
-                notion_page_ids=notion_page_ids or [],
-                top_k=5,
-                gmail_account_email=gmail_account_email,
-            )
+            # Try vector search on project_chunks first (preferred method)
+            if project_id:
+                context = self._retrieve_from_project_chunks(
+                    project_id=project_id,
+                    user_query=user_query,
+                    top_k=10,
+                )
+                if context:
+                    used_vector_search = True
+                    logger.info(
+                        "Project %s: retrieved %d chunks via vector search",
+                        project_id, len(context)
+                    )
+            
+            # Fallback to old scoped retrieval if no chunks found
+            if not context:
+                context = self._retrieve_context_scoped(
+                    user_query,
+                    channel_ids=channel_ids or [],
+                    label_ids=label_ids or [],
+                    notion_page_ids=notion_page_ids or [],
+                    top_k=5,
+                    gmail_account_email=gmail_account_email,
+                )
 
             # ------------------------------------------------------------------
             # Fallback: if hybrid RAG returns no context (e.g., embeddings missing
@@ -1307,13 +1488,22 @@ Answer the question based on the context above. Be concise and accurate."""
             history_str = '\n'.join(history_lines)
 
         project_label = project_name or 'this project'
+        
+        # Determine if we should indicate limited context
+        has_synced_data = used_vector_search and len(context) > 0
 
         system_prompt = (
             "You are a helpful project assistant for a cross-application project. "
             "You ONLY use the provided context from Slack, Gmail, and Notion that "
-            "belongs to this project. If the context is insufficient, say you "
-            "don't have enough information instead of guessing. Always keep "
-            "answers concise and focused on this project."
+            "belongs to this project's synced data sources.\n\n"
+            "IMPORTANT RULES:\n"
+            "1. Answer ONLY based on the provided context from the synced sources.\n"
+            "2. If the exact information requested is not found in the context, "
+            "say clearly: 'The exact information was not found in the synced sources.' "
+            "Then provide any related information you DID find that might be helpful.\n"
+            "3. Never make up information or use knowledge outside the provided context.\n"
+            "4. Always cite which source (Slack, Gmail, or Notion) your information comes from.\n"
+            "5. Keep answers concise and focused on this project."
         )
 
         user_prompt_parts = [

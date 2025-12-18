@@ -36,6 +36,7 @@ from .models import (
     ChatMessage,
     Project,
     ProjectSource,
+    ProjectChunk,
     Workflow,
     WorkflowChannelMapping,
     SlackNotionMessageMapping,
@@ -48,6 +49,7 @@ from .models import (
     ProjectSyncCursor,
     UserWorkflow,
     WorkflowRun,
+    VECTOR_SUPPORT,
 )
 from utils.logger import get_logger
 
@@ -1008,15 +1010,35 @@ class DatabaseManager:
             return project
 
     def delete_project(self, project_id: str, owner_user_id: Optional[str] = None) -> None:
-        """Delete a project and all of its source mappings."""
+        """Delete a project and all of its dependent data."""
         with self.get_session() as session:
             query = session.query(Project).filter(Project.id == project_id)
             if owner_user_id:
                 query = query.filter(Project.owner_user_id == owner_user_id)
             project = query.first()
-            if project:
-                session.delete(project)
-                session.commit()
+            if not project:
+                return
+            
+            # Delete all dependent rows FIRST and flush to DB before deleting project.
+            # This avoids FK constraint violations regardless of DB cascade settings.
+            session.query(ProjectSyncCursor).filter(
+                ProjectSyncCursor.project_id == project_id
+            ).delete(synchronize_session=False)
+            
+            session.query(ProjectChunk).filter(
+                ProjectChunk.project_id == project_id
+            ).delete(synchronize_session=False)
+            
+            session.query(ProjectSource).filter(
+                ProjectSource.project_id == project_id
+            ).delete(synchronize_session=False)
+            
+            # Flush dependent deletes to DB before deleting project
+            session.flush()
+            
+            # Now safe to delete the project
+            session.delete(project)
+            session.commit()
 
     def add_project_source(
         self,
@@ -1535,3 +1557,303 @@ class DatabaseManager:
                 .filter(NotionPage.page_id.in_(page_ids))
                 .all()
             )
+
+    # ========================================================================
+    # Project Chunk Operations (for Project-Scoped RAG)
+    # ========================================================================
+
+    def upsert_project_chunk(
+        self,
+        project_id: str,
+        source_type: str,
+        source_id: str,
+        content_id: str,
+        chunk_text: str,
+        content_hash: str,
+        embedding: List[float],
+        metadata: Optional[Dict[str, Any]] = None,
+        chunk_index: int = 0,
+        sync_version: Optional[str] = None,
+    ) -> ProjectChunk:
+        """Insert or update a project chunk with embedding.
+        
+        Uses content_hash for change detection - only updates if hash changed.
+        """
+        with self.get_session() as session:
+            existing = (
+                session.query(ProjectChunk)
+                .filter_by(
+                    project_id=project_id,
+                    source_type=source_type,
+                    source_id=source_id,
+                    content_id=content_id,
+                    chunk_index=chunk_index,
+                )
+                .first()
+            )
+            
+            if existing:
+                # Only update if content changed
+                if existing.content_hash != content_hash:
+                    existing.chunk_text = chunk_text
+                    existing.content_hash = content_hash
+                    existing.embedding = embedding
+                    existing.chunk_metadata = metadata
+                    existing.sync_version = sync_version
+                    existing.updated_at = datetime.utcnow()
+                elif sync_version:
+                    # Just update sync version to mark as still valid
+                    existing.sync_version = sync_version
+                session.commit()
+                session.refresh(existing)
+                return existing
+            
+            # Create new chunk
+            chunk = ProjectChunk(
+                project_id=project_id,
+                source_type=source_type,
+                source_id=source_id,
+                content_id=content_id,
+                chunk_text=chunk_text,
+                chunk_index=chunk_index,
+                content_hash=content_hash,
+                embedding=embedding,
+                chunk_metadata=metadata,
+                sync_version=sync_version,
+            )
+            session.add(chunk)
+            session.commit()
+            session.refresh(chunk)
+            return chunk
+
+    def bulk_upsert_project_chunks(
+        self,
+        project_id: str,
+        chunks: List[Dict[str, Any]],
+        sync_version: str,
+    ) -> int:
+        """Bulk upsert project chunks for efficiency.
+        
+        Args:
+            project_id: Project ID
+            chunks: List of chunk dicts with keys:
+                source_type, source_id, content_id, chunk_text,
+                content_hash, embedding, metadata, chunk_index
+            sync_version: Current sync version string
+            
+        Returns:
+            Number of chunks upserted
+        """
+        if not chunks:
+            return 0
+        
+        count = 0
+        with self.get_session() as session:
+            for chunk_data in chunks:
+                try:
+                    existing = (
+                        session.query(ProjectChunk)
+                        .filter_by(
+                            project_id=project_id,
+                            source_type=chunk_data["source_type"],
+                            source_id=chunk_data["source_id"],
+                            content_id=chunk_data["content_id"],
+                            chunk_index=chunk_data.get("chunk_index", 0),
+                        )
+                        .first()
+                    )
+                    
+                    if existing:
+                        if existing.content_hash != chunk_data["content_hash"]:
+                            existing.chunk_text = chunk_data["chunk_text"]
+                            existing.content_hash = chunk_data["content_hash"]
+                            existing.embedding = chunk_data["embedding"]
+                            existing.chunk_metadata = chunk_data.get("metadata")
+                            existing.updated_at = datetime.utcnow()
+                        existing.sync_version = sync_version
+                    else:
+                        chunk = ProjectChunk(
+                            project_id=project_id,
+                            source_type=chunk_data["source_type"],
+                            source_id=chunk_data["source_id"],
+                            content_id=chunk_data["content_id"],
+                            chunk_text=chunk_data["chunk_text"],
+                            chunk_index=chunk_data.get("chunk_index", 0),
+                            content_hash=chunk_data["content_hash"],
+                            embedding=chunk_data["embedding"],
+                            chunk_metadata=chunk_data.get("metadata"),
+                            sync_version=sync_version,
+                        )
+                        session.add(chunk)
+                    count += 1
+                except Exception as e:
+                    logger.warning(f"Failed to upsert chunk: {e}")
+            
+            session.commit()
+        return count
+
+    def delete_stale_project_chunks(
+        self,
+        project_id: str,
+        sync_version: str,
+        source_type: Optional[str] = None,
+        source_id: Optional[str] = None,
+    ) -> int:
+        """Delete chunks that weren't updated in the current sync.
+        
+        This handles content deletion - chunks not touched by the sync
+        are considered removed from the source.
+        """
+        with self.get_session() as session:
+            query = session.query(ProjectChunk).filter(
+                ProjectChunk.project_id == project_id,
+                ProjectChunk.sync_version != sync_version,
+            )
+            
+            if source_type:
+                query = query.filter(ProjectChunk.source_type == source_type)
+            if source_id:
+                query = query.filter(ProjectChunk.source_id == source_id)
+            
+            count = query.delete(synchronize_session=False)
+            session.commit()
+            return count
+
+    def get_project_chunks(
+        self,
+        project_id: str,
+        source_type: Optional[str] = None,
+        source_id: Optional[str] = None,
+        limit: int = 1000,
+    ) -> List[ProjectChunk]:
+        """Get all chunks for a project, optionally filtered by source."""
+        with self.get_session() as session:
+            query = session.query(ProjectChunk).filter(
+                ProjectChunk.project_id == project_id
+            )
+            
+            if source_type:
+                query = query.filter(ProjectChunk.source_type == source_type)
+            if source_id:
+                query = query.filter(ProjectChunk.source_id == source_id)
+            
+            return query.order_by(ProjectChunk.created_at.desc()).limit(limit).all()
+
+    def search_project_chunks_by_embedding(
+        self,
+        project_id: str,
+        query_embedding: List[float],
+        top_k: int = 10,
+        source_types: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Search project chunks using vector similarity.
+        
+        Uses pgvector's cosine distance for semantic search.
+        Falls back to returning recent chunks if pgvector not available.
+        """
+        with self.get_session() as session:
+            if VECTOR_SUPPORT:
+                # Use pgvector cosine distance
+                from pgvector.sqlalchemy import Vector
+                
+                query = (
+                    session.query(
+                        ProjectChunk,
+                        ProjectChunk.embedding.cosine_distance(query_embedding).label("distance")
+                    )
+                    .filter(ProjectChunk.project_id == project_id)
+                    .filter(ProjectChunk.embedding.isnot(None))
+                )
+                
+                if source_types:
+                    query = query.filter(ProjectChunk.source_type.in_(source_types))
+                
+                results = (
+                    query
+                    .order_by("distance")
+                    .limit(top_k)
+                    .all()
+                )
+                
+                return [
+                    {
+                        "id": chunk.id,
+                        "source_type": chunk.source_type,
+                        "source_id": chunk.source_id,
+                        "content_id": chunk.content_id,
+                        "chunk_text": chunk.chunk_text,
+                        "metadata": chunk.chunk_metadata,
+                        "score": 1 - distance,  # Convert distance to similarity
+                    }
+                    for chunk, distance in results
+                ]
+            else:
+                # Fallback: return recent chunks without similarity scoring
+                query = session.query(ProjectChunk).filter(
+                    ProjectChunk.project_id == project_id
+                )
+                
+                if source_types:
+                    query = query.filter(ProjectChunk.source_type.in_(source_types))
+                
+                chunks = (
+                    query
+                    .order_by(ProjectChunk.updated_at.desc())
+                    .limit(top_k)
+                    .all()
+                )
+                
+                return [
+                    {
+                        "id": chunk.id,
+                        "source_type": chunk.source_type,
+                        "source_id": chunk.source_id,
+                        "content_id": chunk.content_id,
+                        "chunk_text": chunk.chunk_text,
+                        "metadata": chunk.chunk_metadata,
+                        "score": 0.5,  # Default score for fallback
+                    }
+                    for chunk in chunks
+                ]
+
+    def get_project_chunk_stats(self, project_id: str) -> Dict[str, Any]:
+        """Get statistics about project chunks for sync status display."""
+        with self.get_session() as session:
+            total = (
+                session.query(func.count(ProjectChunk.id))
+                .filter(ProjectChunk.project_id == project_id)
+                .scalar()
+            ) or 0
+            
+            by_source = (
+                session.query(
+                    ProjectChunk.source_type,
+                    func.count(ProjectChunk.id)
+                )
+                .filter(ProjectChunk.project_id == project_id)
+                .group_by(ProjectChunk.source_type)
+                .all()
+            )
+            
+            last_sync = (
+                session.query(func.max(ProjectChunk.sync_version))
+                .filter(ProjectChunk.project_id == project_id)
+                .scalar()
+            )
+            
+            return {
+                "total_chunks": total,
+                "chunks_by_source": {st: count for st, count in by_source},
+                "last_sync_version": last_sync,
+            }
+
+    def clear_project_chunks(self, project_id: str) -> int:
+        """Delete all chunks for a project (for full re-sync)."""
+        with self.get_session() as session:
+            count = (
+                session.query(ProjectChunk)
+                .filter(ProjectChunk.project_id == project_id)
+                .delete(synchronize_session=False)
+            )
+            session.commit()
+            return count

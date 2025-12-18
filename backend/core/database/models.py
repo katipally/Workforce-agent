@@ -564,6 +564,63 @@ class ProjectSyncCursor(Base):
     )
 
 
+# OpenAI text-embedding-3-small produces 1536-dimensional vectors
+OPENAI_EMBEDDING_DIM = 1536
+
+
+class ProjectChunk(Base):
+    """Chunked content with OpenAI embeddings for project-scoped RAG.
+    
+    Each chunk represents a piece of content from a project's sources
+    (Slack messages, Gmail emails, Notion pages) with its embedding
+    for semantic search.
+    """
+    __tablename__ = "project_chunks"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    project_id = Column(String(50), ForeignKey("projects.id"), nullable=False)
+    
+    # Source identification
+    source_type = Column(String(50), nullable=False)  # 'slack', 'gmail', 'notion'
+    source_id = Column(String(255), nullable=False)   # channel_id, label_id, page_id
+    content_id = Column(String(255), nullable=False)  # message_id, email_id, block_id
+    
+    # Chunk content
+    chunk_text = Column(Text, nullable=False)
+    chunk_index = Column(Integer, default=0)  # For multi-chunk documents
+    
+    # Content hash for incremental updates (detect changes)
+    content_hash = Column(String(64), nullable=False)
+    
+    # Metadata for citations and context
+    chunk_metadata = Column(JSON)  # {author, timestamp, channel_name, subject, title, etc.}
+    
+    # OpenAI embedding (1536 dimensions for text-embedding-3-small)
+    # Falls back to JSON storage if pgvector not available
+    if VECTOR_SUPPORT and Vector is not None:
+        embedding = Column(Vector(OPENAI_EMBEDDING_DIM))
+    else:
+        embedding = Column(JSON)  # Fallback: store as JSON array
+    
+    # Sync version tracking
+    sync_version = Column(String(50))  # ISO timestamp of last sync
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        # Unique constraint on project + source + content + chunk index
+        UniqueConstraint(
+            "project_id", "source_type", "source_id", "content_id", "chunk_index",
+            name="uq_project_chunk"
+        ),
+        Index("idx_project_chunk_project", "project_id"),
+        Index("idx_project_chunk_source", "source_type", "source_id"),
+        Index("idx_project_chunk_hash", "content_hash"),
+        Index("idx_project_chunk_sync", "sync_version"),
+    )
+
+
 class Workflow(Base):
     """Definition of a live workflow (e.g., Slack → Notion)."""
     __tablename__ = "workflows"

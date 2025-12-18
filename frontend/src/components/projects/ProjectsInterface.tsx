@@ -147,6 +147,7 @@ export default function ProjectsInterface() {
 
   const projectSyncRunIdRef = useRef<string | null>(null)
   const projectSummaryRunIdRef = useRef<string | null>(null)
+  const chatContainerRef = useRef<HTMLDivElement>(null)
 
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
   const [chatInput, setChatInput] = useState('')
@@ -527,6 +528,13 @@ export default function ProjectsInterface() {
     projectSyncRunIdRef.current = projectSyncRunId
   }, [projectSyncRunId])
 
+  // Auto-scroll chat to bottom when messages change
+  useEffect(() => {
+    if (chatContainerRef.current) {
+      chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight
+    }
+  }, [chatMessages])
+
   useEffect(() => {
     projectSummaryRunIdRef.current = projectSummaryRunId
   }, [projectSummaryRunId])
@@ -616,25 +624,77 @@ export default function ProjectsInterface() {
         .slice(-20)
         .map((m) => ({ role: m.role, content: m.content }))
 
-      const data = await fetchJSON<{
-        response: string
-        sources: any[]
-        intent?: string
-      }>(
-        `${API_BASE_URL}/api/chat/project/${selectedProject.id}`,
+      const assistantId = `${Date.now()}-assistant`
+      setChatMessages((prev) => [
+        ...prev,
         {
-          method: 'POST',
-          body: JSON.stringify({ query, conversation_history: historyPayload }),
+          id: assistantId,
+          role: 'assistant',
+          content: '',
+          sources: [],
         },
-      )
+      ])
 
-      const assistantMessage: ChatMessage = {
-        id: `${Date.now()}-assistant`,
-        role: 'assistant',
-        content: data.response,
-        sources: data.sources || [],
+      const streamUrl = `${API_BASE_URL}/api/chat/project/${selectedProject.id}/stream`
+      const res = await fetch(streamUrl, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query, conversation_history: historyPayload }),
+      })
+
+      if (!res.ok || !res.body) {
+        throw new Error(`Request failed: ${res.status}`)
       }
-      setChatMessages((prev) => [...prev, assistantMessage])
+
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let streamedSources: any[] = []
+
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+
+        let newlineIndex = buffer.indexOf('\n')
+        while (newlineIndex >= 0) {
+          const line = buffer.slice(0, newlineIndex).trim()
+          buffer = buffer.slice(newlineIndex + 1)
+          newlineIndex = buffer.indexOf('\n')
+
+          if (!line) continue
+
+          let event: any
+          try {
+            event = JSON.parse(line)
+          } catch {
+            continue
+          }
+
+          if (event.type === 'token') {
+            const token = String(event.content || '')
+            if (token) {
+              setChatMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantId ? { ...m, content: (m.content || '') + token } : m,
+                ),
+              )
+            }
+          } else if (event.type === 'sources') {
+            streamedSources = Array.isArray(event.content) ? event.content : []
+            setChatMessages((prev) =>
+              prev.map((m) => (m.id === assistantId ? { ...m, sources: streamedSources } : m)),
+            )
+          } else if (event.type === 'error') {
+            throw new Error(String(event.content || 'Project chat failed'))
+          } else if (event.type === 'done') {
+            setChatMessages((prev) =>
+              prev.map((m) => (m.id === assistantId ? { ...m, sources: streamedSources } : m)),
+            )
+          }
+        }
+      }
     } catch (e: any) {
       console.error('Project chat failed', e)
       const errorMessage: ChatMessage = {
@@ -1213,7 +1273,10 @@ export default function ProjectsInterface() {
                     Clear chat
                   </button>
                 </div>
-                <div className="flex-1 overflow-auto border border-border rounded-md bg-background/40 p-2 mb-2">
+                <div 
+                  ref={chatContainerRef}
+                  className="flex-1 overflow-auto border border-border rounded-md bg-background/40 p-2 mb-2"
+                >
                   {syncing ? (
                     <p className="text-[11px] text-muted-foreground">
                       Processing project data from linked Slack, Gmail, and Notion sources…
@@ -1231,19 +1294,35 @@ export default function ProjectsInterface() {
                       updates".
                     </p>
                   ) : (
-                    <div className="space-y-2">
+                    <div className="space-y-3">
                       {chatMessages.map((m) => (
-                        <div key={m.id} className="flex flex-col">
+                        <div key={m.id} className={`flex flex-col ${m.role === 'user' ? 'items-end' : 'items-start'}`}>
                           <span
                             className={`text-[10px] font-semibold mb-0.5 ${
-                              m.role === 'user' ? 'text-blue-300' : 'text-green-300'
+                              m.role === 'user' ? 'text-blue-400' : 'text-green-400'
                             }`}
                           >
                             {m.role === 'user' ? 'You' : 'Assistant'}
                           </span>
-                          <div className="rounded-md bg-background px-2 py-1 text-[11px] text-foreground whitespace-pre-wrap">
-                            {m.content}
+                          <div className={`max-w-[85%] rounded-lg px-3 py-2 text-[11px] whitespace-pre-wrap ${
+                            m.role === 'user' 
+                              ? 'bg-blue-600 text-white' 
+                              : 'bg-muted text-foreground'
+                          }`}>
+                            {m.content || (chatLoading && m.role === 'assistant' ? (
+                              <span className="flex items-center gap-1">
+                                <span className="animate-pulse">●</span>
+                                <span className="animate-pulse delay-100">●</span>
+                                <span className="animate-pulse delay-200">●</span>
+                              </span>
+                            ) : '')}
                           </div>
+                          {m.sources && m.sources.length > 0 && (
+                            <div className="mt-1 text-[9px] text-muted-foreground">
+                              Sources: {m.sources.slice(0, 3).map((s: any) => s.type || 'unknown').join(', ')}
+                              {m.sources.length > 3 && ` +${m.sources.length - 3} more`}
+                            </div>
+                          )}
                         </div>
                       ))}
                     </div>
